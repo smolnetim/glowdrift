@@ -1,0 +1,10 @@
+* text=auto eol=lf
+
+*.png binary
+*.ico binary
+*.icns binary
+*.exe binary
+*.sig text
+
+Cargo.lock linguist-generated=true
+package-lock.json linguist-generated=true

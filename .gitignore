@@ -1,0 +1,23 @@
+# Rust
+/target
+
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Tauri
+apps/desktop/src-tauri/gen/
+
+# Secrets
+*.key
+*.key.pub.bak
+.env
+.env.*
+
+# OS / editor
+Thumbs.db
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+.idea/

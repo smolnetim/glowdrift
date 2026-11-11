@@ -1,0 +1,60 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/desktop/src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/smolnetim/glowdrift"
+rust-version = "1.90"
+authors = ["Glowdrift contributors"]
+
+[workspace.dependencies]
+glowdrift-core = { path = "crates/glowdrift-core" }
+glowdrift-capture = { path = "crates/glowdrift-capture" }
+glowdrift-outputs = { path = "crates/glowdrift-outputs" }
+
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+log = "0.4.35"
+windows = "0.62.2"
+libloading = "0.9.0"
+png = "0.18.1"
+base64 = "0.23.1"
+
+tauri = { version = "2.12.5", features = ["tray-icon", "image-png"] }
+tauri-build = "2.7.4"
+tauri-plugin-single-instance = "2.5.5"
+tauri-plugin-autostart = "2.7.0"
+tauri-plugin-updater = "2.14.1"
+tauri-plugin-process = "2.4.0"
+tauri-plugin-log = "2.10.2"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+needless_pass_by_value = "allow"
+many_single_char_names = "allow"
+float_cmp = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_lossless = "allow"
+dbg_macro = "warn"
+todo = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+opt-level = 3
