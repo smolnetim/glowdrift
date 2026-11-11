@@ -1,0 +1,22 @@
+[package]
+name = "glowdrift-outputs"
+description = "Ambient-lighting output sinks for Glowdrift (iCUE now; Hue and virtual display later)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+glowdrift-core = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+libloading = { workspace = true }
+
+[lints]
+workspace = true
