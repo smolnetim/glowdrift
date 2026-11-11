@@ -1,0 +1,108 @@
+/* Live colour surfaces: all colour comes from CSS variables updated by script. */
+
+.hero {
+  position: relative;
+  padding: 28px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  isolation: isolate;
+}
+
+.hero-glow {
+  position: absolute;
+  inset: -40px;
+  z-index: -1;
+  border-radius: 48px;
+  background: radial-gradient(closest-side, color-mix(in srgb, var(--live) 70%, transparent), transparent);
+  filter: blur(40px);
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+.hero-swatches {
+  display: grid;
+  grid-template-columns: minmax(0, 2.2fr) minmax(0, 1fr);
+  gap: 16px;
+}
+
+.color-chip {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 220px;
+  padding: 16px 18px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  text-align: left;
+}
+
+.color-chip--smoothed {
+  background: var(--live);
+  color: var(--live-ink);
+}
+
+.color-chip--raw {
+  background: var(--live-raw);
+  color: var(--live-raw-ink);
+}
+
+.color-chip-label {
+  font-weight: 600;
+}
+
+.color-chip-value {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.color-chip--large .mono {
+  font-size: 28px;
+  letter-spacing: 0.02em;
+}
+
+.color-chip--small .mono {
+  font-size: 18px;
+}
+
+.color-chip-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  opacity: 0.85;
+}
+
+.color-chip:focus-visible {
+  outline-offset: 3px;
+}
+
+.engine-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.engine-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.live-swatch {
+  display: flex;
+  align-items: flex-end;
+  min-height: 96px;
+  padding: 14px 18px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--live);
+  color: var(--live-ink);
+  font-size: 18px;
+}

@@ -1,0 +1,77 @@
+@property --live {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: #000000;
+}
+
+@property --live-raw {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: #000000;
+}
+
+:root {
+  color-scheme: dark light;
+  --font: "Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Cascadia Mono", "Cascadia Code", Consolas, monospace;
+
+  /* Dark theme (default). Layered greys stand in for Mica. */
+  --bg: #1b1b1f;
+  --sidebar: rgb(32 32 38 / 0.72);
+  --surface: #26262c;
+  --surface-2: #2f2f36;
+  --surface-hover: #34343c;
+  --border: rgb(255 255 255 / 0.09);
+  --border-strong: rgb(255 255 255 / 0.2);
+  --text: #f4f4f7;
+  --text-muted: #adadb9;
+  --accent: #6cb6ff;
+  --accent-ink: #0b1b2b;
+  --success: #6ccb5f;
+  --warning: #fcd34d;
+  --danger: #ff9aa5;
+  --danger-solid: #c42b1c;
+  --shadow: 0 8px 24px rgb(0 0 0 / 0.35);
+
+  --radius: 8px;
+  --radius-lg: 12px;
+  --focus: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
+
+  /* Live colour, mirrored from engine events by script. */
+  --live: #000000;
+  --live-raw: #000000;
+  --live-ink: #ffffff;
+  --live-raw-ink: #ffffff;
+  --live-strength: 0;
+  --live-accent: color-mix(in srgb, var(--live) calc(var(--live-strength) * 100%), var(--accent));
+
+  transition:
+    --live 160ms linear,
+    --live-raw 160ms linear;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f1f1f5;
+    --sidebar: rgb(250 250 252 / 0.75);
+    --surface: #ffffff;
+    --surface-2: #f6f6f9;
+    --surface-hover: #ececf1;
+    --border: rgb(0 0 0 / 0.09);
+    --border-strong: rgb(0 0 0 / 0.28);
+    --text: #1b1b20;
+    --text-muted: #5a5a66;
+    --accent: #005fb8;
+    --accent-ink: #ffffff;
+    --success: #0f7b0f;
+    --warning: #8a5300;
+    --danger: #b42318;
+    --shadow: 0 8px 24px rgb(0 0 0 / 0.1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    transition: none;
+  }
+}
