@@ -1,0 +1,38 @@
+[package]
+name = "glowdrift-desktop"
+description = "Glowdrift desktop app: ambient lighting driven by a smoothed screen colour."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+name = "glowdrift_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { workspace = true }
+
+[dependencies]
+glowdrift-core = { workspace = true }
+glowdrift-capture = { workspace = true }
+glowdrift-outputs = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+tauri = { workspace = true }
+tauri-plugin-log = { workspace = true }
+tauri-plugin-process = { workspace = true }
+png = { workspace = true }
+base64 = { workspace = true }
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-single-instance = { workspace = true }
+tauri-plugin-autostart = { workspace = true }
+tauri-plugin-updater = { workspace = true }
+
+[lints]
+workspace = true
