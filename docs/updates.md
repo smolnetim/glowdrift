@@ -9,7 +9,8 @@ How Glowdrift ships updates, how they are verified, and what that means for wher
 - The installer and the update payload are the same NSIS setup file. Every update payload carries a **minisign
   signature** that the app verifies against a public key compiled into it.
 - Updates download silently in the background and are applied when the app restarts.
-- The app installs **per user**, so neither installing nor updating needs administrator rights.
+- The app installs **per user** in `%LOCALAPPDATA%\Programs\T1M\Glowdrift`, so neither installing nor updating needs
+  administrator rights or shows a prompt. See [Installation and updates](#installation-and-updates).
 - To roll back, install an older installer over the current one.
 
 ## How the built-in updater works
@@ -22,14 +23,44 @@ The app uses the official Tauri updater plugin (`tauri-plugin-updater`).
 2. `latest.json` lists, per platform, the version, a download URL and the contents of the matching `.sig` file.
 3. If the version is newer than the running one, the app downloads the installer and verifies its minisign
    signature against the embedded public key. A file that fails verification is discarded.
-4. The new version is applied on the next restart. The Windows install mode is `passive`: a small progress window,
-   no questions asked.
+4. The new version is applied on the next restart. The Windows install mode is `passive`: the installer shows a
+   small progress window and asks no questions.
 5. `autoUpdate` in the config turns the background check off.
 
 The updater and installer settings live in `apps/desktop/src-tauri/tauri.conf.json` (`plugins.updater` and
 `bundle`). The frontend drives the check through `@tauri-apps/plugin-updater` and restarts through
 `@tauri-apps/plugin-process`. Nothing about the user or the PC is sent beyond what an ordinary HTTPS request to
 GitHub contains, because the endpoint is a plain static file.
+
+## Installation and updates
+
+The app installs **per user** and never asks for administrator rights, for the first install or for updates.
+The NSIS installer is configured with install mode `currentUser` (`bundle.windows.nsis.installMode`), which makes
+its manifest request the invoking user's own rights (`RequestExecutionLevel user`), so Windows shows no UAC
+prompt on administrator and standard accounts alike. It uses a copy of the bundler's installer template
+(`apps/desktop/src-tauri/installer/installer.nsi`, with the changes listed at the top of that file) and hooks
+(`installer/hooks.nsh`).
+
+- **Install folder.** `%LOCALAPPDATA%\Programs\T1M\Glowdrift`, with registry data under `HKCU`. The wizard has no
+  folder page. The path is built from the user's "Programs" known folder, falling back to
+  `%LOCALAPPDATA%\Programs` if that lookup fails. A folder given on the command line with `/D=` overrides the
+  default; the updater never passes it.
+- **Start menu.** One `Glowdrift` shortcut directly in the user's Start menu Programs folder.
+- **What the updater runs.** It starts the downloaded setup file with `ShellExecuteW("open", ...)` and the
+  arguments `/P /UPDATE` (passive mode: a small progress window, no questions), then exits the app. Because the
+  installer needs no elevation, the update runs without a prompt.
+- **Location is reused.** For an update or a reinstall, the installer reads the previous folder from
+  `Software\T1M\Glowdrift` in `HKCU` and installs there, so an installation is updated where it is and is never
+  moved. The default folder only applies to a first install.
+- **A running instance is asked to quit first.** Before replacing or removing files, the installer starts
+  `glowdrift-desktop.exe --quit`, which makes the running instance stop the engine, release the lights and exit,
+  then waits at most 10 seconds for the executable to be released. If the app is not running, nothing is started.
+  If it is still running after the wait, the bundler's standard running-app check takes over (a prompt, or in
+  silent and passive modes a forced close through the Windows Restart Manager).
+- **Uninstall.** Removes the shortcut and the files, and removes the empty `T1M` folder above the install folder.
+
+These points follow from the updater plugin source, the bundler template and the built installer's manifest; the
+installer's runtime behaviour is not covered by automated tests.
 
 ## Signing keys
 

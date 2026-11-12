@@ -21,7 +21,7 @@ How it works in Glowdrift:
 
 - The SDK is a native library (`iCUESDK.x64_2019.dll`) that Glowdrift loads at run time. It looks in the
   executable's folder, its `resources` subfolder, the app's bundled resource folder and an `icue-sdk` folder in the
-  app data directory (`%APPDATA%\dev.glowdrift.desktop\icue-sdk`). `PATH` and the working directory are never
+  app data directory (`%APPDATA%\gg.t1m.glowdrift\icue-sdk`). `PATH` and the working directory are never
   searched. If the library or iCUE itself is missing, the output reports `unavailable` and the rest of the app keeps
   working.
 - The output connects, enumerates devices, and applies the current colour to the devices' lighting. The status

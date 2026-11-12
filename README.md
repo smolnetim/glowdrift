@@ -23,7 +23,8 @@ See [docs/integrations.md](docs/integrations.md) for what each lighting route do
 
 1. Open the [Releases](https://github.com/smolnetim/glowdrift/releases) page and download the latest
    `Glowdrift_<version>_x64-setup.exe`.
-2. Run it. It installs for the current user only, so it does not ask for administrator rights.
+2. Run it. It installs for the current user only, into `%LOCALAPPDATA%\Programs\T1M\Glowdrift`, so it does not ask
+   for administrator rights.
 3. Start Glowdrift. It lives in the system tray, and closing the window hides it rather than quitting.
 
 Requirements: Windows 11, and Corsair iCUE running if you want to drive Corsair devices. The
@@ -35,8 +36,8 @@ build provenance attestations where the repository is public, and the updater ve
 update. See [docs/updates.md](docs/updates.md).
 
 **Updates.** Glowdrift checks GitHub Releases for new versions, downloads them in the background, and applies
-them on the next restart. You can turn this off in the settings. To go back to an older version, install that
-version's installer over the top.
+them on the next restart, in place and without an administrator prompt. You can turn this off in the settings. To go
+back to an older version, install that version's installer over the top.
 
 ## How it works
 

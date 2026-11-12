@@ -172,3 +172,5 @@ Every exit path stops the engine and releases iCUE control before the process en
 | Window close request while quitting | Once shutdown has begun, a close request is no longer turned into "hide", so the window and process can finish exiting. |
 | Windows logoff or shutdown | The event loop receives the session-end message and runs the exit handler, which stops the engine and outputs. |
 | Update install and restart | The updater's before-exit hook and the process plugin's restart both stop the engine and outputs first. |
+
+An orderly shutdown logs `outputs released` (the engine thread releases the outputs as it stops) and then `engine stopped` at info level. The installer also uses `--quit` to stop a running instance before replacing its files (see [updates.md](updates.md)).
