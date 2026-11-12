@@ -295,6 +295,8 @@ impl EngineHandle {
         self.send(EngineCommand::Shutdown);
         if join.join().is_err() {
             log::error!("engine thread panicked");
+        } else {
+            log::info!("engine stopped");
         }
     }
 }

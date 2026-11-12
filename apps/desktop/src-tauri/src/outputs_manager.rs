@@ -258,6 +258,7 @@ impl OutputsManager {
             slot.output.shutdown();
             slot.applied = None;
         }
+        log::info!("outputs released");
     }
 }
 
