@@ -1,9 +1,10 @@
+import { useState } from "react";
 import { useConfig } from "../hooks/useConfig";
 import { OUTPUT_STATE_LABEL } from "../lib/format";
 import type { OutputStatus } from "../lib/ipc";
 import { useStore } from "../lib/store";
 import { patchConfig } from "../state/config";
-import { outputsStore } from "../state/outputs";
+import { downloadIcueLibrary, outputsStore } from "../state/outputs";
 import { ToggleRow } from "./controls";
 import { Icon } from "./Icon";
 
@@ -30,10 +31,56 @@ export function IcueSetupHelp({ disabled }: { disabled: boolean }) {
   );
 }
 
+type DownloadState = { phase: "idle" } | { phase: "working" } | { phase: "done" } | { phase: "failed"; message: string };
+
+/** Explains the missing iCUE library and offers the verified download. */
+function LibraryDownload({ missing }: { missing: boolean }) {
+  const [state, setState] = useState<DownloadState>({ phase: "idle" });
+  const working = state.phase === "working";
+
+  async function download() {
+    setState({ phase: "working" });
+    try {
+      await downloadIcueLibrary();
+      setState({ phase: "done" });
+    } catch (error) {
+      setState({ phase: "failed", message: error instanceof Error ? error.message : "Download failed." });
+    }
+  }
+
+  if (!missing && state.phase !== "done") return null;
+  return (
+    <div className="help">
+      <h3>Corsair library needed</h3>
+      <p>
+        Glowdrift needs Corsair&apos;s official iCUE SDK library. It is downloaded from Corsair&apos;s GitHub and
+        verified before use.
+      </p>
+      {state.phase === "done" && (
+        <p role="status">Library downloaded and verified. Glowdrift is now connecting to iCUE.</p>
+      )}
+      {state.phase === "failed" && <p role="alert">{state.message}</p>}
+      {missing && (
+        <div className="update-actions">
+          <button type="button" className="btn btn--primary" onClick={() => void download()} disabled={working}>
+            {working ? "Downloading…" : state.phase === "failed" ? "Try again" : "Download Corsair library"}
+          </button>
+          {working && (
+            <span className="muted-text" role="status">
+              Downloading and verifying…
+            </span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function OutputCard({ output }: { output: OutputStatus }) {
   const config = useConfig();
   const enabled = output.kind === "icue" ? config.outputs.icue.enabled : output.enabled;
-  const needsHelp = output.kind === "icue" && output.state !== "connected";
+  const libraryMissing = output.kind === "icue" && output.code === "libraryMissing";
+  const needsHelp = output.kind === "icue" && output.state !== "connected" && !libraryMissing;
 
   return (
     <article className="card output-card" aria-label={output.name}>
@@ -59,6 +106,7 @@ function OutputCard({ output }: { output: OutputStatus }) {
         checked={enabled}
         onChange={(next) => patchConfig({ outputs: { ...config.outputs, [output.kind]: { enabled: next } } })}
       />
+      {output.kind === "icue" && <LibraryDownload missing={libraryMissing} />}
       {needsHelp && output.state !== "connecting" && <IcueSetupHelp disabled={!enabled} />}
     </article>
   );
@@ -67,7 +115,6 @@ function OutputCard({ output }: { output: OutputStatus }) {
 /** Output cards with setup guidance; safe with an empty list. */
 export function OutputsPanel() {
   const outputs = useStore(outputsStore);
-  const config = useConfig();
   return (
     <div className="stack">
       {outputs.length === 0 ? (
@@ -83,7 +130,6 @@ export function OutputsPanel() {
               </div>
             </div>
           </div>
-          <IcueSetupHelp disabled={!config.outputs.icue.enabled} />
         </article>
       ) : (
         outputs.map((output) => <OutputCard key={output.id} output={output} />)

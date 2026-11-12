@@ -26,6 +26,7 @@ const MONITORS: MonitorInfo[] = [
 
 let config: Config = { ...DEFAULT_CONFIG, onboardingComplete: params.has("onboarded") };
 let running = true;
+let libraryInstalled = false;
 let engineColor: ColorEvent = { raw: "#000000", smoothed: "#000000" };
 
 type Handler = (payload: unknown) => void;
@@ -72,6 +73,17 @@ function engineStatus(): EngineStatus {
 function outputs(): OutputStatus[] {
   const base = { id: "icue", kind: "icue", name: "Corsair iCUE", enabled: config.outputs.icue.enabled } as const;
   if (!base.enabled) return [{ ...base, state: "disabled", detail: null, deviceCount: 0 }];
+  if (params.get("icue") === "nolibrary" && !libraryInstalled) {
+    return [
+      {
+        ...base,
+        state: "unavailable",
+        detail: "iCUE SDK library (iCUESDK.x64_2019.dll) not found",
+        deviceCount: 0,
+        code: "libraryMissing",
+      },
+    ];
+  }
   if (params.get("icue") === "unavailable") {
     return [{ ...base, state: "unavailable", detail: "Could not reach the iCUE SDK.", deviceCount: 0 }];
   }
@@ -123,6 +135,19 @@ export async function setEngineRunning(next: boolean): Promise<EngineStatus> {
   const status = engineStatus();
   emit("engine://status", status);
   return status;
+}
+
+/** ?icue=nolibrary simulates a missing library; ?icuefail=1 makes the download fail once. */
+export async function installIcueSdk(): Promise<OutputStatus[]> {
+  await delay(1200);
+  if (params.has("icuefail") && !libraryInstalled) {
+    params.delete("icuefail");
+    throw "Could not download the library from GitHub. Check your internet connection and try again.";
+  }
+  libraryInstalled = true;
+  const list = outputs();
+  emit("outputs://status", list);
+  return list;
 }
 
 export const listOutputs = async (): Promise<OutputStatus[]> => outputs();

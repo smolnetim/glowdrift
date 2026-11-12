@@ -5,10 +5,10 @@ import {
   HANDLES,
   type Handle,
   REGION_MIN_SIZE,
-  clampRegion,
   moveRegion,
   regionFromCorners,
   resizeRegion,
+  resizeRegionBy,
 } from "../lib/region";
 
 type Drag =
@@ -88,11 +88,7 @@ export function RegionEditor({ region, imageUrl, aspectRatio, busy, onChange }: 
     if (!delta) return;
     e.preventDefault();
     const [dx = 0, dy = 0] = delta;
-    onChange(
-      e.shiftKey
-        ? clampRegion({ ...region, width: region.width + dx, height: region.height + dy })
-        : moveRegion(region, dx, dy),
-    );
+    onChange(e.shiftKey ? resizeRegionBy(region, dx, dy) : moveRegion(region, dx, dy));
   };
 
   const rectVars = cssVars({ "--x": region.x, "--y": region.y, "--w": region.width, "--h": region.height });

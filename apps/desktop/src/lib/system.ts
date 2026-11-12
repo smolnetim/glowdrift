@@ -4,7 +4,7 @@
 import { isTauri } from "@tauri-apps/api/core";
 import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { relaunch } from "@tauri-apps/plugin-process";
-import { installPendingUpdate } from "./ipc";
+import { installPendingUpdate, stageUpdate } from "./ipc";
 import { check } from "@tauri-apps/plugin-updater";
 
 export interface AvailableUpdate {
@@ -29,19 +29,10 @@ export async function checkForUpdate(): Promise<AvailableUpdate | null> {
   if (!update) return null;
   return {
     version: update.version,
+    // The shell downloads and stages the update so it can stop the lights before the installer runs.
     async install(onProgress) {
-      let total = 0;
-      let received = 0;
-      await update.downloadAndInstall((event) => {
-        if (event.event === "Started") {
-          total = event.data.contentLength ?? 0;
-        } else if (event.event === "Progress") {
-          received += event.data.chunkLength;
-          onProgress(total > 0 ? received / total : null);
-        } else {
-          onProgress(1);
-        }
-      });
+      onProgress(null);
+      if ((await stageUpdate()) === null) throw new Error("no update is available");
     },
   };
 }

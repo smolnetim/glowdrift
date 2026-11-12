@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Icon, type IconName, Logo } from "./components/Icon";
 import { Banner } from "./components/layout";
 import { UpdatePill } from "./components/Updates";
+import { frontendReady } from "./lib/ipc";
 import { useStore } from "./lib/store";
 import { configStore, loadConfig } from "./state/config";
 import { Onboarding } from "./onboarding/Onboarding";
@@ -100,8 +101,24 @@ function Splash({ failed }: { failed: boolean }) {
   );
 }
 
+/** Tells the shell once the first real screen has been painted, so the window never shows blank. */
+function useSignalReady(ready: boolean): void {
+  useEffect(() => {
+    if (!ready) return;
+    let second = 0;
+    const first = requestAnimationFrame(() => {
+      second = requestAnimationFrame(() => void frontendReady().catch(() => undefined));
+    });
+    return () => {
+      cancelAnimationFrame(first);
+      cancelAnimationFrame(second);
+    };
+  }, [ready]);
+}
+
 export default function App() {
   const { config, loadFailed } = useStore(configStore);
+  useSignalReady(config !== null || loadFailed);
   if (!config) return <Splash failed={loadFailed} />;
   return config.onboardingComplete ? <Shell /> : <Onboarding />;
 }

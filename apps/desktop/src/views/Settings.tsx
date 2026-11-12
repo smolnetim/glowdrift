@@ -69,7 +69,7 @@ export function Settings() {
         <div className="setting-row">
           <div className="setting-text">
             <div className="setting-title">Reset to defaults</div>
-            <div className="setting-description">Restores every setting except Start with Windows.</div>
+            <div className="setting-description">Restores every setting except Start with Windows, which keeps its current choice.</div>
           </div>
           <button type="button" className="btn btn--danger-outline" onClick={() => setConfirmingReset(true)}>
             Reset
@@ -80,7 +80,7 @@ export function Settings() {
       <ConfirmDialog
         open={confirmingReset}
         title="Reset all settings?"
-        message="Your display, region, colour and startup choices will go back to their defaults."
+        message="Your display, region, colour, start minimised and automatic update choices will go back to their defaults. Start with Windows is not changed."
         confirmLabel="Reset settings"
         onCancel={() => setConfirmingReset(false)}
         onConfirm={() => {

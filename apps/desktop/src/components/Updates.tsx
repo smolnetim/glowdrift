@@ -1,6 +1,5 @@
 import { useStore } from "../lib/store";
-import { restartApp } from "../lib/system";
-import { checkNow, installUpdate, updateStore } from "../state/updates";
+import { checkNow, installUpdate, restartToUpdate, updateStore } from "../state/updates";
 import { Icon } from "./Icon";
 
 /** Non-blocking pill shown once an update only needs a restart. */
@@ -8,9 +7,9 @@ export function UpdatePill() {
   const state = useStore(updateStore);
   if (state.phase !== "ready") return null;
   return (
-    <button type="button" className="update-pill" onClick={() => void restartApp()}>
+    <button type="button" className="update-pill" title={state.error} onClick={() => void restartToUpdate()}>
       <Icon name="download" size={16} />
-      <span>Update ready &ndash; Restart</span>
+      <span>{state.error ? "Update failed – Try again" : "Update ready – Restart"}</span>
     </button>
   );
 }
@@ -38,7 +37,7 @@ export function UpdateChecker() {
     <div className="update-checker">
       <div className="update-actions">
         {state.phase === "ready" ? (
-          <button type="button" className="btn btn--primary" onClick={() => void restartApp()}>
+          <button type="button" className="btn btn--primary" onClick={() => void restartToUpdate()}>
             Restart to finish
           </button>
         ) : state.phase === "available" ? (

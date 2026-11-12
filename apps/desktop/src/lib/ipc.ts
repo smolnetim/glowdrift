@@ -67,6 +67,9 @@ export interface EngineStatus {
 export type OutputKind = "icue";
 export type OutputState = "connected" | "connecting" | "unavailable" | "error" | "disabled";
 
+/** Machine-readable cause behind an output state; `detail` is for display only. */
+export type OutputCode = "libraryMissing";
+
 export interface OutputStatus {
   id: string;
   kind: OutputKind;
@@ -75,6 +78,8 @@ export interface OutputStatus {
   state: OutputState;
   detail: string | null;
   deviceCount: number;
+  /** Absent or null when the state has no specific cause. */
+  code?: OutputCode | null;
 }
 
 export interface AppInfo {
@@ -120,6 +125,17 @@ export const listOutputs = () => call<OutputStatus[]>("list_outputs", undefined,
 /** Installs the update the shell has already downloaded; resolves false when none is staged. */
 export const installPendingUpdate = () =>
   call<boolean>("install_pending_update", undefined, () => Promise.resolve(false));
+/**
+ * Downloads and verifies Corsair's iCUE SDK library, then makes the iCUE output retry loading it.
+ * Rejects with a user-presentable message.
+ */
+export const installIcueSdk = () =>
+  call<OutputStatus[]>("install_icue_sdk", undefined, (m) => m.installIcueSdk());
+/** Tells the shell the first screen is rendered so it can show the window. */
+export const frontendReady = () => call<void>("frontend_ready", undefined, () => Promise.resolve());
+/** Downloads and verifies an available update and stages it; resolves its version, or null when none. */
+export const stageUpdate = () =>
+  call<string | null>("stage_update", undefined, () => Promise.resolve(null));
 export const getAppInfo = () => call<AppInfo>("get_app_info", undefined, (m) => m.getAppInfo());
 
 /** Emitted at most ~20/s, only while the main window is visible. */

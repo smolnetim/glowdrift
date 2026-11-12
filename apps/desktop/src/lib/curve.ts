@@ -1,20 +1,33 @@
 import { SMOOTHING_MS_MAX } from "./defaults";
-import { clamp } from "./format";
 
-/** Number of positions on the smoothing slider. */
-export const SMOOTHING_SLIDER_STEPS = 1000;
-const EXPONENT = 2.5;
-
-export function smoothingToSlider(ms: number): number {
-  const fraction = clamp(ms / SMOOTHING_MS_MAX, 0, 1);
-  return Math.round(fraction ** (1 / EXPONENT) * SMOOTHING_SLIDER_STEPS);
+function buildSmoothingSteps(): readonly number[] {
+  const steps = [0];
+  for (let ms = 5; ms < 100; ms += 5) steps.push(ms);
+  for (let ms = 100; ms < 1000; ms += 25) steps.push(ms);
+  for (let ms = 1000; ms <= SMOOTHING_MS_MAX; ms += 50) steps.push(ms);
+  return steps;
 }
 
-/** Maps a slider position to milliseconds, finer near zero and coarser near the top. */
+/** Allowed smoothing values in ms: finer near zero, coarser near the top. The slider position is an index into this list. */
+export const SMOOTHING_STEPS: readonly number[] = buildSmoothingSteps();
+
+/** Highest slider position. */
+export const SMOOTHING_SLIDER_MAX = SMOOTHING_STEPS.length - 1;
+
+/** The slider position whose value is closest to `ms`. */
+export function smoothingToSlider(ms: number): number {
+  let best = 0;
+  for (let i = 1; i < SMOOTHING_STEPS.length; i += 1) {
+    const step = SMOOTHING_STEPS[i] as number;
+    if (Math.abs(step - ms) < Math.abs((SMOOTHING_STEPS[best] as number) - ms)) best = i;
+  }
+  return best;
+}
+
+/** Maps a slider position (index) to milliseconds. */
 export function sliderToSmoothing(position: number): number {
-  const raw = SMOOTHING_MS_MAX * (clamp(position, 0, SMOOTHING_SLIDER_STEPS) / SMOOTHING_SLIDER_STEPS) ** EXPONENT;
-  const step = raw < 100 ? 5 : raw < 1000 ? 25 : 50;
-  return Math.min(SMOOTHING_MS_MAX, Math.round(raw / step) * step);
+  const index = Math.min(SMOOTHING_SLIDER_MAX, Math.max(0, Math.round(position)));
+  return SMOOTHING_STEPS[index] as number;
 }
 
 export const SMOOTHING_PRESETS = [

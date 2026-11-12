@@ -39,11 +39,22 @@ export function resizeRegion(origin: NormRect, handle: Handle, dx: number, dy: n
 
 /** The rectangle spanned by two corner points, in unit-square fractions. */
 export function regionFromCorners(ax: number, ay: number, bx: number, by: number): NormRect {
+  const [x1, x2] = [clamp(ax, 0, 1), clamp(bx, 0, 1)];
+  const [y1, y2] = [clamp(ay, 0, 1), clamp(by, 0, 1)];
   return clampRegion({
-    x: Math.min(ax, bx),
-    y: Math.min(ay, by),
-    width: Math.abs(bx - ax),
-    height: Math.abs(by - ay),
+    x: Math.min(x1, x2),
+    y: Math.min(y1, y2),
+    width: Math.abs(x2 - x1),
+    height: Math.abs(y2 - y1),
+  });
+}
+
+/** Grows or shrinks the region from its top-left corner by the given deltas, staying inside the unit square. */
+export function resizeRegionBy(region: NormRect, dw: number, dh: number): NormRect {
+  return clampRegion({
+    ...region,
+    width: Math.min(region.width + dw, 1 - region.x),
+    height: Math.min(region.height + dh, 1 - region.y),
   });
 }
 

@@ -1,5 +1,5 @@
 import { useConfig } from "../hooks/useConfig";
-import { SMOOTHING_PRESETS, SMOOTHING_SLIDER_STEPS, sliderToSmoothing, smoothingToSlider } from "../lib/curve";
+import { SMOOTHING_PRESETS, SMOOTHING_SLIDER_MAX, sliderToSmoothing, smoothingToSlider } from "../lib/curve";
 import { formatMs } from "../lib/format";
 import type { ReduceMode } from "../lib/ipc";
 import { patchConfig } from "../state/config";
@@ -39,7 +39,8 @@ export function SmoothingControl() {
       description="How slowly the light follows your screen. Higher values fade more gently."
       value={smoothingToSlider(config.smoothingMs)}
       min={0}
-      max={SMOOTHING_SLIDER_STEPS}
+      max={SMOOTHING_SLIDER_MAX}
+      step={1}
       valueText={formatMs(config.smoothingMs)}
       onChange={(position) => patchConfig({ smoothingMs: sliderToSmoothing(position) })}
     >
