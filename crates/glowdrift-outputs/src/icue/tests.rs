@@ -260,6 +260,45 @@ fn retry_now_does_nothing_while_disabled_or_connected() {
 }
 
 #[test]
+fn a_connect_failure_reason_is_logged_once_until_it_changes_or_a_connect_succeeds() {
+    let fake = FakeSdk::default();
+    let missing = || SdkError::LibraryMissing {
+        file: "iCUESDK.x64_2019.dll",
+        searched: vec![],
+    };
+    fake.state().connect_error = Some(missing());
+    let mut h = Harness::new(fake);
+    h.ctl.set_enabled(true);
+
+    let mut now = h.at(0);
+    for _ in 0..5 {
+        now = h.ctl.tick(now).unwrap();
+    }
+    assert_eq!(h.fake.state().connects, 5);
+    assert_eq!(h.ctl.connect_failures_logged, 1);
+
+    // A different reason is logged again, then stays quiet.
+    h.fake.state().connect_error = Some(SdkError::LibraryLoad("boom".to_owned()));
+    for _ in 0..3 {
+        now = h.ctl.tick(now).unwrap();
+    }
+    assert_eq!(h.ctl.connect_failures_logged, 2);
+
+    // After a successful connect the same failure is reported again.
+    h.fake.state().connect_error = None;
+    h.ctl.tick(now);
+    assert_eq!(h.ctl.status().state, OutputState::Connecting);
+    h.ctl.set_enabled(false);
+    h.ctl.set_enabled(true);
+    h.fake.state().connect_error = Some(SdkError::LibraryLoad("boom".to_owned()));
+    let mut now = h.at(1_000_000);
+    for _ in 0..3 {
+        now = h.ctl.tick(now).unwrap();
+    }
+    assert_eq!(h.ctl.connect_failures_logged, 3);
+}
+
+#[test]
 fn backoff_is_capped_and_resets_after_a_successful_connect() {
     let fake = FakeSdk::default();
     fake.state().connect_error = Some(SdkError::LibraryLoad("boom".to_owned()));

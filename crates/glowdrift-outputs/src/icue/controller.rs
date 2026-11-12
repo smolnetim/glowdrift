@@ -93,6 +93,11 @@ pub(crate) struct Controller<S: Sdk> {
     sdk_connected: bool,
     session: SessionState,
     fault: Option<Fault>,
+    /// Reason of the connect failure that was last logged; cleared by a successful connect so a
+    /// repeated failure is logged once per outage instead of once per retry.
+    logged_connect_failure: Option<String>,
+    #[cfg(test)]
+    pub(crate) connect_failures_logged: u32,
     retry_at: Option<Instant>,
     backoff: Backoff,
     devices: Vec<Device>,
@@ -153,6 +158,9 @@ impl<S: Sdk> Controller<S> {
             sdk_connected: false,
             session: SessionState::Closed,
             fault: None,
+            logged_connect_failure: None,
+            #[cfg(test)]
+            connect_failures_logged: 0,
             retry_at: None,
             backoff: Backoff::new(),
             devices: Vec::new(),
@@ -270,11 +278,20 @@ impl<S: Sdk> Controller<S> {
                 self.sdk_connected = true;
                 self.session = SessionState::Connecting;
                 self.fault = None;
+                self.logged_connect_failure = None;
                 self.retry_at = None;
                 self.backoff.reset();
             }
             Err(err) => {
-                log::warn!("iCUE connect failed: {err}");
+                let reason = err.to_string();
+                if self.logged_connect_failure.as_ref() != Some(&reason) {
+                    log::warn!("iCUE connect failed: {reason}");
+                    self.logged_connect_failure = Some(reason);
+                    #[cfg(test)]
+                    {
+                        self.connect_failures_logged += 1;
+                    }
+                }
                 self.fault = Some(match err {
                     SdkError::LibraryMissing { .. } => Fault::LibraryMissing,
                     other => Fault::Error(other.to_string()),
