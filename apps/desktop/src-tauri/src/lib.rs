@@ -3,6 +3,7 @@
 pub mod commands;
 pub mod config_store;
 pub mod engine;
+pub mod icue_sdk;
 pub mod outputs_manager;
 pub mod tray;
 pub mod updater;
@@ -15,7 +16,6 @@ use std::time::Duration;
 use glowdrift_core::Rgb;
 use log::LevelFilter;
 use tauri::menu::MenuItem;
-use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, Wry};
 use tauri_plugin_log::{RotationStrategy, Target, TargetKind};
 
@@ -26,7 +26,10 @@ use outputs_manager::{OutputsManager, default_outputs};
 
 /// Argument passed by the autostart entry.
 const MINIMIZED_ARG: &str = "--minimized";
-/// If the page never reports being loaded, a window that should be visible is shown anyway.
+/// Argument that asks the running instance to quit. A process started with it while no other
+/// instance is running exits immediately.
+const QUIT_ARG: &str = "--quit";
+/// If the frontend never reports being ready, a window that should be visible is shown anyway.
 const SHOW_FALLBACK_DELAY: Duration = Duration::from_secs(4);
 const LOG_FILE_NAME: &str = "glowdrift";
 const LOG_MAX_FILE_BYTES: u128 = 1_000_000;
@@ -66,6 +69,7 @@ fn log_plugin() -> tauri::plugin::TauriPlugin<Wry> {
         } else {
             LevelFilter::Info
         })
+        .level_for("tauri_plugin_updater", LevelFilter::Off)
         .max_file_size(LOG_MAX_FILE_BYTES)
         .rotation_strategy(RotationStrategy::KeepSome(LOG_KEEP_FILES))
         .clear_targets()
@@ -78,7 +82,21 @@ fn log_plugin() -> tauri::plugin::TauriPlugin<Wry> {
     builder.build()
 }
 
+fn has_arg(arg: &str) -> bool {
+    std::env::args().any(|a| a == arg)
+}
+
+fn is_quitting(app: &AppHandle) -> bool {
+    app.try_state::<AppState>()
+        .is_some_and(|state| state.is_quitting())
+}
+
 fn initialise(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    if has_arg(QUIT_ARG) {
+        // The single-instance plugin forwards the flag to a running instance and exits this
+        // process; reaching this point means there was no running instance to quit.
+        std::process::exit(0);
+    }
     let handle = app.handle().clone();
     log::info!("starting Glowdrift {}", env!("CARGO_PKG_VERSION"));
 
@@ -101,7 +119,7 @@ fn initialise(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
-    let launched_by_autostart = std::env::args().any(|arg| arg == MINIMIZED_ARG);
+    let launched_by_autostart = has_arg(MINIMIZED_ARG);
     let start_hidden =
         launched_by_autostart && config.start_minimized && config.onboarding_complete;
 
@@ -112,6 +130,7 @@ fn initialise(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         outputs,
         pending_update: Mutex::new(None),
         show_on_load: AtomicBool::new(!start_hidden),
+        quitting: AtomicBool::new(false),
     });
 
     if !start_hidden {
@@ -126,7 +145,7 @@ fn initialise(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Shows the main window once, the first time this is called while it is still pending.
-fn show_initial_window(app: &AppHandle) {
+pub(crate) fn show_initial_window(app: &AppHandle) {
     let pending = app
         .try_state::<AppState>()
         .is_some_and(|state| state.show_on_load.swap(false, Ordering::AcqRel));
@@ -141,9 +160,14 @@ fn show_initial_window(app: &AppHandle) {
 /// Panics if the Tauri runtime fails to start.
 pub fn run() {
     let app = tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            log::info!("second instance launched; showing the main window");
-            window::show_main(app);
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if args.iter().any(|arg| arg == QUIT_ARG) {
+                log::info!("quit requested by a second instance");
+                tray::quit(app);
+            } else {
+                log::info!("second instance launched; showing the main window");
+                window::show_main(app);
+            }
         }))
         .plugin(log_plugin())
         .plugin(tauri_plugin_process::init())
@@ -152,19 +176,16 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![MINIMIZED_ARG]),
         ))
-        .on_page_load(|webview, payload| {
-            if payload.event() == PageLoadEvent::Finished && webview.label() == window::MAIN_LABEL {
-                show_initial_window(webview.app_handle());
-            }
-        })
         .on_window_event(|win, event| {
             if win.label() != window::MAIN_LABEL {
                 return;
             }
             match event {
                 tauri::WindowEvent::CloseRequested { api, .. } => {
-                    api.prevent_close();
-                    window::hide_main(win.app_handle());
+                    if !is_quitting(win.app_handle()) {
+                        api.prevent_close();
+                        window::hide_main(win.app_handle());
+                    }
                 }
                 tauri::WindowEvent::Resized(_) | tauri::WindowEvent::Focused(_) => {
                     window::sync_preview(win.app_handle());
@@ -183,6 +204,9 @@ pub fn run() {
             commands::list_outputs,
             commands::get_app_info,
             commands::install_pending_update,
+            commands::install_icue_sdk,
+            commands::frontend_ready,
+            commands::stage_update,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Glowdrift");
@@ -190,7 +214,7 @@ pub fn run() {
     app.run(|app, event| match event {
         RunEvent::ExitRequested {
             code: None, api, ..
-        } => api.prevent_exit(),
+        } if !is_quitting(app) => api.prevent_exit(),
         RunEvent::Exit => {
             if let Some(state) = app.try_state::<AppState>() {
                 state.shutdown();

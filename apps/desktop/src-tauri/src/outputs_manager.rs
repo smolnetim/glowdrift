@@ -17,17 +17,23 @@ const PAUSED_DETAIL: &str = "Paused";
 
 type StatusEmitter = Box<dyn Fn(&[OutputStatus]) + Send + Sync>;
 
+/// The `icue-sdk` folder in the app data directory, where a downloaded SDK library is stored.
+pub fn icue_sdk_dir(app: &AppHandle) -> Option<PathBuf> {
+    app.path()
+        .app_data_dir()
+        .ok()
+        .map(|dir| dir.join("icue-sdk"))
+}
+
 /// Extra directories searched for the iCUE SDK runtime, in addition to the executable's
-/// own directory and its `resources` subdirectory: the bundled resource directory and an
-/// `icue-sdk` folder in the app data directory.
+/// own directory and its `resources` subdirectory: the bundled resource directory and the
+/// [`icue_sdk_dir`].
 pub fn icue_dll_dirs(app: &AppHandle) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Ok(dir) = app.path().resource_dir() {
         dirs.push(dir);
     }
-    if let Ok(dir) = app.path().app_data_dir() {
-        dirs.push(dir.join("icue-sdk"));
-    }
+    dirs.extend(icue_sdk_dir(app));
     dirs
 }
 
@@ -167,6 +173,20 @@ impl OutputsManager {
         self.poll();
     }
 
+    /// Asks the output with `id` to retry connecting now, then publishes the new status.
+    pub fn retry(&self, id: &str) {
+        {
+            let mut inner = lock(&self.inner);
+            if inner.closed {
+                return;
+            }
+            for slot in inner.slots.iter_mut().filter(|s| s.output.id() == id) {
+                slot.output.retry();
+            }
+        }
+        self.poll();
+    }
+
     /// Sends a colour to every active output.
     pub fn set_color(&self, color: Rgb) {
         let mut inner = lock(&self.inner);
@@ -252,6 +272,7 @@ mod tests {
         colors: Vec<Rgb>,
         connected: bool,
         shutdowns: u32,
+        retries: u32,
     }
 
     struct Fake(Arc<Mutex<Shared>>);
@@ -277,7 +298,11 @@ mod tests {
                 },
                 detail: None,
                 device_count: 0,
+                code: None,
             }
+        }
+        fn retry(&mut self) {
+            lock(&self.0).retries += 1;
         }
         fn set_enabled(&mut self, enabled: bool) {
             lock(&self.0).enabled = Some(enabled);
@@ -363,6 +388,18 @@ mod tests {
         assert_eq!(*lock(&emitted), after_two + 1);
         assert!(manager.take_resend());
         assert!(!manager.take_resend());
+    }
+
+    #[test]
+    fn retry_reaches_only_the_named_output_and_not_after_shutdown() {
+        let (manager, shared, _) = setup(true);
+        manager.retry("other");
+        assert_eq!(lock(&shared).retries, 0);
+        manager.retry(ICUE_OUTPUT_ID);
+        assert_eq!(lock(&shared).retries, 1);
+        manager.shutdown();
+        manager.retry(ICUE_OUTPUT_ID);
+        assert_eq!(lock(&shared).retries, 1);
     }
 
     #[test]

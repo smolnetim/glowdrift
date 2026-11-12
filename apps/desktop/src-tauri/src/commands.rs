@@ -1,20 +1,27 @@
 //! IPC commands and their payload types. Command names are `snake_case`; payloads are `camelCase`.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use glowdrift_capture::{Frame, MonitorInfo};
 use glowdrift_core::Config;
-use glowdrift_outputs::OutputStatus;
+use glowdrift_outputs::icue::ICUE_OUTPUT_ID;
+use glowdrift_outputs::{OutputCode, OutputStatus};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
 use crate::config_store::ConfigStore;
 pub use crate::engine::EngineStatus;
 use crate::engine::{EngineHandle, describe_capture_error};
-use crate::outputs_manager::OutputsManager;
+use crate::icue_sdk;
+use crate::outputs_manager::{self, OutputsManager};
 use crate::updater::{self, PendingUpdate};
+
+/// How long `install_icue_sdk` waits for the iCUE output to pick up a newly installed library.
+const SDK_RELOAD_WAIT: Duration = Duration::from_secs(2);
+const SDK_RELOAD_POLL: Duration = Duration::from_millis(50);
 
 /// Accepted range of `maxWidth` for thumbnails, in pixels.
 const THUMBNAIL_WIDTH_RANGE: std::ops::RangeInclusive<u32> = 16..=4096;
@@ -62,6 +69,8 @@ pub struct AppState {
     pub pending_update: Mutex<Option<PendingUpdate>>,
     /// True until the main window has been shown for the first time (and when it must be).
     pub show_on_load: AtomicBool,
+    /// Set once the application is shutting down; window closes then really close.
+    pub quitting: AtomicBool,
 }
 
 impl std::fmt::Debug for AppState {
@@ -73,8 +82,13 @@ impl std::fmt::Debug for AppState {
 impl AppState {
     /// Stops the engine (releasing outputs). Safe to call more than once.
     pub fn shutdown(&self) {
+        self.quitting.store(true, Ordering::Release);
         self.engine.shutdown();
         self.outputs.shutdown();
+    }
+
+    pub fn is_quitting(&self) -> bool {
+        self.quitting.load(Ordering::Acquire)
     }
 
     pub fn toggle_running(&self) {
@@ -204,6 +218,51 @@ pub async fn install_pending_update(app: AppHandle) -> Result<bool, String> {
     tauri::async_runtime::spawn_blocking(move || updater::install_pending(&app))
         .await
         .map_err(|e| format!("Update task failed: {e}"))?
+}
+
+/// Downloads the pinned, verified iCUE SDK library into the app data directory and makes the
+/// iCUE output retry loading it. Returns the output statuses after the retry.
+#[tauri::command]
+pub async fn install_icue_sdk(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<OutputStatus>, String> {
+    let dir = outputs_manager::icue_sdk_dir(&app)
+        .ok_or_else(|| "The app data folder is not available.".to_owned())?;
+    icue_sdk::install(&dir).await.map_err(|e| e.to_string())?;
+    let outputs = Arc::clone(&state.outputs);
+    tauri::async_runtime::spawn_blocking(move || {
+        outputs.retry(ICUE_OUTPUT_ID);
+        let deadline = Instant::now() + SDK_RELOAD_WAIT;
+        loop {
+            let statuses = outputs.statuses();
+            let still_missing = statuses
+                .iter()
+                .any(|s| s.id == ICUE_OUTPUT_ID && s.code == Some(OutputCode::LibraryMissing));
+            if !still_missing || Instant::now() >= deadline {
+                return statuses;
+            }
+            std::thread::sleep(SDK_RELOAD_POLL);
+        }
+    })
+    .await
+    .map_err(|e| format!("Library reload task failed: {e}"))
+}
+
+/// Called by the frontend after its first render; shows the main window if it is waiting.
+#[tauri::command]
+pub fn frontend_ready(app: AppHandle) {
+    crate::show_initial_window(&app);
+}
+
+/// Checks for an update, downloads and verifies it, and stages it for `install_pending_update`.
+/// Returns the staged version, or null when no update exists.
+#[tauri::command]
+pub async fn stage_update(app: AppHandle) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || updater::stage_now(&app))
+        .await
+        .map_err(|e| format!("Update task failed: {e}"))?
+        .map_err(|e| format!("The update could not be downloaded: {e}"))
 }
 
 #[cfg(test)]
