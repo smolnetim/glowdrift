@@ -27,6 +27,9 @@ How it works in Glowdrift:
 - The output connects, enumerates devices, and applies the current colour to the devices' lighting. The status
   panel shows the state (`connected`, `connecting`, `unavailable`, `error`, `disabled`), a detail message and the
   number of devices found.
+- A device that fails to report its LEDs or to accept a colour is skipped and logged while the other devices keep
+  working. The status detail names the skipped devices, and they are tried again on a later enumeration with a
+  growing delay (1 s up to 30 s).
 - Colours are sent only when they change.
 - Disabling the output, or pausing the engine, stops Glowdrift sending colours and shuts the output down.
 
@@ -38,9 +41,26 @@ Trade-offs:
 - Control is shared with iCUE and its own lighting effects. How conflicts between Glowdrift and an iCUE lighting
   effect are resolved is decided by iCUE's SDK access rules, and has not been verified here.
 - The SDK library is distributed by Corsair and is not included in this repository or in the installer, because
-  its licence text grants no explicit redistribution right. Download the official SDK release from Corsair's
-  `CorsairOfficial/cue-sdk` repository and copy `redist/x64/iCUESDK.x64_2019.dll` into one of the folders above.
-  Obtain written permission from Corsair, or download the library on the user's machine, before shipping it.
+  its licence text grants no explicit redistribution right. When the library is not found, the Lights page and the
+  setup step show a "Download Corsair library" button. Pressing it downloads the library on the user's machine; the
+  user can also copy `redist/x64/iCUESDK.x64_2019.dll` from Corsair's `CorsairOfficial/cue-sdk` release into one of
+  the folders above by hand.
+
+### Library download
+
+The download is pinned to release `v4.0.84` of `CorsairOfficial/cue-sdk` (`iCUESDK_4.0.84.zip`):
+
+- HTTPS only. The request and every redirect must target `github.com` or one of GitHub's release-asset hosts; at
+  most 5 redirects, a 10 s connect timeout, a 60 s total timeout and a 2 MiB size cap.
+- The archive's SHA-256 is compared with a constant in the source. Only the member
+  `iCUESDK/redist/x64/iCUESDK.x64_2019.dll` is read, its SHA-256 is compared with a second constant, and archive
+  member names are never used as file paths.
+- The library is written to `icue-sdk` in the app data directory through a temporary file and a rename. A file that
+  already has the expected checksum is left alone.
+- The iCUE output then retries loading at once; no restart is needed.
+- Nothing is downloaded until the user presses the button.
+
+Changing the pinned version means updating the URL and both checksums in `apps/desktop/src-tauri/src/icue_sdk.rs`.
 
 ## 2. Philips Hue through the bridge's local API
 

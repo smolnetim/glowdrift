@@ -72,8 +72,9 @@ Details are in [docs/architecture.md](docs/architecture.md).
   record, store, or upload screenshots.
 - The window can show a thumbnail of a monitor so you can choose a region. That thumbnail is generated locally and
   only passed to the app's own window.
-- There is no telemetry. The only network request Glowdrift makes by itself is the update check against GitHub
-  Releases, which you can disable.
+- There is no telemetry. Glowdrift makes two kinds of network request: the update check and download against
+  GitHub Releases (which you can disable), and, only when you press the button on the Lights page, the download
+  of Corsair's iCUE SDK library from Corsair's GitHub release, which is verified before use.
 - The configuration is a small JSON file in the app's config directory.
 
 ## Build from source

@@ -74,7 +74,11 @@ Commands (Tauri `invoke`):
 | `get_monitor_thumbnail(monitorId, maxWidth)` | `{ width, height, dataUrl }` | PNG data URL of the whole monitor. `monitorId` null means the primary monitor. |
 | `get_engine_status()` | `EngineStatus` | `{ running, measuredFps, lastError, raw, smoothed }` |
 | `set_engine_running(running)` | `EngineStatus` | |
-| `list_outputs()` | `OutputStatus[]` | `{ id, kind, name, enabled, state, detail, deviceCount }`; `state` is `connected`, `connecting`, `unavailable`, `error` or `disabled`. |
+| `list_outputs()` | `OutputStatus[]` | `{ id, kind, name, enabled, state, detail, deviceCount, code? }`; `state` is `connected`, `connecting`, `unavailable`, `error` or `disabled`. `code` is an optional machine-readable cause; the only value is `libraryMissing` (the iCUE SDK library is not installed). |
+| `install_icue_sdk()` | `OutputStatus[]` | Downloads the pinned iCUE SDK release from GitHub, verifies it and installs the library, then makes the iCUE output retry loading. Returns the statuses after the retry. Rejects with a user-presentable message. See [integrations.md](integrations.md). |
+| `stage_update()` | `string` or null | Checks for an update, downloads and verifies it, and stages it. Returns the staged version, or null when up to date. |
+| `install_pending_update()` | `boolean` | Installs the staged update; false when none is staged. On Windows a successful install ends the process after the engine and outputs are stopped. |
+| `frontend_ready()` | nothing | Sent once after the first screen is painted; the shell then shows the main window (unless it is starting minimised). |
 | `get_app_info()` | `{ version, name }` | |
 
 Events (emitted by Rust):
@@ -84,10 +88,15 @@ Events (emitted by Rust):
 | `engine://color` | `{ raw, smoothed }` as `#rrggbb` | At most about 20 per second, only while the main window is visible. |
 | `engine://status` | `EngineStatus` | On change: start, stop, error, notable frame-rate change. |
 | `outputs://status` | `OutputStatus[]` | On change. |
+| `updater://ready` | `{ version }` | An update was downloaded and staged. |
 
-Autostart, updates and restart are not part of this contract: the frontend uses the official Tauri plugins'
-JavaScript APIs (`@tauri-apps/plugin-autostart`, `@tauri-apps/plugin-updater`, `@tauri-apps/plugin-process`)
-directly, with permissions granted in `apps/desktop/src-tauri/capabilities/default.json`.
+Autostart uses the official Tauri plugin's JavaScript API (`@tauri-apps/plugin-autostart`). The update check calls
+the updater plugin's `check` (`@tauri-apps/plugin-updater`) and the fallback restart uses
+`@tauri-apps/plugin-process`; the permissions granted in `apps/desktop/src-tauri/capabilities/default.json` are
+limited to those calls (`updater:allow-check`, `process:allow-restart`, autostart enable, disable and status).
+Downloading and installing an update goes through `stage_update` and `install_pending_update` instead of the
+plugin's own installer, so the engine and outputs are stopped before the installer starts. A failed install keeps
+the update staged and rejects with a message, so the restart button can be pressed again.
 
 The webview runs under a strict content security policy (`script-src 'self'`, `style-src 'self'`), so the frontend
 uses CSS classes or sets styles from script rather than inline `style` attributes in markup.
@@ -129,16 +138,37 @@ migration that upgrades older files on load. See [updates.md](updates.md) for th
 | Desktop Duplication access lost (resolution or display mode change, secure desktop such as UAC, display sleep, another full-screen exclusive app) | The capturer reports `AccessLost`. The engine recreates the capturer and retries with exponential backoff from 250 ms up to 2 s, then resumes. The light holds its last colour meanwhile. |
 | Configured monitor no longer exists | The capturer reports `MonitorNotFound`. The error is surfaced in `EngineStatus.lastError` and the engine retries every few seconds, so reconnecting the monitor recovers without a restart. |
 | Capture unsupported or other OS error | Surfaced in `lastError`; the engine retries on a slower interval rather than spinning. |
-| iCUE not running, SDK library missing, or connection lost | The iCUE output reports `unavailable`, `connecting` or `error` with a `detail` string. The outputs poller notices a reconnect and the engine resends the current colour. The rest of the app keeps working. |
+| iCUE not running, SDK library missing, or connection lost | The iCUE output reports `unavailable`, `connecting` or `error` with a `detail` string; a missing library also sets `code: "libraryMissing"`, which the UI answers with a download button (`install_icue_sdk`). The outputs poller notices a reconnect and the engine resends the current colour. The rest of the app keeps working. |
 | An output is disabled in the settings, or the engine is paused | Outputs are released (`disabled`) and the current state is restored on resume. |
 | `config.json` missing | Defaults are used. |
 | `config.json` unreadable as a configuration | It is copied to `config.json.bak` and defaults are used. Valid files are validated and clamped. |
 | Config writes | Written to a temporary file and then moved into place, so a crash does not leave a half-written file. |
 | Second launch | The single-instance plugin focuses the existing window instead of starting another engine. |
-| Update check or download fails | Handled in the frontend; it does not touch the engine, so lighting continues. |
+| Update check or download fails | Does not touch the engine, so lighting continues. A missing release or no network is logged at debug level; other failures at warning level. After consecutive failed background checks the interval doubles (6 h, 12 h, 24 h, 48 h at most) until a check succeeds. |
+| Update install fails | The staged update is kept, the error is shown next to the restart button and the install can be retried. If the installer had already been reached, the engine and outputs were stopped and stay off until Glowdrift restarts. |
+| Library download fails | The error is shown next to the download button and nothing is written; a checksum mismatch discards the download. |
 
 ## Window and tray lifecycle
 
 The app lives in the system tray. Closing the window hides it; the engine keeps running. Preview events are
 emitted only while the window is visible, so a hidden app does no UI work. The autostart entry passes
 `--minimized`, and `startMinimized` controls whether the window is shown at launch.
+
+The main window stays hidden until the frontend calls `frontend_ready` after painting its first screen (or after 4
+seconds, whichever comes first), so no blank frame is shown. When the app starts minimised the window is never shown
+automatically.
+
+Tray: a left click toggles the window, a right click opens the menu (Open, Pause or Resume, Check for updates, Quit).
+The Pause/Resume label follows the engine's running state.
+
+### Shutdown
+
+Every exit path stops the engine and releases iCUE control before the process ends:
+
+| Path | How |
+| --- | --- |
+| Tray Quit | Stops the engine and outputs, then exits. |
+| `--quit` | A second launch with `--quit` is forwarded by the single-instance plugin to the running instance, which quits as above and exits within a few seconds. With no running instance the launched process exits immediately. |
+| Window close request while quitting | Once shutdown has begun, a close request is no longer turned into "hide", so the window and process can finish exiting. |
+| Windows logoff or shutdown | The event loop receives the session-end message and runs the exit handler, which stops the engine and outputs. |
+| Update install and restart | The updater's before-exit hook and the process plugin's restart both stop the engine and outputs first. |
