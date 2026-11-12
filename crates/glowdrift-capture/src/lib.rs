@@ -44,6 +44,22 @@ pub enum CaptureError {
     Os(String),
 }
 
+/// Where the time of the most recent [`Capturer::grab`] went.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GrabTimings {
+    /// Inside `AcquireNextFrame`, including the wait for a desktop update.
+    pub acquire: Duration,
+    /// Copying the desktop image into the cache and releasing the duplication frame.
+    pub store: Duration,
+    /// Recording the downscale and readback copies on the immediate context.
+    pub submit: Duration,
+    /// Blocked in `Map` waiting for the GPU.
+    pub map: Duration,
+    /// Time between the desktop image shown in the returned frame being presented and the frame
+    /// being returned; `None` when no frame was returned or the presentation time is unknown.
+    pub latency: Option<Duration>,
+}
+
 /// A display attached to the desktop.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -161,6 +177,12 @@ impl Capturer {
         &self.monitor
     }
 
+    /// Timings of the most recent [`Capturer::grab`].
+    #[cfg(windows)]
+    pub fn last_timings(&self) -> GrabTimings {
+        self.inner.timings()
+    }
+
     /// Changes the downscale target for subsequent [`Capturer::grab`] calls. The next `grab`
     /// delivers a frame immediately from the last desktop image seen.
     pub fn set_max_dimension(&mut self, max_dimension: u32) {
@@ -188,9 +210,10 @@ impl Capturer {
     }
 
     /// Waits up to `timeout` for a new desktop frame and returns the downscaled `region` of
-    /// it. `Ok(None)` means the screen did not change within the timeout; pointer-only updates
-    /// do not count as a change. When `region` differs from the previously delivered one, a
-    /// frame is returned immediately from the last desktop image seen.
+    /// it. `Ok(None)` means the screen did not change within the timeout (or the GPU needed
+    /// longer than the timeout for the change, which the next call then delivers); pointer-only
+    /// updates do not count as a change. When `region` differs from the previously delivered
+    /// one, a frame is returned immediately from the last desktop image seen.
     /// [`CaptureError::AccessLost`] means the caller must recreate the capturer.
     pub fn grab(
         &mut self,

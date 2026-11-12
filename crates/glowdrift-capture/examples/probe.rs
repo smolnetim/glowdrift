@@ -1,16 +1,21 @@
 //! Prints the monitors, then captures one monitor for a few seconds and reports grab timings.
 //!
-//! Usage: `probe [--monitor <id>] [--seconds <n>] [--fps <n>] [--max-dim <px>] [--region x,y,w,h]`
+//! Usage: `probe [--monitor <id>] [--seconds <n>] [--fps <n>] [--timeout-ms <n>] [--max-dim <px>]
+//! [--region x,y,w,h]`. `--fps 0` grabs back to back, which measures latency from a screen change.
 
 use std::time::{Duration, Instant};
 
-use glowdrift_capture::{CaptureError, Capturer, Frame, capture_thumbnail, list_monitors};
+use glowdrift_capture::{
+    CaptureError, Capturer, Frame, GrabTimings, capture_thumbnail, list_monitors,
+};
 use glowdrift_core::{NormRect, ReduceMode, reduce};
 
 struct Args {
     monitor: Option<String>,
     seconds: f32,
     fps: u32,
+    /// Grab timeout in milliseconds; defaults to the frame period.
+    timeout_ms: Option<u64>,
     max_dim: u32,
     region: NormRect,
 }
@@ -20,6 +25,7 @@ fn parse_args() -> Result<Args, String> {
         monitor: None,
         seconds: 3.0,
         fps: 20,
+        timeout_ms: None,
         max_dim: 64,
         region: NormRect::full(),
     };
@@ -30,6 +36,7 @@ fn parse_args() -> Result<Args, String> {
             "--monitor" => args.monitor = Some(value()?),
             "--seconds" => args.seconds = value()?.parse().map_err(|e| format!("{e}"))?,
             "--fps" => args.fps = value()?.parse().map_err(|e| format!("{e}"))?,
+            "--timeout-ms" => args.timeout_ms = Some(value()?.parse().map_err(|e| format!("{e}"))?),
             "--max-dim" => args.max_dim = value()?.parse().map_err(|e| format!("{e}"))?,
             "--region" => {
                 let v: Vec<f32> = value()?
@@ -75,23 +82,102 @@ fn percentile(sorted: &[Duration], p: f64) -> Duration {
 
 struct Run {
     grab_times: Vec<Duration>,
+    /// Thread CPU time spent inside each delivered `grab` call.
+    cpu_times: Vec<Duration>,
+    timings: Vec<GrabTimings>,
     timeouts: u32,
     last: Option<Frame>,
+    /// Process CPU time (user + kernel) and wall time over the whole run.
+    process_cpu: Duration,
+    /// Process CPU time from the cycle counter, which counts every thread precisely.
+    process_cycle_cpu: Duration,
+    wall: Duration,
+}
+
+fn thread_cycles() -> u64 {
+    use windows::Win32::System::Threading::GetCurrentThread;
+    use windows::Win32::System::WindowsProgramming::QueryThreadCycleTime;
+    let mut cycles = 0u64;
+    // SAFETY: the pseudo handle is always valid and the out parameter is a live local.
+    let _ = unsafe { QueryThreadCycleTime(GetCurrentThread(), &raw mut cycles) };
+    cycles
+}
+
+/// Thread cycles per second, measured by spinning briefly.
+fn cycles_per_second() -> f64 {
+    let (c0, t0) = (thread_cycles(), Instant::now());
+    while t0.elapsed() < Duration::from_millis(150) {
+        std::hint::spin_loop();
+    }
+    (thread_cycles() - c0) as f64 / t0.elapsed().as_secs_f64()
+}
+
+fn process_cycles() -> u64 {
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    use windows::Win32::System::WindowsProgramming::QueryProcessCycleTime;
+    let mut cycles = 0u64;
+    // SAFETY: the pseudo handle is always valid and the out parameter is a live local.
+    let _ = unsafe { QueryProcessCycleTime(GetCurrentProcess(), &raw mut cycles) };
+    cycles
+}
+
+fn process_cpu() -> Duration {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    let zero = FILETIME::default();
+    let (mut creation, mut exit, mut kernel, mut user) = (zero, zero, zero, zero);
+    // SAFETY: the pseudo handle is always valid and the out parameters are live locals.
+    let _ = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    };
+    let ticks = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+    Duration::from_nanos((ticks(kernel) + ticks(user)) * 100)
 }
 
 fn run_capture(capturer: &mut Capturer, target: Option<&str>, args: &Args) -> Run {
-    let period = Duration::from_secs_f64(1.0 / f64::from(args.fps.max(1)));
+    let period = if args.fps == 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_secs_f64(1.0 / f64::from(args.fps))
+    };
+    let timeout = args.timeout_ms.map_or_else(
+        || {
+            if period.is_zero() {
+                Duration::from_millis(100)
+            } else {
+                period
+            }
+        },
+        Duration::from_millis,
+    );
     let start = Instant::now();
     let end = start + Duration::from_secs_f32(args.seconds);
     let mut grab_times: Vec<Duration> = Vec::new();
     let mut timeouts = 0u32;
     let mut last: Option<Frame> = None;
     let mut next_tick = start;
+    let hz = cycles_per_second();
+    let mut cpu_times: Vec<Duration> = Vec::new();
+    let mut timings: Vec<GrabTimings> = Vec::new();
+    let cpu_start = process_cpu();
+    let pc_start = process_cycles();
+    let wall_start = Instant::now();
     while Instant::now() < end {
         let begin = Instant::now();
-        match capturer.grab(args.region, period) {
+        let cycles = thread_cycles();
+        let result = capturer.grab(args.region, timeout);
+        let used = thread_cycles() - cycles;
+        match result {
             Ok(Some(frame)) => {
                 grab_times.push(begin.elapsed());
+                cpu_times.push(Duration::from_secs_f64(used as f64 / hz));
+                timings.push(capturer.last_timings());
                 last = Some(frame);
             }
             Ok(None) => timeouts += 1,
@@ -117,8 +203,13 @@ fn run_capture(capturer: &mut Capturer, target: Option<&str>, args: &Args) -> Ru
     }
     Run {
         grab_times,
+        cpu_times,
+        timings,
         timeouts,
         last,
+        process_cpu: process_cpu().saturating_sub(cpu_start),
+        process_cycle_cpu: Duration::from_secs_f64((process_cycles() - pc_start) as f64 / hz),
+        wall: wall_start.elapsed(),
     }
 }
 
@@ -141,6 +232,47 @@ fn report(run: &Run) {
             grab_times[grab_times.len() - 1]
         );
     }
+    if !run.timings.is_empty() {
+        let n = run.timings.len() as u32;
+        let avg = |f: fn(&GrabTimings) -> Duration| run.timings.iter().map(f).sum::<Duration>() / n;
+        let cpu: Duration = run.cpu_times.iter().sum::<Duration>() / n;
+        let mut cpu_sorted = run.cpu_times.clone();
+        cpu_sorted.sort();
+        println!(
+            "thread CPU per delivered frame: avg {:.2?}  p95 {:.2?}  max {:.2?}",
+            cpu,
+            percentile(&cpu_sorted, 0.95),
+            cpu_sorted[cpu_sorted.len() - 1]
+        );
+        println!(
+            "avg phases per grab: acquire(wait) {:.2?}  store {:.2?}  submit {:.2?}  map-block {:.2?}",
+            avg(|t| t.acquire),
+            avg(|t| t.store),
+            avg(|t| t.submit),
+            avg(|t| t.map)
+        );
+        let mut latencies: Vec<Duration> = run.timings.iter().filter_map(|t| t.latency).collect();
+        latencies.sort();
+        if !latencies.is_empty() {
+            let total: Duration = latencies.iter().sum();
+            println!(
+                "latency present->returned: min {:.2?}  avg {:.2?}  p95 {:.2?}  max {:.2?} ({} samples)",
+                latencies[0],
+                total / latencies.len() as u32,
+                percentile(&latencies, 0.95),
+                latencies[latencies.len() - 1],
+                latencies.len()
+            );
+        }
+    }
+    println!(
+        "process CPU over run: {:.2?} of {:.2?} wall = {:.2}% of one core (cycle counter: {:.2?} = {:.2}%)",
+        run.process_cpu,
+        run.wall,
+        run.process_cpu.as_secs_f64() / run.wall.as_secs_f64() * 100.0,
+        run.process_cycle_cpu,
+        run.process_cycle_cpu.as_secs_f64() / run.wall.as_secs_f64() * 100.0
+    );
     if let Some(frame) = last {
         let color = reduce(&frame.view(), ReduceMode::Average)
             .to_srgb()
