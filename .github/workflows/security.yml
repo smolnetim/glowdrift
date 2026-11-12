@@ -54,7 +54,7 @@ jobs:
   dependency-review:
     name: Dependency review
     # Dependency review on private repositories needs GitHub Advanced Security.
-    if: github.event_name == 'pull_request' && github.event.repository.visibility == 'public'
+    if: github.event_name == 'pull_request' && github.event.repository.private == false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -75,7 +75,7 @@ jobs:
   codeql:
     name: CodeQL (${{ matrix.language }})
     # Code scanning on private repositories needs GitHub Advanced Security.
-    if: github.event.repository.visibility == 'public'
+    if: github.event.repository.private == false
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -109,7 +109,9 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-      pull-requests: read
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb # gitleaks_8.30.1_linux_x64.tar.gz
     steps:
       - name: Check out (full history)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -117,7 +119,14 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Scan
-        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install gitleaks (checksum verified)
+        run: |
+          set -euo pipefail
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl --fail --silent --show-error --location --retry 3             --output "$RUNNER_TEMP/$archive"             "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/$archive" | sha256sum --check --strict -
+          mkdir "$RUNNER_TEMP/gitleaks"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
+
+      - name: Scan the full git history
+        run: '"$RUNNER_TEMP/gitleaks/gitleaks" git --redact --exit-code 2 --no-banner --verbose .'

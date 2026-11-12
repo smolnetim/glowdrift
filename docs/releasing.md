@@ -11,9 +11,23 @@ Create `smolnetim/glowdrift` on GitHub and push `main`. The default update endpo
 (`https://github.com/smolnetim/glowdrift/releases/latest/download/latest.json`) only works when release assets are
 publicly downloadable; see [updates.md](updates.md) for the options if the repository stays private.
 
-### 2. Add secrets
+### 2. Create the `release` environment and add secrets
 
-Repository settings, Secrets and variables, Actions:
+The release job runs in a GitHub Environment named `release` (`environment: release` in `release.yml`). It is
+what lets you gate the signing secrets behind approvals and tag rules. The workflow also runs when the
+environment has no protection rules, and GitHub creates an unprotected `release` environment automatically the
+first time the job references it, but create it yourself to configure it:
+
+1. Settings, Environments, New environment, name it `release`.
+2. Optional: **Required reviewers**, so a release job waits for approval before it receives any secret.
+3. Optional: **Deployment branches and tags**, select "Selected branches and tags" and add a tag rule `v*`, so
+   only `v*` tags can use the environment. A manual run (`workflow_dispatch`) uses the ref picked under "Use
+   workflow from"; pick the tag itself, or it will be refused by this rule.
+4. Put the secrets below on the environment (Environment secrets) to keep them away from other workflows. Secrets
+   that already exist as repository secrets, such as `TAURI_SIGNING_PRIVATE_KEY`, keep working with the
+   environment and can stay there; an environment secret with the same name takes precedence.
+
+Secrets (repository or environment scope, Settings, Secrets and variables, Actions):
 
 | Secret | Required | Value |
 | --- | --- | --- |
@@ -24,6 +38,11 @@ Repository settings, Secrets and variables, Actions:
 
 The public key matching the private key is already in `apps/desktop/src-tauri/tauri.conf.json`. If you generate a
 new key pair, replace it there too (and read the rotation notes in [updates.md](updates.md) first).
+
+The signing key and password are passed only to the `tauri-action` build step. The Azure service principal values
+are passed only to the steps that need them (the endpoint, account and profile when the signing command is
+written; client ID, secret and tenant ID to the build step, and only when all six Azure secrets are set). Other
+steps (`npm ci`, `cargo install`, release notes) never see them.
 
 `GITHUB_TOKEN` is provided automatically. The release job asks for `contents: write`, `id-token: write` and
 `attestations: write` itself; no workflow-level write permission is granted elsewhere.
@@ -57,16 +76,16 @@ new key pair, replace it there too (and read the rotation notes in [updates.md](
 | Built-in updater download | Does not work without credentials | Works |
 
 The workflows skip CodeQL, dependency review and the attestation step unless
-`github.event.repository.visibility == 'public'`, so they do not fail on a private repository. The remaining jobs
-(cargo-deny, npm audit, gitleaks, CI) run everywhere. gitleaks-action is free for personal accounts; for an
-organisation account it needs a `GITLEAKS_LICENSE` secret.
+`github.event.repository.private == false`, so they do not fail on a private repository. The remaining jobs
+(cargo-deny, npm audit, gitleaks, CI) run everywhere. gitleaks runs as a checksum-verified, pinned CLI release
+over the full git history, so it needs no licence.
 
 ## Workflows
 
 | File | Trigger | Does |
 | --- | --- | --- |
 | `.github/workflows/ci.yml` | Push to `main`, pull requests | Frontend install, typecheck, optional lint and build; `cargo fmt --check`; clippy with `-D warnings`; tests; a debug `tauri build --no-bundle` to validate linking. |
-| `.github/workflows/security.yml` | Push to `main`, pull requests, weekly, manual | cargo-deny, npm audit (production dependencies, high and above), dependency review, CodeQL (JavaScript/TypeScript, Rust, Actions), gitleaks. |
+| `.github/workflows/security.yml` | Push to `main`, pull requests, weekly, manual | cargo-deny, npm audit (production dependencies, high and above), dependency review, CodeQL (JavaScript/TypeScript, Rust, Actions), gitleaks (full history). |
 | `.github/workflows/release.yml` | Tag `v*.*.*`, manual | Verify, build, sign updater artifacts, publish the release, attest. |
 
 Third-party actions are pinned to full commit SHAs with the version in a trailing comment. Dependabot proposes
@@ -75,9 +94,9 @@ updates to the pins.
 ## What the release workflow does
 
 1. Checks out the tag with full history.
-2. Fails early if `TAURI_SIGNING_PRIVATE_KEY` is not set, then runs `scripts/check-version.ps1` to confirm the tag
-   equals the version in `Cargo.toml`, `apps/desktop/package.json`, `Cargo.lock` and (if present)
-   `tauri.conf.json`.
+2. Validates the tag format, runs `scripts/check-version.ps1` to confirm the tag equals the version in
+   `Cargo.toml`, `apps/desktop/package.json`, `Cargo.lock` and (if present) `tauri.conf.json`, and fails early if
+   `TAURI_SIGNING_PRIVATE_KEY` is not set.
 3. Generates release notes from the Conventional Commits since the previous `v*.*.*` tag with
    `scripts/release-notes.ps1`.
 4. Optionally prepares Authenticode signing (see below).

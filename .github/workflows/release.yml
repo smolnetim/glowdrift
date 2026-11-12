@@ -30,21 +30,11 @@ jobs:
     name: Build and publish (Windows)
     runs-on: windows-latest
     timeout-minutes: 60
+    environment: release
     permissions:
       contents: write # create the release and upload assets
       id-token: write # build provenance attestation
       attestations: write # build provenance attestation
-    env:
-      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-      # Optional Authenticode signing through Azure Artifact Signing
-      # (formerly Azure Trusted Signing). Skipped when any of these is absent.
-      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-      AZURE_SIGNING_ENDPOINT: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
-      AZURE_SIGNING_ACCOUNT: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
-      AZURE_SIGNING_PROFILE: ${{ secrets.AZURE_SIGNING_PROFILE }}
     steps:
       - name: Check out the tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -53,20 +43,37 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify tag, versions and signing key
+      - name: Verify tag and versions
         shell: pwsh
         run: |
-          if ([string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY)) {
-            throw 'Secret TAURI_SIGNING_PRIVATE_KEY is not set. The updater artifacts cannot be signed.'
+          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') {
+            throw "Tag '$env:RELEASE_TAG' is not of the form vMAJOR.MINOR.PATCH[-prerelease]."
           }
           ./scripts/check-version.ps1 -Tag $env:RELEASE_TAG
+
+      # The steps below only learn whether a secret is set; the values are not exposed.
+      - name: Check the updater signing key is set
+        shell: pwsh
+        env:
+          SIGNING_KEY_SET: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+        run: |
+          if ($env:SIGNING_KEY_SET -ne 'true') {
+            throw 'Secret TAURI_SIGNING_PRIVATE_KEY is not set. The updater artifacts cannot be signed.'
+          }
 
       - name: Decide on Authenticode signing
         id: authenticode
         shell: pwsh
+        env:
+          AZURE_CLIENT_ID_SET: ${{ secrets.AZURE_CLIENT_ID != '' }}
+          AZURE_CLIENT_SECRET_SET: ${{ secrets.AZURE_CLIENT_SECRET != '' }}
+          AZURE_TENANT_ID_SET: ${{ secrets.AZURE_TENANT_ID != '' }}
+          AZURE_SIGNING_ENDPOINT_SET: ${{ secrets.AZURE_SIGNING_ENDPOINT != '' }}
+          AZURE_SIGNING_ACCOUNT_SET: ${{ secrets.AZURE_SIGNING_ACCOUNT != '' }}
+          AZURE_SIGNING_PROFILE_SET: ${{ secrets.AZURE_SIGNING_PROFILE != '' }}
         run: |
           $required = 'AZURE_CLIENT_ID','AZURE_CLIENT_SECRET','AZURE_TENANT_ID','AZURE_SIGNING_ENDPOINT','AZURE_SIGNING_ACCOUNT','AZURE_SIGNING_PROFILE'
-          $missing = $required | Where-Object { [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($_)) }
+          $missing = $required | Where-Object { [Environment]::GetEnvironmentVariable("${_}_SET") -ne 'true' }
           if ($missing) {
             "enabled=false" >> $env:GITHUB_OUTPUT
             Write-Host "Authenticode signing skipped; missing: $($missing -join ', ')"
@@ -108,12 +115,20 @@ jobs:
       # OPTIONAL: Authenticode code signing. Runs only when all Azure secrets are
       # present. Tauri calls signCommand for the app executable and the NSIS
       # installer during the build, so the updater signature that is computed
-      # afterwards covers the Authenticode-signed installer.
+      # afterwards covers the Authenticode-signed installer. The service principal
+      # credentials are provided to the build step only.
+      - name: Install the signing tool (optional)
+        if: steps.authenticode.outputs.enabled == 'true'
+        run: cargo install artifact-signing-cli --locked
+
       - name: Configure Authenticode signing (optional)
         if: steps.authenticode.outputs.enabled == 'true'
         shell: pwsh
+        env:
+          AZURE_SIGNING_ENDPOINT: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          AZURE_SIGNING_PROFILE: ${{ secrets.AZURE_SIGNING_PROFILE }}
         run: |
-          cargo install artifact-signing-cli --locked
           $command = 'artifact-signing-cli -e {0} -a {1} -c {2} -d Glowdrift %1' -f $env:AZURE_SIGNING_ENDPOINT, $env:AZURE_SIGNING_ACCOUNT, $env:AZURE_SIGNING_PROFILE
           $config = @{ bundle = @{ windows = @{ signCommand = $command } } } | ConvertTo-Json -Depth 5
           Set-Content -Path apps/desktop/src-tauri/tauri.sign.conf.json -Value $config -Encoding utf8
@@ -123,6 +138,11 @@ jobs:
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          AZURE_CLIENT_ID: ${{ steps.authenticode.outputs.enabled == 'true' && secrets.AZURE_CLIENT_ID || '' }}
+          AZURE_CLIENT_SECRET: ${{ steps.authenticode.outputs.enabled == 'true' && secrets.AZURE_CLIENT_SECRET || '' }}
+          AZURE_TENANT_ID: ${{ steps.authenticode.outputs.enabled == 'true' && secrets.AZURE_TENANT_ID || '' }}
         with:
           projectPath: apps/desktop
           tagName: ${{ env.RELEASE_TAG }}
@@ -136,7 +156,7 @@ jobs:
 
       # Artifact attestations on private repositories need GitHub Enterprise Cloud.
       - name: Attest build provenance
-        if: github.event.repository.visibility == 'public'
+        if: github.event.repository.private == false
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
