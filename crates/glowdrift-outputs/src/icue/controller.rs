@@ -10,7 +10,7 @@ use glowdrift_core::Rgb;
 
 use super::ffi::DLL_NAME;
 use super::sdk::{ErrorCode, EventSink, Sdk, SdkError, SdkEvent, SessionState};
-use crate::OutputState;
+use crate::{OutputCode, OutputState};
 
 /// Minimum gap between colour writes (about 30 Hz).
 pub(crate) const MIN_SEND_INTERVAL: Duration = Duration::from_millis(33);
@@ -32,6 +32,7 @@ pub(crate) struct Status {
     pub state: OutputState,
     pub detail: Option<String>,
     pub device_count: u32,
+    pub code: Option<OutputCode>,
 }
 
 impl Status {
@@ -40,6 +41,7 @@ impl Status {
             state,
             detail: detail.map(str::to_owned),
             device_count: 0,
+            code: None,
         }
     }
 }
@@ -55,6 +57,7 @@ enum Fault {
 #[derive(Debug)]
 struct Device {
     id: String,
+    model: String,
     led_ids: Vec<u32>,
 }
 
@@ -93,6 +96,9 @@ pub(crate) struct Controller<S: Sdk> {
     retry_at: Option<Instant>,
     backoff: Backoff,
     devices: Vec<Device>,
+    /// Models of devices that failed to enumerate or to take a colour; re-read on the next
+    /// enumeration.
+    skipped: Vec<String>,
     enumerated: bool,
     enumerate_at: Option<Instant>,
     desired: Option<Rgb>,
@@ -150,6 +156,7 @@ impl<S: Sdk> Controller<S> {
             retry_at: None,
             backoff: Backoff::new(),
             devices: Vec::new(),
+            skipped: Vec::new(),
             enumerated: false,
             enumerate_at: None,
             desired: None,
@@ -178,6 +185,15 @@ impl<S: Sdk> Controller<S> {
             self.teardown();
         }
         self.refresh_status();
+    }
+
+    /// Makes the next [`Controller::tick`] attempt to connect immediately when the previous
+    /// attempt failed and is waiting out its back-off.
+    pub fn retry_now(&mut self) {
+        if self.enabled && !self.stopped && !self.sdk_connected {
+            self.retry_at = None;
+            self.backoff.reset();
+        }
     }
 
     /// Records the latest requested colour. Writing happens in [`Controller::tick`].
@@ -280,7 +296,12 @@ impl<S: Sdk> Controller<S> {
     }
 
     fn drop_devices(&mut self) {
+        // A fault describes the lost session or its devices; a missing library outlives both.
+        if !matches!(self.fault, Some(Fault::LibraryMissing)) {
+            self.fault = None;
+        }
         self.devices.clear();
+        self.skipped.clear();
         self.enumerated = false;
         self.enumerate_at = None;
         self.sent = None;
@@ -310,19 +331,25 @@ impl<S: Sdk> Controller<S> {
             }
         };
         let mut devices = Vec::with_capacity(list.len());
+        let mut skipped = Vec::new();
         for info in list.into_iter().filter(|d| d.led_count > 0) {
             match self.sdk.led_ids(&info.id) {
                 Ok(led_ids) if !led_ids.is_empty() => devices.push(Device {
                     id: info.id,
+                    model: info.model,
                     led_ids,
                 }),
                 Ok(_) => {}
                 Err(err) if err.code() == Some(ErrorCode::DeviceNotFound) => {
                     log::debug!("iCUE device {} vanished during enumeration", info.model);
                 }
-                Err(err) => {
+                Err(err) if err.code() == Some(ErrorCode::NotConnected) => {
                     self.enumeration_failed(&err, now);
                     return;
+                }
+                Err(err) => {
+                    log::warn!("iCUE device {} skipped: {err}", info.model);
+                    skipped.push(info.model);
                 }
             }
         }
@@ -330,10 +357,15 @@ impl<S: Sdk> Controller<S> {
         self.enumerated = true;
         self.sent = None;
         self.send_retry_at = None;
-        self.backoff.reset();
-        if matches!(self.fault, Some(Fault::Error(_))) {
+        if !matches!(self.fault, Some(Fault::LibraryMissing)) {
             self.fault = None;
         }
+        if skipped.is_empty() {
+            self.backoff.reset();
+        } else {
+            self.enumerate_at = Some(now + self.backoff.next_delay());
+        }
+        self.skipped = skipped;
     }
 
     fn enumeration_failed(&mut self, err: &SdkError, now: Instant) {
@@ -371,16 +403,17 @@ impl<S: Sdk> Controller<S> {
         let Some(color) = self.desired else { return };
         let mut lost = false;
         let mut stale = false;
-        let mut contended = false;
-        let mut failure = None;
-        for device in &self.devices {
+        let mut written = 0_usize;
+        // Devices that rejected the colour: index, whether another client holds control, message.
+        let mut failed: Vec<(usize, bool, String)> = Vec::new();
+        for (index, device) in self.devices.iter().enumerate() {
             match self.sdk.set_leds_color(&device.id, &device.led_ids, color) {
-                Ok(()) => {}
+                Ok(()) => written += 1,
                 Err(err) => match err.code() {
                     Some(ErrorCode::NotConnected) => lost = true,
                     Some(ErrorCode::DeviceNotFound) => stale = true,
-                    Some(ErrorCode::NoControl) => contended = true,
-                    _ => failure = Some(err.to_string()),
+                    Some(ErrorCode::NoControl) => failed.push((index, true, err.to_string())),
+                    _ => failed.push((index, false, err.to_string())),
                 },
             }
         }
@@ -392,25 +425,47 @@ impl<S: Sdk> Controller<S> {
             self.drop_devices();
             return;
         }
-        if contended {
-            self.fault = Some(Fault::Contended);
-            self.send_retry_at = Some(now + SEND_RETRY);
-            return;
-        }
-        if let Some(message) = failure {
-            log::warn!("iCUE write failed: {message}");
-            self.fault = Some(Fault::Error(message));
-            self.send_retry_at = Some(now + SEND_RETRY);
-            return;
-        }
         if stale {
             self.enumerate_at.get_or_insert(now + ENUMERATE_DEBOUNCE);
+        }
+        if !failed.is_empty() {
+            if written == 0 {
+                self.fault = Some(if failed.iter().any(|(_, contended, _)| *contended) {
+                    Fault::Contended
+                } else {
+                    let message = failed.swap_remove(0).2;
+                    log::warn!("iCUE write failed: {message}");
+                    Fault::Error(message)
+                });
+                self.send_retry_at = Some(now + SEND_RETRY);
+                return;
+            }
+            self.skip_failed_devices(&failed, now);
         }
         self.sent = Some(color);
         self.send_retry_at = None;
         if matches!(self.fault, Some(Fault::Contended | Fault::Error(_))) {
             self.fault = None;
         }
+    }
+
+    /// Takes devices that rejected a colour out of use while the others keep working, and
+    /// schedules a re-enumeration that gives them another chance.
+    fn skip_failed_devices(&mut self, failed: &[(usize, bool, String)], now: Instant) {
+        for (index, _, message) in failed {
+            if let Some(device) = self.devices.get(*index) {
+                log::warn!("iCUE device {} skipped: {message}", device.model);
+                self.skipped.push(device.model.clone());
+            }
+        }
+        let mut index = 0;
+        self.devices.retain(|_| {
+            let keep = !failed.iter().any(|(i, _, _)| *i == index);
+            index += 1;
+            keep
+        });
+        let retry = now + self.backoff.next_delay();
+        self.enumerate_at = Some(self.enumerate_at.map_or(retry, |at| at.min(retry)));
     }
 
     fn refresh_status(&mut self) {
@@ -426,10 +481,13 @@ impl<S: Sdk> Controller<S> {
         }
         match &self.fault {
             Some(Fault::LibraryMissing) => {
-                return Status::new(
-                    OutputState::Unavailable,
-                    Some(&format!("iCUE SDK library ({DLL_NAME}) not found")),
-                );
+                return Status {
+                    code: Some(OutputCode::LibraryMissing),
+                    ..Status::new(
+                        OutputState::Unavailable,
+                        Some(&format!("iCUE SDK library ({DLL_NAME}) not found")),
+                    )
+                };
             }
             Some(Fault::Error(message)) => {
                 return Status::new(OutputState::Error, Some(message));
@@ -465,10 +523,26 @@ impl<S: Sdk> Controller<S> {
                 if leds == 1 { "LED" } else { "LEDs" },
             )
         };
+        if self.skipped.is_empty() {
+            return Status {
+                state: OutputState::Connected,
+                detail: Some(detail),
+                device_count: u32::try_from(count).unwrap_or(u32::MAX),
+                code: None,
+            };
+        }
+        let skipped = format!("skipped {}", self.skipped.join(", "));
+        if count == 0 {
+            return Status::new(
+                OutputState::Error,
+                Some(&format!("Could not use any device ({skipped})")),
+            );
+        }
         Status {
             state: OutputState::Connected,
-            detail: Some(detail),
+            detail: Some(format!("{detail}; {skipped}")),
             device_count: u32::try_from(count).unwrap_or(u32::MAX),
+            code: None,
         }
     }
 }

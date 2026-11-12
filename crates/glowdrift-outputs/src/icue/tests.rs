@@ -13,7 +13,7 @@ use super::probe::probe_with;
 use super::sdk::{
     DeviceInfo, ErrorCode, EventSink, Sdk, SdkError, SdkEvent, SessionDetails, SessionState,
 };
-use crate::{Output, OutputState};
+use crate::{Output, OutputCode, OutputState};
 
 #[derive(Default)]
 struct FakeState {
@@ -22,6 +22,7 @@ struct FakeState {
     devices: Vec<(DeviceInfo, Vec<u32>)>,
     devices_error: Option<SdkError>,
     set_error: Option<(String, ErrorCode)>,
+    led_ids_error: Option<(String, ErrorCode)>,
     connects: u32,
     disconnects: u32,
     enumerations: u32,
@@ -96,6 +97,14 @@ impl Sdk for FakeSdk {
         Ok(s.devices.iter().map(|(d, _)| d.clone()).collect())
     }
     fn led_ids(&mut self, device: &str) -> Result<Vec<u32>, SdkError> {
+        if let Some((id, code)) = self.state().led_ids_error.clone()
+            && id == device
+        {
+            return Err(SdkError::Call {
+                function: "CorsairGetLedPositions",
+                code,
+            });
+        }
         self.state()
             .devices
             .iter()
@@ -211,6 +220,43 @@ fn missing_library_is_unavailable_and_retries_with_backoff() {
     assert_eq!(h.ctl.tick(h.at(1_000)), Some(h.at(3_000)));
     assert_eq!(h.ctl.tick(h.at(3_000)), Some(h.at(7_000)));
     assert_eq!(h.fake.state().connects, 3);
+}
+
+#[test]
+fn missing_library_sets_a_machine_readable_code_that_clears_after_retry_now() {
+    let fake = FakeSdk::default();
+    fake.state().connect_error = Some(SdkError::LibraryMissing {
+        file: "iCUESDK.x64_2019.dll",
+        searched: vec![],
+    });
+    let mut h = Harness::new(fake);
+    h.ctl.set_enabled(true);
+    assert_eq!(h.ctl.tick(h.at(0)), Some(h.at(1_000)));
+    assert_eq!(h.ctl.status().code, Some(OutputCode::LibraryMissing));
+
+    // The library appears while the controller is waiting out its back-off.
+    h.fake.state().connect_error = None;
+    assert_eq!(h.ctl.tick(h.at(100)), Some(h.at(1_000)));
+    h.ctl.retry_now();
+    h.ctl.tick(h.at(100));
+    assert_eq!(h.fake.state().connects, 2);
+    assert_eq!(h.ctl.status().code, None);
+    assert_eq!(h.ctl.status().state, OutputState::Connecting);
+}
+
+#[test]
+fn retry_now_does_nothing_while_disabled_or_connected() {
+    let fake = FakeSdk::default();
+    let mut h = Harness::new(fake);
+    h.ctl.retry_now();
+    assert_eq!(h.ctl.tick(h.at(0)), None);
+    assert_eq!(h.fake.state().connects, 0);
+
+    h.ctl.set_enabled(true);
+    h.ctl.tick(h.at(0));
+    h.ctl.retry_now();
+    h.ctl.tick(h.at(10));
+    assert_eq!(h.fake.state().connects, 1);
 }
 
 #[test]
@@ -447,6 +493,118 @@ fn enumeration_failure_is_an_error_that_recovers() {
     fake.state().devices_error = None;
     h.ctl.tick(h.at(1_001));
     assert_eq!(h.ctl.status().state, OutputState::Connected);
+}
+
+#[test]
+fn device_that_fails_enumeration_is_skipped_and_retried_later() {
+    let fake = FakeSdk::with_devices(&[("kb", 3), ("mouse", 2)]);
+    fake.state().led_ids_error = Some(("mouse".to_owned(), ErrorCode::InvalidArguments));
+    let mut h = Harness::connected(fake.clone());
+    assert_eq!(h.ctl.status().state, OutputState::Connected);
+    assert_eq!(h.ctl.status().device_count, 1);
+    let detail = h.ctl.status().detail.clone().unwrap();
+    assert!(detail.contains("skipped mouse"), "{detail}");
+
+    h.ctl.set_color(Rgb::new(1, 2, 3));
+    let next = h.ctl.tick(h.at(100));
+    assert_eq!(fake.write_count(), 1, "only the healthy device is written");
+    assert_eq!(fake.state().writes[0].0, "kb");
+    assert_eq!(next, Some(h.at(1) + Duration::from_secs(1)));
+
+    fake.state().led_ids_error = None;
+    h.ctl.tick(h.at(1) + Duration::from_secs(1));
+    assert_eq!(h.ctl.status().device_count, 2);
+    assert!(!h.ctl.status().detail.clone().unwrap().contains("skipped"));
+    assert!(fake.state().writes.iter().any(|w| w.0 == "mouse"));
+}
+
+#[test]
+fn skipped_device_retries_back_off() {
+    let fake = FakeSdk::with_devices(&[("kb", 3), ("mouse", 2)]);
+    fake.state().led_ids_error = Some(("mouse".to_owned(), ErrorCode::InvalidArguments));
+    let mut h = Harness::connected(fake);
+    let first = h.at(1) + Duration::from_secs(1);
+    assert_eq!(h.ctl.tick(h.at(2)), Some(first));
+    let next = h.ctl.tick(first);
+    assert_eq!(next, Some(first + Duration::from_secs(2)));
+}
+
+#[test]
+fn no_usable_device_is_an_error_that_names_the_skipped_ones() {
+    let fake = FakeSdk::with_devices(&[("kb", 3)]);
+    fake.state().led_ids_error = Some(("kb".to_owned(), ErrorCode::InvalidArguments));
+    let h = Harness::connected(fake);
+    assert_eq!(h.ctl.status().state, OutputState::Error);
+    assert!(h.ctl.status().detail.clone().unwrap().contains("kb"));
+}
+
+#[test]
+fn device_that_rejects_colours_is_skipped_while_the_others_keep_working() {
+    let fake = FakeSdk::with_devices(&[("kb", 3), ("mouse", 2)]);
+    let mut h = Harness::connected(fake.clone());
+    fake.state().set_error = Some(("mouse".to_owned(), ErrorCode::InvalidArguments));
+    h.ctl.set_color(Rgb::new(1, 1, 1));
+    let next = h.ctl.tick(h.at(100));
+    assert_eq!(h.ctl.status().state, OutputState::Connected);
+    assert_eq!(h.ctl.status().device_count, 1);
+    assert!(
+        h.ctl
+            .status()
+            .detail
+            .clone()
+            .unwrap()
+            .contains("skipped mouse")
+    );
+    assert_eq!(fake.write_count(), 1);
+    assert_eq!(next, Some(h.at(100) + Duration::from_secs(1)));
+
+    // The same colour is not rewritten while waiting.
+    assert_eq!(h.ctl.tick(h.at(200)), next);
+    assert_eq!(fake.write_count(), 1);
+
+    fake.state().set_error = None;
+    h.ctl.tick(h.at(100) + Duration::from_secs(1));
+    assert_eq!(h.ctl.status().device_count, 2);
+    assert!(
+        fake.state()
+            .writes
+            .iter()
+            .any(|w| w.0 == "mouse" && w.2 == Rgb::new(1, 1, 1))
+    );
+}
+
+#[test]
+fn exclusive_control_of_one_device_does_not_stop_the_others() {
+    let fake = FakeSdk::with_devices(&[("kb", 3), ("mouse", 2)]);
+    let mut h = Harness::connected(fake.clone());
+    fake.state().set_error = Some(("kb".to_owned(), ErrorCode::NoControl));
+    h.ctl.set_color(Rgb::new(1, 1, 1));
+    h.ctl.tick(h.at(100));
+    assert_eq!(h.ctl.status().state, OutputState::Connected);
+    assert_eq!(fake.state().writes.len(), 1);
+    assert_eq!(fake.state().writes[0].0, "mouse");
+}
+
+#[test]
+fn enumeration_fault_does_not_outlive_the_session() {
+    let fake = FakeSdk::with_devices(&[("kb", 3)]);
+    fake.state().devices_error = Some(SdkError::Call {
+        function: "CorsairGetDevices",
+        code: ErrorCode::InvalidArguments,
+    });
+    let mut h = Harness::new(fake);
+    h.ctl.set_enabled(true);
+    h.ctl.tick(h.at(0));
+    h.ctl.on_event(session(SessionState::Connected), h.at(1));
+    h.ctl.tick(h.at(1));
+    assert_eq!(h.ctl.status().state, OutputState::Error);
+
+    h.ctl.on_event(session(SessionState::Timeout), h.at(2));
+    assert_eq!(h.ctl.status().state, OutputState::Unavailable);
+    assert_eq!(
+        h.ctl.status().detail.as_deref(),
+        Some("iCUE is not running")
+    );
 }
 
 #[test]

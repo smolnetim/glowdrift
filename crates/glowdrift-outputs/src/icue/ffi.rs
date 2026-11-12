@@ -245,11 +245,14 @@ mod imp {
         })
     }
 
-    /// Loads the SDK DLL from `dirs` (absolute paths, tried in order). Dependencies resolve from
-    /// the System32 directory and the DLL's own directory only, never from `PATH` or the
-    /// current directory.
-    fn load_library(dirs: &[PathBuf]) -> Result<Library, SdkError> {
+    /// Finds the SDK DLL in `dirs` (absolute paths, tried in order) and builds `Api` from the
+    /// first copy that loads and has every export. A copy that fails is remembered and the next
+    /// directory is tried; the first such error is returned only when no copy works. Dependencies
+    /// resolve from the System32 directory and the DLL's own directory only, never from `PATH` or
+    /// the current directory.
+    fn load_api(dirs: &[PathBuf]) -> Result<Api, SdkError> {
         let mut searched = Vec::new();
+        let mut first_error = None;
         for dir in dirs {
             let Ok(dir) = std::path::absolute(dir) else {
                 continue;
@@ -259,12 +262,21 @@ mod imp {
                 searched.push(dir);
                 continue;
             }
-            return load_file(&candidate);
+            match load_file(&candidate).and_then(Api::from_library) {
+                Ok(api) => return Ok(api),
+                Err(err) => {
+                    log::warn!(
+                        "iCUE SDK library at {} unusable: {err}",
+                        candidate.display()
+                    );
+                    first_error.get_or_insert(err);
+                }
+            }
         }
-        Err(SdkError::LibraryMissing {
+        Err(first_error.unwrap_or(SdkError::LibraryMissing {
             file: DLL_NAME,
             searched,
-        })
+        }))
     }
 
     fn load_file(path: &Path) -> Result<Library, SdkError> {
@@ -289,8 +301,7 @@ mod imp {
     }
 
     impl Api {
-        fn load(dirs: &[PathBuf]) -> Result<Api, SdkError> {
-            let lib = load_library(dirs)?;
+        fn from_library(lib: Library) -> Result<Api, SdkError> {
             Ok(Api {
                 connect: export!(lib, "CorsairConnect"),
                 get_session_details: export!(lib, "CorsairGetSessionDetails"),
@@ -360,7 +371,7 @@ mod imp {
     impl Sdk for FfiSdk {
         fn connect(&mut self, sink: EventSink) -> Result<(), SdkError> {
             if self.api.is_none() {
-                self.api = Some(Api::load(&self.dirs)?);
+                self.api = Some(load_api(&self.dirs)?);
             }
             self.ctx.set_sink(Some(sink));
             let context = self.context();
@@ -547,6 +558,51 @@ mod imp {
     impl Drop for FfiSdk {
         fn drop(&mut self) {
             self.disconnect();
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn scratch_dir(tag: &str) -> PathBuf {
+            let dir = std::env::temp_dir()
+                .join(format!("glowdrift-ffi-test-{}-{tag}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        fn load_error(dirs: &[PathBuf]) -> SdkError {
+            match load_api(dirs) {
+                Ok(_) => panic!("no copy should load"),
+                Err(err) => err,
+            }
+        }
+
+        #[test]
+        fn directories_without_the_library_are_reported_as_missing() {
+            let empty = scratch_dir("empty");
+            let err = load_error(std::slice::from_ref(&empty));
+            std::fs::remove_dir_all(&empty).unwrap();
+            assert!(matches!(err, SdkError::LibraryMissing { .. }), "{err}");
+        }
+
+        #[test]
+        fn unloadable_copies_are_skipped_and_the_first_error_is_returned() {
+            let first = scratch_dir("first");
+            let second = scratch_dir("second");
+            let empty = scratch_dir("none");
+            std::fs::write(first.join(DLL_NAME), b"not a dll 1").unwrap();
+            std::fs::write(second.join(DLL_NAME), b"not a dll 2").unwrap();
+            let err = load_error(&[first.clone(), empty.clone(), second.clone()]);
+            for dir in [&first, &second, &empty] {
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+            let SdkError::LibraryLoad(message) = err else {
+                panic!("expected a load error, got {err}");
+            };
+            assert!(message.contains(first.to_str().unwrap()), "{message}");
+            assert!(!message.contains(second.to_str().unwrap()), "{message}");
         }
     }
 }

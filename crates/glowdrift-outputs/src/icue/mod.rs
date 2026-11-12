@@ -61,12 +61,17 @@ struct Inbox {
     color: Option<Rgb>,
     enabled: Option<bool>,
     events: VecDeque<SdkEvent>,
+    retry: bool,
     shutdown: bool,
 }
 
 impl Inbox {
     fn has_pending(&self) -> bool {
-        self.color.is_some() || self.enabled.is_some() || !self.events.is_empty() || self.shutdown
+        self.color.is_some()
+            || self.enabled.is_some()
+            || !self.events.is_empty()
+            || self.retry
+            || self.shutdown
     }
 }
 
@@ -135,6 +140,7 @@ impl IcueOutput {
                 state: OutputState::Connecting,
                 detail: Some("Starting".to_owned()),
                 device_count: 0,
+                code: None,
             }),
         });
         let (done_tx, done) = mpsc::channel();
@@ -148,6 +154,7 @@ impl IcueOutput {
                     state: OutputState::Error,
                     detail: Some(format!("could not start the iCUE worker: {err}")),
                     device_count: 0,
+                    code: None,
                 };
             })
             .ok();
@@ -180,13 +187,23 @@ impl Output for IcueOutput {
 
     fn status(&self) -> OutputStatus {
         let published = lock(&self.shared.status).clone();
-        let (state, detail, device_count) = if !self.enabled {
-            (OutputState::Disabled, None, 0)
+        let (state, detail, device_count, code) = if !self.enabled {
+            (OutputState::Disabled, None, 0, None)
         } else if published.state == OutputState::Disabled {
             // Enabled, but the worker has not processed the request yet.
-            (OutputState::Connecting, Some("Starting".to_owned()), 0)
+            (
+                OutputState::Connecting,
+                Some("Starting".to_owned()),
+                0,
+                None,
+            )
         } else {
-            (published.state, published.detail, published.device_count)
+            (
+                published.state,
+                published.detail,
+                published.device_count,
+                published.code,
+            )
         };
         OutputStatus {
             id: ICUE_OUTPUT_ID.to_owned(),
@@ -196,7 +213,12 @@ impl Output for IcueOutput {
             state,
             detail,
             device_count,
+            code,
         }
+    }
+
+    fn retry(&mut self) {
+        self.shared.update(|inbox| inbox.retry = true);
     }
 
     fn set_enabled(&mut self, enabled: bool) {
@@ -255,6 +277,9 @@ fn run_worker<S: Sdk>(shared: &Arc<Shared>, sdk: S, done: &Sender<()>) {
             for event in batch.events {
                 controller.on_event(event, now);
             }
+            if batch.retry {
+                controller.retry_now();
+            }
             if let Some(color) = batch.color {
                 controller.set_color(color);
             }
@@ -268,6 +293,7 @@ fn run_worker<S: Sdk>(shared: &Arc<Shared>, sdk: S, done: &Sender<()>) {
             state: OutputState::Error,
             detail: Some("The iCUE worker stopped unexpectedly".to_owned()),
             device_count: 0,
+            code: None,
         };
     }
     let _ = done.send(());

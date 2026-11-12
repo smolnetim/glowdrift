@@ -59,6 +59,7 @@ impl Output for NullOutput {
             },
             detail: None,
             device_count: 0,
+            code: None,
         }
     }
 
