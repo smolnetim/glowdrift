@@ -56,11 +56,14 @@ jobs:
           ) -join "`n"
           $file = Join-Path $env:RUNNER_TEMP 'pr-comment.md'
           Set-Content -Path $file -Value $body -Encoding utf8
-          $existing = gh api "repos/$env:REPO/issues/$env:PR_NUMBER/comments" --paginate --jq '.[] | {id, body} | tojson' |
+          # The listing is collected completely before it is filtered: stopping the pipe early at the
+          # first match would cut gh off and make it exit non-zero.
+          $listing = @(gh api "repos/$env:REPO/issues/$env:PR_NUMBER/comments" --paginate --jq '.[] | {id, body} | tojson')
+          if ($LASTEXITCODE -ne 0) { throw 'Could not list the pull request comments.' }
+          $existing = $listing |
             ForEach-Object { $_ | ConvertFrom-Json } |
             Where-Object { $_.body.Contains($marker) } |
             Select-Object -First 1
-          if ($LASTEXITCODE -ne 0) { throw 'Could not list the pull request comments.' }
           if ($existing) {
             gh api --method PATCH "repos/$env:REPO/issues/comments/$($existing.id)" -F "body=@$file" --silent
           } else {
@@ -87,6 +90,8 @@ jobs:
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: windows-release
 
       - name: Install frontend dependencies
         working-directory: apps/desktop
@@ -151,7 +156,6 @@ jobs:
       # Guarded by the run id so a cancelled run cannot overwrite the comment of the newer run that replaced it.
       - name: Comment the result
         if: always() && env.SAME_REPO == 'true'
-        continue-on-error: true
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -188,11 +192,14 @@ jobs:
           }
           $file = Join-Path $env:RUNNER_TEMP 'pr-comment.md'
           Set-Content -Path $file -Value ($lines -join "`n") -Encoding utf8
-          $existing = gh api "repos/$env:REPO/issues/$env:PR_NUMBER/comments" --paginate --jq '.[] | {id, body} | tojson' |
+          # The listing is collected completely before it is filtered: stopping the pipe early at the
+          # first match would cut gh off and make it exit non-zero.
+          $listing = @(gh api "repos/$env:REPO/issues/$env:PR_NUMBER/comments" --paginate --jq '.[] | {id, body} | tojson')
+          if ($LASTEXITCODE -ne 0) { throw 'Could not list the pull request comments.' }
+          $existing = $listing |
             ForEach-Object { $_ | ConvertFrom-Json } |
             Where-Object { $_.body.Contains($marker) } |
             Select-Object -First 1
-          if ($LASTEXITCODE -ne 0) { throw 'Could not list the pull request comments.' }
           if ($existing -and -not $existing.body.Contains("<!-- run:$env:RUN_ID -->")) {
             Write-Host 'The comment belongs to a newer run; leaving it alone.'
             return
