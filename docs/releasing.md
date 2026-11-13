@@ -86,6 +86,7 @@ over the full git history, so it needs no licence.
 | --- | --- | --- |
 | `.github/workflows/ci.yml` | Push to `main`, pull requests | Frontend install, typecheck, optional lint and build; `cargo fmt --check`; clippy with `-D warnings`; tests; a debug `tauri build --no-bundle` to validate linking. |
 | `.github/workflows/security.yml` | Push to `main`, pull requests, weekly, manual | cargo-deny, npm audit (production dependencies, high and above), dependency review, CodeQL (JavaScript/TypeScript, Rust, Actions), gitleaks (full history). |
+| `.github/workflows/pr-build.yml` | Pull requests to `main` (not docs-only) | Builds the unsigned setup file (real version, no updater artifacts), uploads it unzipped as `Glowdrift-pr<number>-<sha>-setup.exe` (14 days) and keeps one sticky pull request comment with the build state and download link. Fork pull requests skip the comment and only get the job summary. |
 | `.github/workflows/release.yml` | Tag `v*.*.*`, manual | Verify, build, sign updater artifacts, publish the release, attest. |
 
 Third-party actions are pinned to full commit SHAs with the version in a trailing comment. Dependabot proposes
