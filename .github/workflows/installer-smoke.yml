@@ -1,0 +1,109 @@
+name: Installer smoke test
+
+# Builds the setup file with a version above any published release, then installs, updates and
+# uninstalls it on the runner (scripts/test-installer.ps1). The test changes HKCU and the user
+# profile, which is fine on a throwaway runner.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/desktop/src-tauri/installer/**"
+      - "apps/desktop/src-tauri/tauri.conf.json"
+      - "scripts/test-installer.ps1"
+      - ".github/workflows/installer-smoke.yml"
+  pull_request:
+    paths:
+      - "apps/desktop/src-tauri/installer/**"
+      - "apps/desktop/src-tauri/tauri.conf.json"
+      - "scripts/test-installer.ps1"
+      - ".github/workflows/installer-smoke.yml"
+  workflow_dispatch:
+    inputs:
+      old_setup_url:
+        description: Setup file to install before the update step (default is the latest release)
+        required: false
+        type: string
+
+concurrency:
+  group: installer-smoke-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  installer-smoke:
+    name: Install, update and uninstall (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      # The version comes from Cargo.toml when tauri.conf.json has none. A top-level "version" in a
+      # --config override takes precedence, so the new setup file is a higher version than the
+      # published release it updates. Without the updater artifacts no signing key is needed.
+      - name: Write the build override
+        shell: pwsh
+        run: |
+          $override = '{"version":"99.0.0","bundle":{"createUpdaterArtifacts":false}}'
+          Set-Content -Path "$env:RUNNER_TEMP/installer-smoke.tauri.conf.json" -Value $override -Encoding ascii
+
+      - name: Build the setup file
+        working-directory: apps/desktop
+        shell: pwsh
+        run: npm run tauri -- build --bundles nsis --config "$env:RUNNER_TEMP/installer-smoke.tauri.conf.json"
+
+      - name: Locate the setup file
+        id: setup
+        shell: pwsh
+        run: |
+          $files = @(Get-ChildItem -Path target/release/bundle/nsis -Filter '*_99.0.0_*-setup.exe')
+          if ($files.Count -ne 1) { throw "Expected one setup file for version 99.0.0 in target/release/bundle/nsis, found $($files.Count)." }
+          "path=$($files[0].FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Run the installer smoke test
+        shell: pwsh
+        env:
+          SETUP_FILE: ${{ steps.setup.outputs.path }}
+          OLD_SETUP_URL: ${{ github.event.inputs.old_setup_url }}
+        run: |
+          $arguments = @{ SetupFile = $env:SETUP_FILE }
+          if ($env:OLD_SETUP_URL) { $arguments.OldSetupUrl = $env:OLD_SETUP_URL }
+          & ./scripts/test-installer.ps1 @arguments
+
+      - name: Upload the setup file and test log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: installer-smoke-diagnostics
+          path: |
+            ${{ runner.temp }}/glowdrift-installer-smoke/smoke.log
+            ${{ steps.setup.outputs.path }}
+          if-no-files-found: warn
+          retention-days: 7
