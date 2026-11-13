@@ -50,7 +50,7 @@ jobs:
           $body = @(
             $marker
             "<!-- run:$env:RUN_ID -->"
-            '### 🟡 Building'
+            '![Build: building](https://img.shields.io/badge/build-building-yellow?logo=windows)'
             ''
             ('Commit [`{0}`]({1}/{2}/commit/{3}) · [workflow run]({4})' -f $short, $env:SERVER_URL, $env:REPO, $env:SHA, $env:RUN_URL)
           ) -join "`n"
@@ -165,10 +165,14 @@ jobs:
           $short = $env:SHA.Substring(0, 7)
           $commit = 'Commit [`{0}`]({1}/{2}/commit/{3}) · [workflow run]({4})' -f $short, $env:SERVER_URL, $env:REPO, $env:SHA, $env:RUN_URL
           $head = @($marker, "<!-- run:$env:RUN_ID -->")
+          # shields.io static badge: a dash is written "--", an underscore "__" and a space "_".
+          $esc = { param($text) $text.Replace('-', '--').Replace('_', '__').Replace(' ', '_') }
+          $badge = 'https://img.shields.io/badge/build-{0}-{1}?logo=windows'
           $lines = switch ($env:JOB_STATUS) {
             'success' {
+              $download = 'https://img.shields.io/badge/download-{0}-blue' -f (& $esc ('{0} {1} MB' -f $env:FILE_NAME, $env:FILE_SIZE_MB))
               $head + @(
-                '### 🟢 Built'
+                ('![Build: passing]({0}) [![Download the setup file]({1})]({2})' -f ($badge -f 'passing', 'brightgreen'), $download, $env:DOWNLOAD_URL)
                 ''
                 $commit
                 ''
@@ -179,8 +183,8 @@ jobs:
                 '> Downloading needs a signed-in GitHub account. The file is unsigned, so Windows SmartScreen will warn. Kept for 14 days.'
               )
             }
-            'cancelled' { $head + @('### ⚪ Superseded by a newer commit', '', $commit) }
-            default { $head + @('### 🔴 Build failed', '', $commit) }
+            'cancelled' { $head + @(('![Build: superseded]({0}) Superseded by a newer commit' -f ($badge -f 'superseded', 'lightgrey')), '', $commit) }
+            default { $head + @(('![Build: failed]({0})' -f ($badge -f 'failed', 'red')), '', $commit) }
           }
           $file = Join-Path $env:RUNNER_TEMP 'pr-comment.md'
           Set-Content -Path $file -Value ($lines -join "`n") -Encoding utf8
