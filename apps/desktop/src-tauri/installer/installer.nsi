@@ -1,7 +1,8 @@
 ; Derived from tauri-bundler 2.10.4 (src/bundle/windows/nsis/installer.nsi, the template used by
 ; tauri-cli 2.12.4). Differences from upstream, each marked "Glowdrift:" below:
 ;   1. The default per-user install directory is %LOCALAPPDATA%\Programs\<vendor>\<product>.
-;   2. The directory page is removed, so the install directory is not chosen in the wizard.
+;   2. The stock directory page is replaced by a custom install folder page (folder-page.nsh) that is shown
+;      only on a first interactive install; later installs and updates reuse the remembered folder.
 ; When updating tauri-cli, diff this file against the new upstream installer.nsi and re-apply the changes.
 
 Unicode true
@@ -92,6 +93,10 @@ OutFile "${OUTFILE}"
 ; https://nsis.sourceforge.io/Reference/InstallDir
 !define PLACEHOLDER_INSTALL_DIR "placeholder\${PRODUCTNAME}"
 InstallDir "${PLACEHOLDER_INSTALL_DIR}"
+
+; Glowdrift: install folder page (first interactive install only). Needs the defines and variables above.
+; The path is relative to the hooks file, which Tauri passes as an absolute path.
+!include "{{installer_hooks}}\..\folder-page.nsh"
 
 VIProductVersion "${VERSIONWITHBUILD}"
 VIAddVersionKey "ProductName" "${PRODUCTNAME}"
@@ -417,7 +422,9 @@ Function PageLeaveReinstall
 FunctionEnd
 
 ; 5. Choose install directory page
-; Glowdrift: no directory page; .onInit sets the install directory (or it comes from /D).
+; Glowdrift: custom page, shown only on a first interactive install (see folder-page.nsh); otherwise
+; .onInit sets the install directory (or it comes from /D).
+Page custom FolderPageCreate FolderPageLeave
 
 ; 6. Start menu shortcut page
 Var AppStartMenuFolder
@@ -506,6 +513,7 @@ FunctionEnd
 {{#each languages}}
 !insertmacro MUI_LANGUAGE "{{this}}"
 LangString choowHowToInstall 0 ""
+!insertmacro GlowdriftFolderPageLangStrings
 {{/each}}
 !insertmacro MUI_RESERVEFILE_LANGDLL
 {{#each language_files}}
@@ -533,6 +541,9 @@ Function .onInit
   !endif
 
   !insertmacro SetContext
+
+  ; Glowdrift: record /D= and an existing install before $INSTDIR is defaulted below
+  Call FolderPageDetect
 
   ${If} $INSTDIR == "${PLACEHOLDER_INSTALL_DIR}"
     ; Set default install location
