@@ -22,6 +22,14 @@ _Avoid_: Settings, user data, config
 An install of a newer version over an existing one, run without questions, in the existing install folder.
 _Avoid_: Upgrade
 
+**Release**:
+A published, tagged version of Glowdrift, carrying its Setup file and the manifest installed copies read to find updates. Installed copies update to the newest Release that is not a pre-release.
+_Avoid_: Deployment, build, version (for the published artifact)
+
+**Maintainer**:
+A person permitted to publish a Release. Contributors propose changes through pull requests; only Maintainers decide what ships.
+_Avoid_: Admin, owner, collaborator
+
 **Per-user install**:
 An install that belongs to one Windows account and needs no administrator rights, for the first install and for updates.
 _Avoid_: Current-user install, local install
