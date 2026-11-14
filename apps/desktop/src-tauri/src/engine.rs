@@ -9,10 +9,11 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use glowdrift_capture::{CaptureError, Capturer};
+use glowdrift_capture::CaptureError;
 use glowdrift_core::{ColorAdjust, Config, LinearRgb, Rgb, Smoother, reduce};
 use serde::{Deserialize, Serialize};
 
+use crate::frame_source::{FrameSource, OpenSource, open_desktop};
 use crate::lights_manager::LightsManager;
 use crate::timing::{Stage, Timing};
 
@@ -254,7 +255,14 @@ impl EngineHandle {
             running: true,
             ..EngineStatus::default()
         }));
-        let engine = Engine::new(rx, Arc::clone(&status), lights, events, config);
+        let engine = Engine::new(
+            rx,
+            Arc::clone(&status),
+            lights,
+            events,
+            config,
+            open_desktop(),
+        );
         let join = thread::Builder::new()
             .name("glowdrift-engine".to_owned())
             .spawn(move || engine.run())?;
@@ -313,8 +321,10 @@ struct ReportKey {
     error: Option<String>,
 }
 
+/// The engine's state and loop. [`EngineHandle`] runs one on its own thread; tests drive
+/// [`Engine::step`] directly on a clock they control.
 #[allow(clippy::struct_excessive_bools)]
-struct Engine<E: EngineEvents> {
+pub struct Engine<E: EngineEvents> {
     rx: Receiver<EngineCommand>,
     shared: Arc<Mutex<EngineStatus>>,
     lights: Arc<LightsManager>,
@@ -323,7 +333,8 @@ struct Engine<E: EngineEvents> {
     running: bool,
     preview: bool,
 
-    capturer: Option<Capturer>,
+    open: OpenSource,
+    capturer: Option<Box<dyn FrameSource>>,
     retry_at: Option<Instant>,
     backoff: Backoff,
 
@@ -346,13 +357,20 @@ struct Engine<E: EngineEvents> {
     timing: Timing,
 }
 
+impl<E: EngineEvents> std::fmt::Debug for Engine<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Engine").finish_non_exhaustive()
+    }
+}
+
 impl<E: EngineEvents> Engine<E> {
-    fn new(
+    pub fn new(
         rx: Receiver<EngineCommand>,
         shared: Arc<Mutex<EngineStatus>>,
         lights: Arc<LightsManager>,
         events: E,
         config: Config,
+        open: OpenSource,
     ) -> Self {
         let now = Instant::now();
         lights.apply_config(&config.lights);
@@ -364,6 +382,7 @@ impl<E: EngineEvents> Engine<E> {
             config,
             running: true,
             preview: false,
+            open,
             capturer: None,
             retry_at: None,
             backoff: Backoff::new(RECOVERY_MIN, RECOVERY_MAX),
@@ -418,7 +437,7 @@ impl<E: EngineEvents> Engine<E> {
     }
 
     /// Returns false when the engine must stop.
-    fn handle(&mut self, command: EngineCommand) -> bool {
+    pub fn handle(&mut self, command: EngineCommand) -> bool {
         let now = Instant::now();
         match command {
             EngineCommand::ApplyConfig(config) => self.apply_config(*config, now),
@@ -438,7 +457,8 @@ impl<E: EngineEvents> Engine<E> {
         true
     }
 
-    fn step(&mut self, now: Instant) {
+    /// Runs one pass of the loop as of `now`: capture, smoothing and preview when due.
+    pub fn step(&mut self, now: Instant) {
         let mark = Timing::start();
         let resend = self.lights.take_resend();
         self.timing.record(Stage::Resend, mark);
@@ -497,7 +517,7 @@ impl<E: EngineEvents> Engine<E> {
             if self.retry_at.is_some_and(|at| now < at) {
                 return;
             }
-            match Capturer::new(self.config.monitor_id.as_deref(), CAPTURE_MAX_DIMENSION) {
+            match (self.open)(self.config.monitor_id.as_deref(), CAPTURE_MAX_DIMENSION) {
                 Ok(capturer) => {
                     self.capturer = Some(capturer);
                     self.retry_at = None;
@@ -533,11 +553,10 @@ impl<E: EngineEvents> Engine<E> {
 
     /// Feeds the capturer's internal split of the last grab to the timer.
     fn note_grab_timings(&mut self) {
-        #[cfg(windows)]
         if Timing::ENABLED
-            && let Some(capturer) = &self.capturer
+            && let Some(timings) = self.capturer.as_ref().and_then(|c| c.last_timings())
         {
-            self.timing.grab_detail(capturer.last_timings());
+            self.timing.grab_detail(timings);
         }
     }
 
