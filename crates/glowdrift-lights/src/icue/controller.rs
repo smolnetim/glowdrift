@@ -108,6 +108,10 @@ pub(crate) struct Controller<S: Sdk> {
     enumerate_at: Option<Instant>,
     desired: Option<Rgb>,
     sent: Option<Rgb>,
+    /// Whether colours go out as one batched request for all devices. Cleared when a batched
+    /// write fails, so the per-device path can say which device is at fault; restored by the next
+    /// enumeration.
+    batching: bool,
     last_send: Option<Instant>,
     send_retry_at: Option<Instant>,
     status: Status,
@@ -169,6 +173,7 @@ impl<S: Sdk> Controller<S> {
             enumerate_at: None,
             desired: None,
             sent: None,
+            batching: true,
             last_send: None,
             send_retry_at: None,
             status: Status::new(LightState::Disabled, None),
@@ -372,6 +377,7 @@ impl<S: Sdk> Controller<S> {
         }
         self.devices = devices;
         self.enumerated = true;
+        self.batching = true;
         self.sent = None;
         self.send_retry_at = None;
         if !matches!(self.fault, Some(Fault::LibraryMissing)) {
@@ -416,8 +422,35 @@ impl<S: Sdk> Controller<S> {
         })
     }
 
+    /// Queues the colour for every device and sends it in one request. Returns whether it all
+    /// went through.
+    fn write_batched(&mut self, color: Rgb) -> bool {
+        for device in &self.devices {
+            if let Err(err) = self
+                .sdk
+                .buffer_leds_color(&device.id, &device.led_ids, color)
+            {
+                log::debug!("iCUE batched write failed: {err}");
+                return false;
+            }
+        }
+        if let Err(err) = self.sdk.flush_leds() {
+            log::debug!("iCUE batched write failed: {err}");
+            return false;
+        }
+        true
+    }
+
     fn send(&mut self, now: Instant) {
         let Some(color) = self.desired else { return };
+        if self.batching {
+            if self.write_batched(color) {
+                self.last_send = Some(now);
+                self.sent_ok(color);
+                return;
+            }
+            self.batching = false;
+        }
         let mut lost = false;
         let mut stale = false;
         let mut written = 0_usize;
@@ -459,6 +492,10 @@ impl<S: Sdk> Controller<S> {
             }
             self.skip_failed_devices(&failed, now);
         }
+        self.sent_ok(color);
+    }
+
+    fn sent_ok(&mut self, color: Rgb) {
         self.sent = Some(color);
         self.send_retry_at = None;
         if matches!(self.fault, Some(Fault::Contended | Fault::Error(_))) {
