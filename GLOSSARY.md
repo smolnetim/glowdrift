@@ -61,7 +61,7 @@ A lighting device or service that receives the Smoothed colour.
 _Avoid_: Output, sink, device
 
 **Smoothing rate**:
-How often the Smoothed colour is advanced and sent to the Lights, independent of the Capture rate.
+How often the Smoothed colour is advanced and sent to the Lights, independent of the Capture rate. It is the fastest maximum rate declared by the enabled Lights, raised to the preview rate while the preview is on, and zero when neither consumes the colour.
 _Avoid_: Output rate, tick rate, update rate
 
 **Settled**:

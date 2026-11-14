@@ -25,7 +25,7 @@ flowchart LR
     subgraph engine [Engine thread]
         CAP[Capturer.grab<br/>captureFps] --> RED[reduce<br/>linear light]
         RED --> ADJ[ColorAdjust<br/>brightness, saturation]
-        ADJ --> SM[Smoother.update<br/>fixed ~60 Hz tick]
+        ADJ --> SM[Smoother.update<br/>smoothing-rate tick]
     end
     SM -->|sRGB, when changed| OUT[Lights manager]
     OUT --> ICUE[iCUE light]
@@ -39,9 +39,14 @@ flowchart LR
 1. The capturer grabs a small downscaled frame of the configured region at `captureFps` (1 to 60, default 20).
 2. `reduce` collapses the frame to one colour in linear light, either the average or the dominant colour.
 3. The colour passes through `ColorAdjust` (brightness gain, saturation).
-4. The smoother advances at a fixed smoothing rate of about 60 Hz, independent of the capture rate, moving the
-   current colour toward the target with an exponential time constant (`smoothingMs`). A time constant of 0 snaps
-   to the target.
+4. The smoother advances at the smoothing rate, independent of the capture rate, moving the current colour toward
+   the target with an exponential time constant (`smoothingMs`). A time constant of 0 snaps to the target. The
+   rate is derived, not configured: the fastest of the active lights' maximum rates (`Light::min_send_interval`,
+   about 30 Hz for iCUE; a light with no limit gets the 60 Hz cap) and, while the preview is on, its 20 Hz. A light
+   counts while it is enabled and the engine is running, even if disconnected. The step is time-based, so the time
+   constant holds at any rate. With no active light and no preview nothing consumes the colour: the smoother does
+   not tick and the smoothed colour follows the target directly, so a light enabled later starts from the current
+   picture.
 5. The sRGB result is forwarded to lights only when it changed.
 6. The UI receives a throttled preview (at most about 20 events per second) only while the main window is visible.
 
@@ -53,7 +58,7 @@ linear light gives a more even perceived fade.
 | Thread | Responsibility |
 | --- | --- |
 | Main / Tauri runtime | Window, tray, IPC command handlers, event emission. Handlers do not block on capture or lights. |
-| Engine thread | Owns the capturer, the smoother and the loop timing. Receives commands over a channel (apply config, start/stop, preview on/off, shut down). It sleeps until the next capture or smoothing deadline, and stops ticking once the light has settled at its target, so an unchanging picture costs almost no CPU. |
+| Engine thread | Owns the capturer, the smoother and the loop timing. Receives commands over a channel (apply config, start/stop, preview on/off, shut down). It sleeps until the next capture or smoothing deadline, and stops ticking once the smoothed colour has settled at its target, so an unchanging picture costs almost no CPU. |
 | Lights poller | Polls each light's status about once per second and emits `lights://status` when it changes. Reconnect handling lives here. |
 
 Shared state is small: the current configuration and the last engine status, each behind a mutex. The engine
