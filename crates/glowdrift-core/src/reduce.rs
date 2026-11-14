@@ -1,4 +1,4 @@
-//! Reduction of a frame to a single colour, and output colour adjustment.
+//! Reduction of a frame to a single colour, and brightness and saturation adjustment.
 //!
 //! # Average
 //!
@@ -185,7 +185,7 @@ fn dominant(frame: &FrameView) -> LinearRgb {
     )
 }
 
-/// Output gain and saturation applied after smoothing.
+/// Brightness gain and saturation applied to a reduced colour to give the target colour.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ColorAdjust {
     /// Linear gain, `0.0..=1.0`.

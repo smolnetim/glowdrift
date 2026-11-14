@@ -1,13 +1,13 @@
 import { flushConfig, loadConfig } from "./config";
 import { refreshEngine, startEngineSync } from "./engine";
-import { refreshOutputs, startOutputsSync } from "./outputs";
+import { refreshLights, startLightsSync } from "./lights";
 import { startUpdateSync } from "./updates";
 
 /** Loads initial state and subscribes to backend events. Call once at startup. */
 export function startBackendSync(): void {
   void loadConfig();
   startEngineSync();
-  startOutputsSync();
+  startLightsSync();
   startUpdateSync();
 
   document.addEventListener("visibilitychange", () => {
@@ -15,7 +15,7 @@ export function startBackendSync(): void {
       flushConfig();
     } else {
       void refreshEngine();
-      void refreshOutputs();
+      void refreshLights();
     }
   });
 }

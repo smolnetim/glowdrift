@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use glowdrift_core::Rgb;
 
-use super::IcueOutput;
+use super::IcueLight;
 use super::controller::{
     Controller, ENUMERATE_DEBOUNCE, LAYER_PRIORITY, MIN_SEND_INTERVAL, SEND_RETRY,
 };
@@ -13,7 +13,7 @@ use super::probe::probe_with;
 use super::sdk::{
     DeviceInfo, ErrorCode, EventSink, Sdk, SdkError, SdkEvent, SessionDetails, SessionState,
 };
-use crate::{Output, OutputCode, OutputState};
+use crate::{Light, LightCode, LightState};
 
 #[derive(Default)]
 struct FakeState {
@@ -186,7 +186,7 @@ impl Harness {
 #[test]
 fn starts_disabled_and_idle() {
     let mut h = Harness::new(FakeSdk::default());
-    assert_eq!(h.ctl.status().state, OutputState::Disabled);
+    assert_eq!(h.ctl.status().state, LightState::Disabled);
     assert_eq!(h.ctl.tick(h.at(0)), None);
     assert_eq!(h.fake.state().connects, 0);
 }
@@ -202,7 +202,7 @@ fn missing_library_is_unavailable_and_retries_with_backoff() {
     h.ctl.set_enabled(true);
 
     let next = h.ctl.tick(h.at(0));
-    assert_eq!(h.ctl.status().state, OutputState::Unavailable);
+    assert_eq!(h.ctl.status().state, LightState::Unavailable);
     assert!(
         h.ctl
             .status()
@@ -232,7 +232,7 @@ fn missing_library_sets_a_machine_readable_code_that_clears_after_retry_now() {
     let mut h = Harness::new(fake);
     h.ctl.set_enabled(true);
     assert_eq!(h.ctl.tick(h.at(0)), Some(h.at(1_000)));
-    assert_eq!(h.ctl.status().code, Some(OutputCode::LibraryMissing));
+    assert_eq!(h.ctl.status().code, Some(LightCode::LibraryMissing));
 
     // The library appears while the controller is waiting out its back-off.
     h.fake.state().connect_error = None;
@@ -241,7 +241,7 @@ fn missing_library_sets_a_machine_readable_code_that_clears_after_retry_now() {
     h.ctl.tick(h.at(100));
     assert_eq!(h.fake.state().connects, 2);
     assert_eq!(h.ctl.status().code, None);
-    assert_eq!(h.ctl.status().state, OutputState::Connecting);
+    assert_eq!(h.ctl.status().state, LightState::Connecting);
 }
 
 #[test]
@@ -287,7 +287,7 @@ fn a_connect_failure_reason_is_logged_once_until_it_changes_or_a_connect_succeed
     // After a successful connect the same failure is reported again.
     h.fake.state().connect_error = None;
     h.ctl.tick(now);
-    assert_eq!(h.ctl.status().state, OutputState::Connecting);
+    assert_eq!(h.ctl.status().state, LightState::Connecting);
     h.ctl.set_enabled(false);
     h.ctl.set_enabled(true);
     h.fake.state().connect_error = Some(SdkError::LibraryLoad("boom".to_owned()));
@@ -312,13 +312,13 @@ fn backoff_is_capped_and_resets_after_a_successful_connect() {
         delays.push(next - now);
         now = next;
     }
-    assert_eq!(h.ctl.status().state, OutputState::Error);
+    assert_eq!(h.ctl.status().state, LightState::Error);
     assert_eq!(delays.last(), Some(&Duration::from_secs(30)));
     assert!(delays.windows(2).all(|w| w[0] <= w[1]));
 
     h.fake.state().connect_error = None;
     h.ctl.tick(now + Duration::from_secs(30));
-    assert_eq!(h.ctl.status().state, OutputState::Connecting);
+    assert_eq!(h.ctl.status().state, LightState::Connecting);
 }
 
 #[test]
@@ -326,10 +326,10 @@ fn session_states_map_to_status() {
     let mut h = Harness::new(FakeSdk::with_devices(&[("kb", 3), ("mouse", 2)]));
     h.ctl.set_enabled(true);
     h.ctl.tick(h.at(0));
-    assert_eq!(h.ctl.status().state, OutputState::Connecting);
+    assert_eq!(h.ctl.status().state, LightState::Connecting);
 
     h.ctl.on_event(session(SessionState::Timeout), h.at(1));
-    assert_eq!(h.ctl.status().state, OutputState::Unavailable);
+    assert_eq!(h.ctl.status().state, LightState::Unavailable);
     assert_eq!(
         h.ctl.status().detail.as_deref(),
         Some("iCUE is not running")
@@ -337,7 +337,7 @@ fn session_states_map_to_status() {
 
     h.ctl
         .on_event(session(SessionState::ConnectionRefused), h.at(2));
-    assert_eq!(h.ctl.status().state, OutputState::Unavailable);
+    assert_eq!(h.ctl.status().state, LightState::Unavailable);
     assert!(
         h.ctl
             .status()
@@ -350,18 +350,18 @@ fn session_states_map_to_status() {
     h.ctl.on_event(session(SessionState::Connected), h.at(3));
     assert_eq!(
         h.ctl.status().state,
-        OutputState::Connecting,
+        LightState::Connecting,
         "devices not read yet"
     );
     h.ctl.tick(h.at(3));
-    assert_eq!(h.ctl.status().state, OutputState::Connected);
+    assert_eq!(h.ctl.status().state, LightState::Connected);
     assert_eq!(h.ctl.status().detail.as_deref(), Some("2 devices, 5 LEDs"));
     assert_eq!(h.ctl.status().device_count, 2);
     assert_eq!(h.fake.state().priorities, vec![LAYER_PRIORITY]);
 
     h.ctl
         .on_event(session(SessionState::ConnectionLost), h.at(4));
-    assert_eq!(h.ctl.status().state, OutputState::Connecting);
+    assert_eq!(h.ctl.status().state, LightState::Connecting);
     assert_eq!(h.ctl.status().device_count, 0);
 }
 
@@ -475,7 +475,7 @@ fn vanished_device_triggers_re_enumeration_without_error() {
     h.ctl.set_color(Rgb::new(1, 1, 1));
     let next = h.ctl.tick(h.at(100));
     assert_eq!(next, Some(h.at(100) + ENUMERATE_DEBOUNCE));
-    assert_eq!(h.ctl.status().state, OutputState::Connected);
+    assert_eq!(h.ctl.status().state, LightState::Connected);
 
     fake.state().devices.retain(|(d, _)| d.id != "mouse");
     h.ctl.tick(h.at(100) + ENUMERATE_DEBOUNCE);
@@ -489,12 +489,12 @@ fn lost_connection_during_write_waits_for_session_events() {
     fake.state().set_error = Some(("kb".to_owned(), ErrorCode::NotConnected));
     h.ctl.set_color(Rgb::new(1, 1, 1));
     assert_eq!(h.ctl.tick(h.at(100)), None);
-    assert_eq!(h.ctl.status().state, OutputState::Connecting);
+    assert_eq!(h.ctl.status().state, LightState::Connecting);
 
     fake.state().set_error = None;
     h.ctl.on_event(session(SessionState::Connected), h.at(500));
     h.ctl.tick(h.at(500));
-    assert_eq!(h.ctl.status().state, OutputState::Connected);
+    assert_eq!(h.ctl.status().state, LightState::Connected);
     assert_eq!(fake.write_count(), 1, "colour resent after reconnect");
 }
 
@@ -505,12 +505,12 @@ fn exclusive_control_by_another_client_is_reported_and_retried() {
     fake.state().set_error = Some(("kb".to_owned(), ErrorCode::NoControl));
     h.ctl.set_color(Rgb::new(1, 1, 1));
     let next = h.ctl.tick(h.at(100));
-    assert_eq!(h.ctl.status().state, OutputState::Error);
+    assert_eq!(h.ctl.status().state, LightState::Error);
     assert_eq!(next, Some(h.at(100) + SEND_RETRY));
 
     fake.state().set_error = None;
     h.ctl.tick(h.at(100) + SEND_RETRY);
-    assert_eq!(h.ctl.status().state, OutputState::Connected);
+    assert_eq!(h.ctl.status().state, LightState::Connected);
     assert_eq!(fake.write_count(), 1);
 }
 
@@ -526,12 +526,12 @@ fn enumeration_failure_is_an_error_that_recovers() {
     h.ctl.tick(h.at(0));
     h.ctl.on_event(session(SessionState::Connected), h.at(1));
     let next = h.ctl.tick(h.at(1));
-    assert_eq!(h.ctl.status().state, OutputState::Error);
+    assert_eq!(h.ctl.status().state, LightState::Error);
     assert_eq!(next, Some(h.at(1) + Duration::from_secs(1)));
 
     fake.state().devices_error = None;
     h.ctl.tick(h.at(1_001));
-    assert_eq!(h.ctl.status().state, OutputState::Connected);
+    assert_eq!(h.ctl.status().state, LightState::Connected);
 }
 
 #[test]
@@ -539,7 +539,7 @@ fn device_that_fails_enumeration_is_skipped_and_retried_later() {
     let fake = FakeSdk::with_devices(&[("kb", 3), ("mouse", 2)]);
     fake.state().led_ids_error = Some(("mouse".to_owned(), ErrorCode::InvalidArguments));
     let mut h = Harness::connected(fake.clone());
-    assert_eq!(h.ctl.status().state, OutputState::Connected);
+    assert_eq!(h.ctl.status().state, LightState::Connected);
     assert_eq!(h.ctl.status().device_count, 1);
     let detail = h.ctl.status().detail.clone().unwrap();
     assert!(detail.contains("skipped mouse"), "{detail}");
@@ -573,7 +573,7 @@ fn no_usable_device_is_an_error_that_names_the_skipped_ones() {
     let fake = FakeSdk::with_devices(&[("kb", 3)]);
     fake.state().led_ids_error = Some(("kb".to_owned(), ErrorCode::InvalidArguments));
     let h = Harness::connected(fake);
-    assert_eq!(h.ctl.status().state, OutputState::Error);
+    assert_eq!(h.ctl.status().state, LightState::Error);
     assert!(h.ctl.status().detail.clone().unwrap().contains("kb"));
 }
 
@@ -584,7 +584,7 @@ fn device_that_rejects_colours_is_skipped_while_the_others_keep_working() {
     fake.state().set_error = Some(("mouse".to_owned(), ErrorCode::InvalidArguments));
     h.ctl.set_color(Rgb::new(1, 1, 1));
     let next = h.ctl.tick(h.at(100));
-    assert_eq!(h.ctl.status().state, OutputState::Connected);
+    assert_eq!(h.ctl.status().state, LightState::Connected);
     assert_eq!(h.ctl.status().device_count, 1);
     assert!(
         h.ctl
@@ -619,7 +619,7 @@ fn exclusive_control_of_one_device_does_not_stop_the_others() {
     fake.state().set_error = Some(("kb".to_owned(), ErrorCode::NoControl));
     h.ctl.set_color(Rgb::new(1, 1, 1));
     h.ctl.tick(h.at(100));
-    assert_eq!(h.ctl.status().state, OutputState::Connected);
+    assert_eq!(h.ctl.status().state, LightState::Connected);
     assert_eq!(fake.state().writes.len(), 1);
     assert_eq!(fake.state().writes[0].0, "mouse");
 }
@@ -636,10 +636,10 @@ fn enumeration_fault_does_not_outlive_the_session() {
     h.ctl.tick(h.at(0));
     h.ctl.on_event(session(SessionState::Connected), h.at(1));
     h.ctl.tick(h.at(1));
-    assert_eq!(h.ctl.status().state, OutputState::Error);
+    assert_eq!(h.ctl.status().state, LightState::Error);
 
     h.ctl.on_event(session(SessionState::Timeout), h.at(2));
-    assert_eq!(h.ctl.status().state, OutputState::Unavailable);
+    assert_eq!(h.ctl.status().state, LightState::Unavailable);
     assert_eq!(
         h.ctl.status().detail.as_deref(),
         Some("iCUE is not running")
@@ -655,7 +655,7 @@ fn disabling_releases_control_and_disconnects_then_reenabling_resends() {
     assert_eq!(fake.write_count(), 2);
 
     h.ctl.set_enabled(false);
-    assert_eq!(h.ctl.status().state, OutputState::Disabled);
+    assert_eq!(h.ctl.status().state, LightState::Disabled);
     assert_eq!(
         fake.state().releases,
         vec!["kb".to_owned(), "mouse".to_owned()]
@@ -698,7 +698,7 @@ fn stale_events_after_disconnect_are_ignored() {
     h.ctl.tick(h.at(0));
     h.ctl.set_enabled(false);
     h.ctl.on_event(session(SessionState::Connected), h.at(5));
-    assert_eq!(h.ctl.status().state, OutputState::Disabled);
+    assert_eq!(h.ctl.status().state, LightState::Disabled);
 }
 
 #[test]
@@ -750,9 +750,9 @@ fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
 }
 
 #[test]
-fn threaded_output_connects_writes_and_releases() {
+fn threaded_light_connects_writes_and_releases() {
     let fake = FakeSdk::with_devices(&[("kb", 3), ("mouse", 2)]);
-    let mut out = IcueOutput::spawn(fake.clone());
+    let mut out = IcueLight::spawn(fake.clone());
     assert!(out.status().enabled);
 
     out.set_color(Rgb::new(10, 20, 30)).unwrap();
@@ -760,7 +760,7 @@ fn threaded_output_connects_writes_and_releases() {
     let sink = fake.state().sink.clone().unwrap();
     sink(session(SessionState::Connected));
     wait_until("first writes", || fake.write_count() == 2);
-    assert_eq!(out.status().state, OutputState::Connected);
+    assert_eq!(out.status().state, LightState::Connected);
     assert_eq!(out.status().device_count, 2);
     assert_eq!(out.status().detail.as_deref(), Some("2 devices, 5 LEDs"));
 
@@ -773,7 +773,7 @@ fn threaded_output_connects_writes_and_releases() {
     wait_until("second colour", || fake.write_count() == 4);
 
     out.set_enabled(false);
-    assert_eq!(out.status().state, OutputState::Disabled);
+    assert_eq!(out.status().state, LightState::Disabled);
     wait_until("release", || fake.state().disconnects == 1);
     assert_eq!(fake.state().releases.len(), 2);
 
@@ -782,9 +782,9 @@ fn threaded_output_connects_writes_and_releases() {
 }
 
 #[test]
-fn dropping_the_output_stops_the_worker_and_releases_control() {
+fn dropping_the_light_stops_the_worker_and_releases_control() {
     let fake = FakeSdk::with_devices(&[("kb", 3)]);
-    let out = IcueOutput::spawn(fake.clone());
+    let out = IcueLight::spawn(fake.clone());
     wait_until("connect", || fake.state().sink.is_some());
     let sink = fake.state().sink.clone().unwrap();
     sink(session(SessionState::Connected));
@@ -795,7 +795,7 @@ fn dropping_the_output_stops_the_worker_and_releases_control() {
 }
 
 /// Live check against a running iCUE: writes a colour and reads it back from the hardware.
-/// Run with `GLOWDRIFT_ICUE_DLL_DIR=<dir> cargo test -p glowdrift-outputs -- --ignored live`.
+/// Run with `GLOWDRIFT_ICUE_DLL_DIR=<dir> cargo test -p glowdrift-lights -- --ignored live`.
 #[test]
 #[ignore = "needs iCUE running with the SDK enabled and the SDK DLL"]
 fn live_colour_round_trip() {

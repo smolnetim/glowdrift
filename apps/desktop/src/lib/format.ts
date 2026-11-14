@@ -1,5 +1,5 @@
 import type { CSSProperties } from "react";
-import type { OutputState } from "./ipc";
+import type { LightState } from "./ipc";
 
 export const clamp = (value: number, min: number, max: number): number =>
   Math.min(max, Math.max(min, value));
@@ -14,7 +14,7 @@ export const formatPercent = (fraction: number): string => `${Math.round(fractio
 
 export const formatFps = (fps: number): string => `${fps.toFixed(1)} fps`;
 
-export const OUTPUT_STATE_LABEL: Record<OutputState, string> = {
+export const LIGHT_STATE_LABEL: Record<LightState, string> = {
   connected: "Connected",
   connecting: "Connecting",
   unavailable: "Not available",

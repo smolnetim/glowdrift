@@ -1,4 +1,4 @@
-//! Owns the output sinks: applies the enabled flags, fans out colours, polls status.
+//! Owns the lights: applies the enabled flags, fans out colours, polls status.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,15 +7,15 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread;
 use std::time::Duration;
 
-use glowdrift_core::{OutputsConfig, Rgb};
-use glowdrift_outputs::icue::{ICUE_OUTPUT_ID, IcueOutput};
-use glowdrift_outputs::{Output, OutputState, OutputStatus};
+use glowdrift_core::{LightsConfig, Rgb};
+use glowdrift_lights::icue::{ICUE_LIGHT_ID, IcueLight};
+use glowdrift_lights::{Light, LightState, LightStatus};
 use tauri::{AppHandle, Manager};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const PAUSED_DETAIL: &str = "Paused";
 
-type StatusEmitter = Box<dyn Fn(&[OutputStatus]) + Send + Sync>;
+type StatusEmitter = Box<dyn Fn(&[LightStatus]) + Send + Sync>;
 
 /// The `icue-sdk` folder in the app data directory, where a downloaded SDK library is stored.
 pub fn icue_sdk_dir(app: &AppHandle) -> Option<PathBuf> {
@@ -37,20 +37,20 @@ pub fn icue_dll_dirs(app: &AppHandle) -> Vec<PathBuf> {
     dirs
 }
 
-/// Builds the default set of outputs.
-pub fn default_outputs(app: &AppHandle) -> Vec<Box<dyn Output>> {
-    vec![Box::new(IcueOutput::with_dll_dirs(icue_dll_dirs(app)))]
+/// Builds the default set of lights.
+pub fn default_lights(app: &AppHandle) -> Vec<Box<dyn Light>> {
+    vec![Box::new(IcueLight::with_dll_dirs(icue_dll_dirs(app)))]
 }
 
-fn is_wanted(id: &str, config: &OutputsConfig) -> bool {
+fn is_wanted(id: &str, config: &LightsConfig) -> bool {
     match id {
-        ICUE_OUTPUT_ID => config.icue.enabled,
+        ICUE_LIGHT_ID => config.icue.enabled,
         _ => false,
     }
 }
 
 struct Slot {
-    output: Box<dyn Output>,
+    light: Box<dyn Light>,
     wanted: bool,
     applied: Option<bool>,
     was_connected: bool,
@@ -60,7 +60,7 @@ impl Slot {
     fn sync_enabled(&mut self, paused: bool) {
         let effective = self.wanted && !paused;
         if self.applied != Some(effective) {
-            self.output.set_enabled(effective);
+            self.light.set_enabled(effective);
             self.applied = Some(effective);
         }
     }
@@ -72,19 +72,19 @@ struct Inner {
     closed: bool,
 }
 
-/// Shared handle to all outputs. Methods never block on device I/O beyond what the
-/// individual [`Output`] implementations do.
-pub struct OutputsManager {
+/// Shared handle to all lights. Methods never block on device I/O beyond what the
+/// individual [`Light`] implementations do.
+pub struct LightsManager {
     inner: Mutex<Inner>,
-    last_emitted: Mutex<Option<Vec<OutputStatus>>>,
+    last_emitted: Mutex<Option<Vec<LightStatus>>>,
     resend: AtomicBool,
     emit: StatusEmitter,
     poller_stop: Mutex<Option<Sender<()>>>,
 }
 
-impl std::fmt::Debug for OutputsManager {
+impl std::fmt::Debug for LightsManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OutputsManager").finish_non_exhaustive()
+        f.debug_struct("LightsManager").finish_non_exhaustive()
     }
 }
 
@@ -92,17 +92,17 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-impl OutputsManager {
+impl LightsManager {
     pub fn new(
-        outputs: Vec<Box<dyn Output>>,
-        config: &OutputsConfig,
-        emit: impl Fn(&[OutputStatus]) + Send + Sync + 'static,
+        lights: Vec<Box<dyn Light>>,
+        config: &LightsConfig,
+        emit: impl Fn(&[LightStatus]) + Send + Sync + 'static,
     ) -> Arc<Self> {
-        let slots = outputs
+        let slots = lights
             .into_iter()
-            .map(|output| Slot {
-                wanted: is_wanted(output.id(), config),
-                output,
+            .map(|light| Slot {
+                wanted: is_wanted(light.id(), config),
+                light,
                 applied: None,
                 was_connected: false,
             })
@@ -134,7 +134,7 @@ impl OutputsManager {
         *lock(&self.poller_stop) = Some(stop_tx);
         let weak: Weak<Self> = Arc::downgrade(self);
         let spawned = thread::Builder::new()
-            .name("glowdrift-outputs-poll".to_owned())
+            .name("glowdrift-lights-poll".to_owned())
             .spawn(move || {
                 while let Err(RecvTimeoutError::Timeout) = stop_rx.recv_timeout(POLL_INTERVAL) {
                     let Some(manager) = weak.upgrade() else {
@@ -144,24 +144,24 @@ impl OutputsManager {
                 }
             });
         if let Err(e) = spawned {
-            log::error!("cannot start the outputs poller: {e}");
+            log::error!("cannot start the lights poller: {e}");
         }
     }
 
-    /// Applies the per-output enabled flags from the configuration.
-    pub fn apply_config(&self, config: &OutputsConfig) {
+    /// Applies the per-light enabled flags from the configuration.
+    pub fn apply_config(&self, config: &LightsConfig) {
         {
             let mut inner = lock(&self.inner);
             let paused = inner.paused;
             for slot in &mut inner.slots {
-                slot.wanted = is_wanted(slot.output.id(), config);
+                slot.wanted = is_wanted(slot.light.id(), config);
                 slot.sync_enabled(paused);
             }
         }
         self.poll();
     }
 
-    /// While paused every output is released so normal lighting returns.
+    /// While paused every light is released so normal lighting returns.
     pub fn set_paused(&self, paused: bool) {
         {
             let mut inner = lock(&self.inner);
@@ -173,52 +173,52 @@ impl OutputsManager {
         self.poll();
     }
 
-    /// Asks the output with `id` to retry connecting now, then publishes the new status.
+    /// Asks the light with `id` to retry connecting now, then publishes the new status.
     pub fn retry(&self, id: &str) {
         {
             let mut inner = lock(&self.inner);
             if inner.closed {
                 return;
             }
-            for slot in inner.slots.iter_mut().filter(|s| s.output.id() == id) {
-                slot.output.retry();
+            for slot in inner.slots.iter_mut().filter(|s| s.light.id() == id) {
+                slot.light.retry();
             }
         }
         self.poll();
     }
 
-    /// Sends a colour to every active output.
+    /// Sends a colour to every active light.
     pub fn set_color(&self, color: Rgb) {
         let mut inner = lock(&self.inner);
         if inner.paused || inner.closed {
             return;
         }
         for slot in inner.slots.iter_mut().filter(|s| s.wanted) {
-            if let Err(e) = slot.output.set_color(color) {
-                log::debug!("output {}: {e}", slot.output.id());
+            if let Err(e) = slot.light.set_color(color) {
+                log::debug!("light {}: {e}", slot.light.id());
             }
         }
     }
 
-    /// True once after an output (re)connected; the caller should resend the current colour.
+    /// True once after a light (re)connected; the caller should resend the current colour.
     pub fn take_resend(&self) -> bool {
         self.resend.swap(false, Ordering::AcqRel)
     }
 
-    /// Current status of every output as shown to the UI.
-    pub fn statuses(&self) -> Vec<OutputStatus> {
+    /// Current status of every light as shown to the UI.
+    pub fn statuses(&self) -> Vec<LightStatus> {
         Self::collect(&lock(&self.inner))
     }
 
-    fn collect(inner: &Inner) -> Vec<OutputStatus> {
+    fn collect(inner: &Inner) -> Vec<LightStatus> {
         inner
             .slots
             .iter()
             .map(|slot| {
-                let mut status = slot.output.status();
+                let mut status = slot.light.status();
                 if inner.paused && slot.wanted {
                     status.enabled = true;
-                    status.state = OutputState::Disabled;
+                    status.state = LightState::Disabled;
                     status.detail = Some(PAUSED_DETAIL.to_owned());
                 }
                 status
@@ -231,7 +231,7 @@ impl OutputsManager {
         let statuses = {
             let mut inner = lock(&self.inner);
             for slot in &mut inner.slots {
-                let connected = slot.output.status().state == OutputState::Connected;
+                let connected = slot.light.status().state == LightState::Connected;
                 if connected && !slot.was_connected {
                     self.resend.store(true, Ordering::Release);
                 }
@@ -255,10 +255,10 @@ impl OutputsManager {
         }
         inner.closed = true;
         for slot in &mut inner.slots {
-            slot.output.shutdown();
+            slot.light.shutdown();
             slot.applied = None;
         }
-        log::info!("outputs released");
+        log::info!("lights released");
     }
 }
 
@@ -278,24 +278,24 @@ mod tests {
 
     struct Fake(Arc<Mutex<Shared>>);
 
-    impl Output for Fake {
+    impl Light for Fake {
         fn id(&self) -> &str {
-            ICUE_OUTPUT_ID
+            ICUE_LIGHT_ID
         }
-        fn status(&self) -> OutputStatus {
+        fn status(&self) -> LightStatus {
             let s = lock(&self.0);
             let enabled = s.enabled.unwrap_or(false);
-            OutputStatus {
-                id: ICUE_OUTPUT_ID.to_owned(),
+            LightStatus {
+                id: ICUE_LIGHT_ID.to_owned(),
                 kind: "icue".to_owned(),
                 name: "Fake".to_owned(),
                 enabled,
                 state: if !enabled {
-                    OutputState::Disabled
+                    LightState::Disabled
                 } else if s.connected {
-                    OutputState::Connected
+                    LightState::Connected
                 } else {
-                    OutputState::Connecting
+                    LightState::Connecting
                 },
                 detail: None,
                 device_count: 0,
@@ -308,7 +308,7 @@ mod tests {
         fn set_enabled(&mut self, enabled: bool) {
             lock(&self.0).enabled = Some(enabled);
         }
-        fn set_color(&mut self, color: Rgb) -> Result<(), glowdrift_outputs::OutputError> {
+        fn set_color(&mut self, color: Rgb) -> Result<(), glowdrift_lights::LightError> {
             lock(&self.0).colors.push(color);
             Ok(())
         }
@@ -317,17 +317,17 @@ mod tests {
         }
     }
 
-    fn config(enabled: bool) -> OutputsConfig {
-        OutputsConfig {
+    fn config(enabled: bool) -> LightsConfig {
+        LightsConfig {
             icue: IcueConfig { enabled },
         }
     }
 
-    fn setup(enabled: bool) -> (Arc<OutputsManager>, Arc<Mutex<Shared>>, Arc<Mutex<u32>>) {
+    fn setup(enabled: bool) -> (Arc<LightsManager>, Arc<Mutex<Shared>>, Arc<Mutex<u32>>) {
         let shared = Arc::new(Mutex::new(Shared::default()));
         let emitted = Arc::new(Mutex::new(0_u32));
         let counter = Arc::clone(&emitted);
-        let manager = OutputsManager::new(
+        let manager = LightsManager::new(
             vec![Box::new(Fake(Arc::clone(&shared)))],
             &config(enabled),
             move |_| *lock(&counter) += 1,
@@ -358,7 +358,7 @@ mod tests {
 
         let status = &manager.statuses()[0];
         assert!(status.enabled);
-        assert_eq!(status.state, OutputState::Disabled);
+        assert_eq!(status.state, LightState::Disabled);
         assert_eq!(status.detail.as_deref(), Some(PAUSED_DETAIL));
 
         manager.set_paused(false);
@@ -366,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn user_disabled_output_is_not_reported_as_paused() {
+    fn user_disabled_light_is_not_reported_as_paused() {
         let (manager, _, _) = setup(false);
         manager.set_paused(true);
         let status = &manager.statuses()[0];
@@ -392,19 +392,19 @@ mod tests {
     }
 
     #[test]
-    fn retry_reaches_only_the_named_output_and_not_after_shutdown() {
+    fn retry_reaches_only_the_named_light_and_not_after_shutdown() {
         let (manager, shared, _) = setup(true);
         manager.retry("other");
         assert_eq!(lock(&shared).retries, 0);
-        manager.retry(ICUE_OUTPUT_ID);
+        manager.retry(ICUE_LIGHT_ID);
         assert_eq!(lock(&shared).retries, 1);
         manager.shutdown();
-        manager.retry(ICUE_OUTPUT_ID);
+        manager.retry(ICUE_LIGHT_ID);
         assert_eq!(lock(&shared).retries, 1);
     }
 
     #[test]
-    fn shutdown_shuts_outputs_down() {
+    fn shutdown_shuts_lights_down() {
         let (manager, shared, _) = setup(true);
         manager.shutdown();
         assert_eq!(lock(&shared).shutdowns, 1);

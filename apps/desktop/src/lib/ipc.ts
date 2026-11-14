@@ -33,7 +33,7 @@ export interface Config {
   brightness: number;
   /** 0..=2 */
   saturation: number;
-  outputs: { icue: { enabled: boolean } };
+  lights: { icue: { enabled: boolean } };
   startMinimized: boolean;
   autoUpdate: boolean;
 }
@@ -60,26 +60,26 @@ export interface EngineStatus {
   running: boolean;
   measuredFps: number;
   lastError: string | null;
-  raw: HexColor;
+  target: HexColor;
   smoothed: HexColor;
 }
 
-export type OutputKind = "icue";
-export type OutputState = "connected" | "connecting" | "unavailable" | "error" | "disabled";
+export type LightKind = "icue";
+export type LightState = "connected" | "connecting" | "unavailable" | "error" | "disabled";
 
-/** Machine-readable cause behind an output state; `detail` is for display only. */
-export type OutputCode = "libraryMissing";
+/** Machine-readable cause behind a light state; `detail` is for display only. */
+export type LightCode = "libraryMissing";
 
-export interface OutputStatus {
+export interface LightStatus {
   id: string;
-  kind: OutputKind;
+  kind: LightKind;
   name: string;
   enabled: boolean;
-  state: OutputState;
+  state: LightState;
   detail: string | null;
   deviceCount: number;
   /** Absent or null when the state has no specific cause. */
-  code?: OutputCode | null;
+  code?: LightCode | null;
 }
 
 export interface AppInfo {
@@ -88,7 +88,7 @@ export interface AppInfo {
 }
 
 export interface ColorEvent {
-  raw: HexColor;
+  target: HexColor;
   smoothed: HexColor;
 }
 
@@ -123,7 +123,7 @@ export const getEngineStatus = () =>
   call<EngineStatus>("get_engine_status", undefined, (m) => m.getEngineStatus());
 export const setEngineRunning = (running: boolean) =>
   call<EngineStatus>("set_engine_running", { running }, (m) => m.setEngineRunning(running));
-export const listOutputs = () => call<OutputStatus[]>("list_outputs", undefined, (m) => m.listOutputs());
+export const listLights = () => call<LightStatus[]>("list_lights", undefined, (m) => m.listLights());
 /** Installs the update the shell has already downloaded; resolves false when none is staged. */
 export const installPendingUpdate = () =>
   call<boolean>("install_pending_update", undefined, () => Promise.resolve(false));
@@ -131,11 +131,11 @@ export const installPendingUpdate = () =>
 export const updateNeedsElevation = () =>
   call<boolean>("update_needs_elevation", undefined, (m) => m.updateNeedsElevation());
 /**
- * Downloads and verifies Corsair's iCUE SDK library, then makes the iCUE output retry loading it.
+ * Downloads and verifies Corsair's iCUE SDK library, then makes the iCUE light retry loading it.
  * Rejects with a user-presentable message.
  */
 export const installIcueSdk = () =>
-  call<OutputStatus[]>("install_icue_sdk", undefined, (m) => m.installIcueSdk());
+  call<LightStatus[]>("install_icue_sdk", undefined, (m) => m.installIcueSdk());
 /** Tells the shell the first screen is rendered so it can show the window. */
 export const frontendReady = () => call<void>("frontend_ready", undefined, () => Promise.resolve());
 /** Downloads and verifies an available update and stages it; resolves its version, or null when none. */
@@ -148,8 +148,8 @@ export const onColor = (handler: (e: ColorEvent) => void): Promise<UnlistenFn> =
   subscribe<ColorEvent>("engine://color", handler);
 export const onEngineStatus = (handler: (s: EngineStatus) => void): Promise<UnlistenFn> =>
   subscribe<EngineStatus>("engine://status", handler);
-export const onOutputsStatus = (handler: (s: OutputStatus[]) => void): Promise<UnlistenFn> =>
-  subscribe<OutputStatus[]>("outputs://status", handler);
+export const onLightsStatus = (handler: (s: LightStatus[]) => void): Promise<UnlistenFn> =>
+  subscribe<LightStatus[]>("lights://status", handler);
 /** An update has been downloaded and only needs to be installed. */
 export const onUpdaterReady = (handler: (e: UpdaterReadyEvent) => void): Promise<UnlistenFn> =>
   subscribe<UpdaterReadyEvent>("updater://ready", handler);

@@ -1,18 +1,18 @@
 import { useState } from "react";
 import { useConfig } from "../hooks/useConfig";
-import { OUTPUT_STATE_LABEL } from "../lib/format";
-import type { OutputStatus } from "../lib/ipc";
+import { LIGHT_STATE_LABEL } from "../lib/format";
+import type { LightStatus } from "../lib/ipc";
 import { useStore } from "../lib/store";
 import { patchConfig } from "../state/config";
-import { downloadIcueLibrary, outputsStore } from "../state/outputs";
+import { downloadIcueLibrary, lightsStore } from "../state/lights";
 import { ToggleRow } from "./controls";
 import { Icon } from "./Icon";
 
-export function StateBadge({ output }: { output: OutputStatus }) {
+export function StateBadge({ light }: { light: LightStatus }) {
   return (
-    <span className={`badge badge--${output.state}`}>
+    <span className={`badge badge--${light.state}`}>
       <span className="badge-dot" aria-hidden="true" />
-      {OUTPUT_STATE_LABEL[output.state]}
+      {LIGHT_STATE_LABEL[light.state]}
     </span>
   );
 }
@@ -76,63 +76,63 @@ function LibraryDownload({ missing }: { missing: boolean }) {
   );
 }
 
-function OutputCard({ output }: { output: OutputStatus }) {
+function LightCard({ light }: { light: LightStatus }) {
   const config = useConfig();
-  const enabled = output.kind === "icue" ? config.outputs.icue.enabled : output.enabled;
-  const libraryMissing = output.kind === "icue" && output.code === "libraryMissing";
-  const needsHelp = output.kind === "icue" && output.state !== "connected" && !libraryMissing;
+  const enabled = light.kind === "icue" ? config.lights.icue.enabled : light.enabled;
+  const libraryMissing = light.kind === "icue" && light.code === "libraryMissing";
+  const needsHelp = light.kind === "icue" && light.state !== "connected" && !libraryMissing;
 
   return (
-    <article className="card output-card" aria-label={output.name}>
-      <div className="output-head">
-        <span className="output-icon">
+    <article className="card light-card" aria-label={light.name}>
+      <div className="light-head">
+        <span className="light-icon">
           <Icon name="lights" size={22} />
         </span>
-        <div className="output-title">
-          <h2>{output.name}</h2>
-          <div className="output-meta">
-            <StateBadge output={output} />
-            {output.state === "connected" && (
+        <div className="light-title">
+          <h2>{light.name}</h2>
+          <div className="light-meta">
+            <StateBadge light={light} />
+            {light.state === "connected" && (
               <span className="muted-text">
-                {output.deviceCount} {output.deviceCount === 1 ? "device" : "devices"}
+                {light.deviceCount} {light.deviceCount === 1 ? "device" : "devices"}
               </span>
             )}
           </div>
         </div>
       </div>
-      {output.detail && <p className="output-detail">{output.detail}</p>}
+      {light.detail && <p className="light-detail">{light.detail}</p>}
       <ToggleRow
-        title="Send colour to this output"
+        title="Send colour to this light"
         checked={enabled}
-        onChange={(next) => patchConfig({ outputs: { ...config.outputs, [output.kind]: { enabled: next } } })}
+        onChange={(next) => patchConfig({ lights: { ...config.lights, [light.kind]: { enabled: next } } })}
       />
-      {output.kind === "icue" && <LibraryDownload missing={libraryMissing} />}
-      {needsHelp && output.state !== "connecting" && <IcueSetupHelp disabled={!enabled} />}
+      {light.kind === "icue" && <LibraryDownload missing={libraryMissing} />}
+      {needsHelp && light.state !== "connecting" && <IcueSetupHelp disabled={!enabled} />}
     </article>
   );
 }
 
-/** Output cards with setup guidance; safe with an empty list. */
-export function OutputsPanel() {
-  const outputs = useStore(outputsStore);
+/** Light cards with setup guidance; safe with an empty list. */
+export function LightsPanel() {
+  const lights = useStore(lightsStore);
   return (
     <div className="stack">
-      {outputs.length === 0 ? (
-        <article className="card output-card">
-          <div className="output-head">
-            <span className="output-icon">
+      {lights.length === 0 ? (
+        <article className="card light-card">
+          <div className="light-head">
+            <span className="light-icon">
               <Icon name="lights" size={22} />
             </span>
-            <div className="output-title">
+            <div className="light-title">
               <h2>Corsair iCUE</h2>
-              <div className="output-meta">
+              <div className="light-meta">
                 <span className="muted-text">Checking for lights&hellip;</span>
               </div>
             </div>
           </div>
         </article>
       ) : (
-        outputs.map((output) => <OutputCard key={output.id} output={output} />)
+        lights.map((light) => <LightCard key={light.id} light={light} />)
       )}
       <ul className="notes">
         <li>No virtual display or driver is installed. Glowdrift talks to iCUE through its official SDK.</li>

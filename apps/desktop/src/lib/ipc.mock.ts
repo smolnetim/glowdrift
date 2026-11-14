@@ -12,7 +12,7 @@ import type {
   Config,
   EngineStatus,
   MonitorInfo,
-  OutputStatus,
+  LightStatus,
   Thumbnail,
 } from "./ipc";
 import type { AvailableUpdate } from "./system";
@@ -28,7 +28,7 @@ const MONITORS: MonitorInfo[] = [
 let config: Config = { ...DEFAULT_CONFIG, onboardingComplete: params.has("onboarded") };
 let running = true;
 let libraryInstalled = false;
-let engineColor: ColorEvent = { raw: "#000000", smoothed: "#000000" };
+let engineColor: ColorEvent = { target: "#000000", smoothed: "#000000" };
 
 type Handler = (payload: unknown) => void;
 const handlers = new Map<string, Set<Handler>>();
@@ -71,8 +71,8 @@ function engineStatus(): EngineStatus {
   };
 }
 
-function outputs(): OutputStatus[] {
-  const base = { id: "icue", kind: "icue", name: "Corsair iCUE", enabled: config.outputs.icue.enabled } as const;
+function lights(): LightStatus[] {
+  const base = { id: "icue", kind: "icue", name: "Corsair iCUE", enabled: config.lights.icue.enabled } as const;
   if (!base.enabled) return [{ ...base, state: "disabled", detail: null, deviceCount: 0 }];
   if (params.get("icue") === "nolibrary" && !libraryInstalled) {
     return [
@@ -96,7 +96,7 @@ export const getConfig = async (): Promise<Config> => config;
 export async function setConfig(next: Config): Promise<Config> {
   const previous = config;
   config = validated(next);
-  if (previous.outputs.icue.enabled !== config.outputs.icue.enabled) emit("outputs://status", outputs());
+  if (previous.lights.icue.enabled !== config.lights.icue.enabled) emit("lights://status", lights());
   return config;
 }
 
@@ -139,19 +139,19 @@ export async function setEngineRunning(next: boolean): Promise<EngineStatus> {
 }
 
 /** ?icue=nolibrary simulates a missing library; ?icuefail=1 makes the download fail once. */
-export async function installIcueSdk(): Promise<OutputStatus[]> {
+export async function installIcueSdk(): Promise<LightStatus[]> {
   await delay(1200);
   if (params.has("icuefail") && !libraryInstalled) {
     params.delete("icuefail");
     throw "Could not download the library from GitHub. Check your internet connection and try again.";
   }
   libraryInstalled = true;
-  const list = outputs();
-  emit("outputs://status", list);
+  const list = lights();
+  emit("lights://status", list);
   return list;
 }
 
-export const listOutputs = async (): Promise<OutputStatus[]> => outputs();
+export const listLights = async (): Promise<LightStatus[]> => lights();
 export const getAppInfo = async (): Promise<AppInfo> => ({ name: "Glowdrift", version: "0.1.0" });
 
 const SCENES = ["#3b6cff", "#e5484d", "#2fbf71", "#f5a524", "#9b5de5", "#12a594"];
@@ -178,9 +178,9 @@ setInterval(() => {
     elapsed = 0;
     scene = (scene + 1) % SCENES.length;
   }
-  const raw = SCENES[scene] ?? "#000000";
+  const target = SCENES[scene] ?? "#000000";
   const weight = 1 - Math.exp(-TICK_MS / Math.max(config.smoothingMs, 1));
-  engineColor = { raw, smoothed: mix(engineColor.smoothed, raw, weight) };
+  engineColor = { target, smoothed: mix(engineColor.smoothed, target, weight) };
   emit("engine://color", engineColor);
 }, TICK_MS);
 

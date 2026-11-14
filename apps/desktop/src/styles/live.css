@@ -43,9 +43,9 @@
   color: var(--live-ink);
 }
 
-.color-chip--raw {
-  background: var(--live-raw);
-  color: var(--live-raw-ink);
+.color-chip--target {
+  background: var(--live-target);
+  color: var(--live-target-ink);
 }
 
 .color-chip-label {

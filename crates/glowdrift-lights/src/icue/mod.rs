@@ -1,6 +1,6 @@
-//! Corsair iCUE output via the official iCUE SDK (v4, shared access).
+//! Corsair iCUE light via the official iCUE SDK (v4, shared access).
 //!
-//! [`IcueOutput`] owns a worker thread. `set_color` only stores the latest colour and wakes the
+//! [`IcueLight`] owns a worker thread. `set_color` only stores the latest colour and wakes the
 //! worker; the worker talks to iCUE (connect, session changes, device enumeration, colour
 //! writes at up to ~30 Hz) and releases everything again on disable or shutdown, so the user's
 //! own iCUE lighting returns immediately.
@@ -9,7 +9,7 @@
 //! [`controller::LAYER_PRIORITY`], above iCUE's own profile and level with other shared clients.
 //! The SDK library (`iCUESDK.x64_2019.dll`) is loaded at run time, and only from the
 //! executable's directory, its `resources` subdirectory and directories passed to
-//! [`IcueOutput::with_dll_dirs`]; `PATH` and the working directory are never searched.
+//! [`IcueLight::with_dll_dirs`]; `PATH` and the working directory are never searched.
 
 mod controller;
 #[allow(unsafe_code)]
@@ -29,14 +29,14 @@ use glowdrift_core::Rgb;
 use self::controller::{Controller, Status};
 use self::ffi::FfiSdk;
 use self::sdk::{EventSink, Sdk, SdkEvent};
-use crate::{Output, OutputError, OutputState, OutputStatus};
+use crate::{Light, LightError, LightState, LightStatus};
 
 pub use self::probe::{ProbeDevice, ProbeReport, probe};
 
-/// Output id reported by [`IcueOutput`].
-pub const ICUE_OUTPUT_ID: &str = "icue";
+/// Light id reported by [`IcueLight`].
+pub const ICUE_LIGHT_ID: &str = "icue";
 
-/// How long [`Output::shutdown`] waits for the worker before abandoning it.
+/// How long [`Light::shutdown`] waits for the worker before abandoning it.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(3);
 
 /// The directories the SDK library may be loaded from: `extra`, then the executable's
@@ -75,7 +75,7 @@ impl Inbox {
     }
 }
 
-/// State shared between the [`IcueOutput`] handle, the SDK callbacks and the worker.
+/// State shared between the [`IcueLight`] handle, the SDK callbacks and the worker.
 struct Shared {
     inbox: Mutex<Inbox>,
     wake: Condvar,
@@ -100,7 +100,7 @@ impl Shared {
 }
 
 /// Drives iCUE-controlled devices with a single colour.
-pub struct IcueOutput {
+pub struct IcueLight {
     shared: Arc<Shared>,
     enabled: bool,
     last_color: Option<Rgb>,
@@ -108,28 +108,28 @@ pub struct IcueOutput {
     done: Receiver<()>,
 }
 
-impl std::fmt::Debug for IcueOutput {
+impl std::fmt::Debug for IcueLight {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IcueOutput")
+        f.debug_struct("IcueLight")
             .field("enabled", &self.enabled)
             .field("status", &*lock(&self.shared.status))
             .finish_non_exhaustive()
     }
 }
 
-impl IcueOutput {
-    /// Creates an enabled output that looks for the SDK library next to the executable.
-    pub fn new() -> IcueOutput {
-        IcueOutput::with_dll_dirs(Vec::new())
+impl IcueLight {
+    /// Creates an enabled light that looks for the SDK library next to the executable.
+    pub fn new() -> IcueLight {
+        IcueLight::with_dll_dirs(Vec::new())
     }
 
-    /// Like [`IcueOutput::new`], additionally looking for the SDK library in `dirs` (for
+    /// Like [`IcueLight::new`], additionally looking for the SDK library in `dirs` (for
     /// example the application's bundled resources directory).
-    pub fn with_dll_dirs(dirs: Vec<PathBuf>) -> IcueOutput {
-        IcueOutput::spawn(FfiSdk::new(library_dirs(dirs)))
+    pub fn with_dll_dirs(dirs: Vec<PathBuf>) -> IcueLight {
+        IcueLight::spawn(FfiSdk::new(library_dirs(dirs)))
     }
 
-    fn spawn<S: Sdk + 'static>(sdk: S) -> IcueOutput {
+    fn spawn<S: Sdk + 'static>(sdk: S) -> IcueLight {
         let shared = Arc::new(Shared {
             inbox: Mutex::new(Inbox {
                 enabled: Some(true),
@@ -137,7 +137,7 @@ impl IcueOutput {
             }),
             wake: Condvar::new(),
             status: Mutex::new(Status {
-                state: OutputState::Connecting,
+                state: LightState::Connecting,
                 detail: Some("Starting".to_owned()),
                 device_count: 0,
                 code: None,
@@ -151,14 +151,14 @@ impl IcueOutput {
             .map_err(|err| {
                 log::error!("could not start the iCUE worker: {err}");
                 *lock(&shared.status) = Status {
-                    state: OutputState::Error,
+                    state: LightState::Error,
                     detail: Some(format!("could not start the iCUE worker: {err}")),
                     device_count: 0,
                     code: None,
                 };
             })
             .ok();
-        IcueOutput {
+        IcueLight {
             shared,
             enabled: true,
             last_color: None,
@@ -168,35 +168,30 @@ impl IcueOutput {
     }
 }
 
-impl Default for IcueOutput {
+impl Default for IcueLight {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Drop for IcueOutput {
+impl Drop for IcueLight {
     fn drop(&mut self) {
         self.shutdown();
     }
 }
 
-impl Output for IcueOutput {
+impl Light for IcueLight {
     fn id(&self) -> &str {
-        ICUE_OUTPUT_ID
+        ICUE_LIGHT_ID
     }
 
-    fn status(&self) -> OutputStatus {
+    fn status(&self) -> LightStatus {
         let published = lock(&self.shared.status).clone();
         let (state, detail, device_count, code) = if !self.enabled {
-            (OutputState::Disabled, None, 0, None)
-        } else if published.state == OutputState::Disabled {
+            (LightState::Disabled, None, 0, None)
+        } else if published.state == LightState::Disabled {
             // Enabled, but the worker has not processed the request yet.
-            (
-                OutputState::Connecting,
-                Some("Starting".to_owned()),
-                0,
-                None,
-            )
+            (LightState::Connecting, Some("Starting".to_owned()), 0, None)
         } else {
             (
                 published.state,
@@ -205,8 +200,8 @@ impl Output for IcueOutput {
                 published.code,
             )
         };
-        OutputStatus {
-            id: ICUE_OUTPUT_ID.to_owned(),
+        LightStatus {
+            id: ICUE_LIGHT_ID.to_owned(),
             kind: "icue".to_owned(),
             name: "Corsair iCUE".to_owned(),
             enabled: self.enabled,
@@ -229,7 +224,7 @@ impl Output for IcueOutput {
         self.shared.update(|inbox| inbox.enabled = Some(enabled));
     }
 
-    fn set_color(&mut self, color: Rgb) -> Result<(), OutputError> {
+    fn set_color(&mut self, color: Rgb) -> Result<(), LightError> {
         if self.last_color == Some(color) {
             return Ok(());
         }
@@ -290,7 +285,7 @@ fn run_worker<S: Sdk>(shared: &Arc<Shared>, sdk: S, done: &Sender<()>) {
     if outcome.is_err() {
         log::error!("iCUE worker panicked");
         *lock(&shared.status) = Status {
-            state: OutputState::Error,
+            state: LightState::Error,
             detail: Some("The iCUE worker stopped unexpectedly".to_owned()),
             device_count: 0,
             code: None,

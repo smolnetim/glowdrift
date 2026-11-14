@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use glowdrift_capture::{Frame, MonitorInfo};
 use glowdrift_core::Config;
-use glowdrift_outputs::icue::ICUE_OUTPUT_ID;
-use glowdrift_outputs::{OutputCode, OutputStatus};
+use glowdrift_lights::icue::ICUE_LIGHT_ID;
+use glowdrift_lights::{LightCode, LightStatus};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
@@ -16,11 +16,11 @@ use crate::config_store::ConfigStore;
 pub use crate::engine::EngineStatus;
 use crate::engine::{EngineHandle, describe_capture_error};
 use crate::icue_sdk;
-use crate::outputs_manager::{self, OutputsManager};
+use crate::lights_manager::{self, LightsManager};
 use crate::per_machine;
 use crate::updater::{self, PendingUpdate};
 
-/// How long `install_icue_sdk` waits for the iCUE output to pick up a newly installed library.
+/// How long `install_icue_sdk` waits for the iCUE light to pick up a newly installed library.
 const SDK_RELOAD_WAIT: Duration = Duration::from_secs(2);
 const SDK_RELOAD_POLL: Duration = Duration::from_millis(50);
 
@@ -49,7 +49,7 @@ pub struct AppInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ColorEvent {
-    pub raw: String,
+    pub target: String,
     pub smoothed: String,
 }
 
@@ -57,7 +57,7 @@ pub struct ColorEvent {
 pub mod events {
     pub const COLOR: &str = "engine://color";
     pub const ENGINE_STATUS: &str = "engine://status";
-    pub const OUTPUTS_STATUS: &str = "outputs://status";
+    pub const LIGHTS_STATUS: &str = "lights://status";
     pub const UPDATER_READY: &str = "updater://ready";
 }
 
@@ -66,7 +66,7 @@ pub struct AppState {
     pub config: Mutex<Config>,
     pub store: ConfigStore,
     pub engine: EngineHandle,
-    pub outputs: Arc<OutputsManager>,
+    pub lights: Arc<LightsManager>,
     pub pending_update: Mutex<Option<PendingUpdate>>,
     /// True until the main window has been shown for the first time (and when it must be).
     pub show_on_load: AtomicBool,
@@ -81,11 +81,11 @@ impl std::fmt::Debug for AppState {
 }
 
 impl AppState {
-    /// Stops the engine (releasing outputs). Safe to call more than once.
+    /// Stops the engine (releasing lights). Safe to call more than once.
     pub fn shutdown(&self) {
         self.quitting.store(true, Ordering::Release);
         self.engine.shutdown();
-        self.outputs.shutdown();
+        self.lights.shutdown();
     }
 
     pub fn is_quitting(&self) -> bool {
@@ -199,8 +199,8 @@ pub fn set_engine_running(running: bool, state: State<'_, AppState>) -> EngineSt
 }
 
 #[tauri::command]
-pub fn list_outputs(state: State<'_, AppState>) -> Vec<OutputStatus> {
-    state.outputs.statuses()
+pub fn list_lights(state: State<'_, AppState>) -> Vec<LightStatus> {
+    state.lights.statuses()
 }
 
 #[tauri::command]
@@ -230,24 +230,24 @@ pub fn update_needs_elevation() -> bool {
 }
 
 /// Downloads the pinned, verified iCUE SDK library into the app data directory and makes the
-/// iCUE output retry loading it. Returns the output statuses after the retry.
+/// iCUE light retry loading it. Returns the light statuses after the retry.
 #[tauri::command]
 pub async fn install_icue_sdk(
     app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<Vec<OutputStatus>, String> {
-    let dir = outputs_manager::icue_sdk_dir(&app)
+) -> Result<Vec<LightStatus>, String> {
+    let dir = lights_manager::icue_sdk_dir(&app)
         .ok_or_else(|| "The app data folder is not available.".to_owned())?;
     icue_sdk::install(&dir).await.map_err(|e| e.to_string())?;
-    let outputs = Arc::clone(&state.outputs);
+    let lights = Arc::clone(&state.lights);
     tauri::async_runtime::spawn_blocking(move || {
-        outputs.retry(ICUE_OUTPUT_ID);
+        lights.retry(ICUE_LIGHT_ID);
         let deadline = Instant::now() + SDK_RELOAD_WAIT;
         loop {
-            let statuses = outputs.statuses();
+            let statuses = lights.statuses();
             let still_missing = statuses
                 .iter()
-                .any(|s| s.id == ICUE_OUTPUT_ID && s.code == Some(OutputCode::LibraryMissing));
+                .any(|s| s.id == ICUE_LIGHT_ID && s.code == Some(LightCode::LibraryMissing));
             if !still_missing || Instant::now() >= deadline {
                 return statuses;
             }

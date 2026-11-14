@@ -1,7 +1,7 @@
 //! Connects to iCUE, lists devices, sweeps every LED through the hue wheel for four seconds,
 //! releases control and re-reads the devices to show the user's lighting is back.
 //!
-//! Usage: `cargo run -p glowdrift-outputs --example icue_probe -- [--dll-dir <dir>]`
+//! Usage: `cargo run -p glowdrift-lights --example icue_probe -- [--dll-dir <dir>]`
 //! (the directory containing `iCUESDK.x64_2019.dll`; the executable's directory and its
 //! `resources` subdirectory are always searched, `PATH` and the working directory never are).
 
@@ -9,8 +9,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use glowdrift_core::Rgb;
-use glowdrift_outputs::icue::{IcueOutput, ProbeReport, probe};
-use glowdrift_outputs::{Output, OutputState};
+use glowdrift_lights::icue::{IcueLight, ProbeReport, probe};
+use glowdrift_lights::{Light, LightState};
 
 const SWEEP: Duration = Duration::from_secs(4);
 const FRAME: Duration = Duration::from_millis(16);
@@ -68,19 +68,19 @@ fn main() {
     };
     print_report("before", &before);
 
-    let mut output = IcueOutput::with_dll_dirs(dirs.clone());
+    let mut light = IcueLight::with_dll_dirs(dirs.clone());
     let started = Instant::now();
-    while output.status().state != OutputState::Connected {
+    while light.status().state != LightState::Connected {
         if started.elapsed() > Duration::from_secs(10) {
-            println!("output did not connect: {:?}", output.status());
-            output.shutdown();
+            println!("light did not connect: {:?}", light.status());
+            light.shutdown();
             std::process::exit(1);
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    let status = output.status();
+    let status = light.status();
     println!(
-        "== output status: {:?}, {} device(s), detail {:?} (connected after {:?})",
+        "== light status: {:?}, {} device(s), detail {:?} (connected after {:?})",
         status.state,
         status.device_count,
         status.detail,
@@ -93,7 +93,7 @@ fn main() {
     while sweep_start.elapsed() < SWEEP {
         let t = sweep_start.elapsed().as_secs_f32() / SWEEP.as_secs_f32();
         let color = hue_to_rgb(t * 360.0);
-        let _ = output.set_color(color);
+        let _ = light.set_color(color);
         frames += 1;
         if frames % 60 == 1 {
             println!("  t={t:.2} colour {}", color.to_hex());
@@ -101,9 +101,9 @@ fn main() {
         std::thread::sleep(FRAME);
     }
     println!("  sent {frames} colour updates (the worker writes at most ~30/s)");
-    println!("  status after sweep: {:?}", output.status().state);
+    println!("  status after sweep: {:?}", light.status().state);
 
-    output.shutdown();
+    light.shutdown();
     println!("== control released, SDK disconnected");
     std::thread::sleep(Duration::from_millis(750));
 

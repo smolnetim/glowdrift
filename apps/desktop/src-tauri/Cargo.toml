@@ -19,7 +19,7 @@ tauri-build = { workspace = true }
 [dependencies]
 glowdrift-core = { workspace = true }
 glowdrift-capture = { workspace = true }
-glowdrift-outputs = { workspace = true }
+glowdrift-lights = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }

@@ -1,4 +1,4 @@
-//! Worker-side state machine for the iCUE output.
+//! Worker-side state machine for the iCUE light.
 //!
 //! A [`Controller`] is driven by explicit inputs (`set_enabled`, `set_color`, `on_event`,
 //! `tick`) and an explicit clock, so connection handling, de-duplication and rate limiting are
@@ -10,7 +10,7 @@ use glowdrift_core::Rgb;
 
 use super::ffi::DLL_NAME;
 use super::sdk::{ErrorCode, EventSink, Sdk, SdkError, SdkEvent, SessionState};
-use crate::{OutputCode, OutputState};
+use crate::{LightCode, LightState};
 
 /// Minimum gap between colour writes (about 30 Hz).
 pub(crate) const MIN_SEND_INTERVAL: Duration = Duration::from_millis(33);
@@ -29,14 +29,14 @@ pub(crate) const LAYER_PRIORITY: u32 = 128;
 /// Published connection status.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Status {
-    pub state: OutputState,
+    pub state: LightState,
     pub detail: Option<String>,
     pub device_count: u32,
-    pub code: Option<OutputCode>,
+    pub code: Option<LightCode>,
 }
 
 impl Status {
-    fn new(state: OutputState, detail: Option<&str>) -> Status {
+    fn new(state: LightState, detail: Option<&str>) -> Status {
         Status {
             state,
             detail: detail.map(str::to_owned),
@@ -123,19 +123,19 @@ impl<S: Sdk> std::fmt::Debug for Controller<S> {
     }
 }
 
-/// Output state and user-facing text for a session state other than `Connected`.
-pub(crate) fn session_status(state: SessionState) -> (OutputState, &'static str) {
+/// Light state and user-facing text for a session state other than `Connected`.
+pub(crate) fn session_status(state: SessionState) -> (LightState, &'static str) {
     match state {
         SessionState::Invalid | SessionState::Closed | SessionState::Connecting => {
-            (OutputState::Connecting, "Connecting to iCUE")
+            (LightState::Connecting, "Connecting to iCUE")
         }
-        SessionState::ConnectionLost => (OutputState::Connecting, "Reconnecting to iCUE"),
-        SessionState::Timeout => (OutputState::Unavailable, "iCUE is not running"),
+        SessionState::ConnectionLost => (LightState::Connecting, "Reconnecting to iCUE"),
+        SessionState::Timeout => (LightState::Unavailable, "iCUE is not running"),
         SessionState::ConnectionRefused => (
-            OutputState::Unavailable,
+            LightState::Unavailable,
             "iCUE refused the connection: enable the iCUE SDK in iCUE settings (SDK tab)",
         ),
-        SessionState::Connected => (OutputState::Connected, "Connected"),
+        SessionState::Connected => (LightState::Connected, "Connected"),
     }
 }
 
@@ -171,7 +171,7 @@ impl<S: Sdk> Controller<S> {
             sent: None,
             last_send: None,
             send_retry_at: None,
-            status: Status::new(OutputState::Disabled, None),
+            status: Status::new(LightState::Disabled, None),
         };
         controller.refresh_status();
         controller
@@ -491,27 +491,27 @@ impl<S: Sdk> Controller<S> {
 
     fn compute_status(&self) -> Status {
         if !self.enabled {
-            return Status::new(OutputState::Disabled, None);
+            return Status::new(LightState::Disabled, None);
         }
         if self.stopped {
-            return Status::new(OutputState::Unavailable, Some("Stopped"));
+            return Status::new(LightState::Unavailable, Some("Stopped"));
         }
         match &self.fault {
             Some(Fault::LibraryMissing) => {
                 return Status {
-                    code: Some(OutputCode::LibraryMissing),
+                    code: Some(LightCode::LibraryMissing),
                     ..Status::new(
-                        OutputState::Unavailable,
+                        LightState::Unavailable,
                         Some(&format!("iCUE SDK library ({DLL_NAME}) not found")),
                     )
                 };
             }
             Some(Fault::Error(message)) => {
-                return Status::new(OutputState::Error, Some(message));
+                return Status::new(LightState::Error, Some(message));
             }
             Some(Fault::Contended) => {
                 return Status::new(
-                    OutputState::Error,
+                    LightState::Error,
                     Some("Another application has exclusive control of the lighting"),
                 );
             }
@@ -521,7 +521,7 @@ impl<S: Sdk> Controller<S> {
             return if self.enumerated {
                 self.connected_status()
             } else {
-                Status::new(OutputState::Connecting, Some("Reading iCUE devices"))
+                Status::new(LightState::Connecting, Some("Reading iCUE devices"))
             };
         }
         let (state, detail) = session_status(self.session);
@@ -542,7 +542,7 @@ impl<S: Sdk> Controller<S> {
         };
         if self.skipped.is_empty() {
             return Status {
-                state: OutputState::Connected,
+                state: LightState::Connected,
                 detail: Some(detail),
                 device_count: u32::try_from(count).unwrap_or(u32::MAX),
                 code: None,
@@ -551,12 +551,12 @@ impl<S: Sdk> Controller<S> {
         let skipped = format!("skipped {}", self.skipped.join(", "));
         if count == 0 {
             return Status::new(
-                OutputState::Error,
+                LightState::Error,
                 Some(&format!("Could not use any device ({skipped})")),
             );
         }
         Status {
-            state: OutputState::Connected,
+            state: LightState::Connected,
             detail: Some(format!("{detail}; {skipped}")),
             device_count: u32::try_from(count).unwrap_or(u32::MAX),
             code: None,

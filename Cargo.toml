@@ -13,7 +13,7 @@ authors = ["Glowdrift contributors"]
 [workspace.dependencies]
 glowdrift-core = { path = "crates/glowdrift-core" }
 glowdrift-capture = { path = "crates/glowdrift-capture" }
-glowdrift-outputs = { path = "crates/glowdrift-outputs" }
+glowdrift-lights = { path = "crates/glowdrift-lights" }
 
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

@@ -1477,7 +1477,7 @@ dependencies = [
  "base64 0.23.1",
  "glowdrift-capture",
  "glowdrift-core",
- "glowdrift-outputs",
+ "glowdrift-lights",
  "log",
  "png",
  "reqwest",
@@ -1497,7 +1497,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "glowdrift-outputs"
+name = "glowdrift-lights"
 version = "0.1.0"
 dependencies = [
  "glowdrift-core",

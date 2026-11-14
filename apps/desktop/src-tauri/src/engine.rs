@@ -1,7 +1,7 @@
-//! The colour engine: capture -> reduce -> smooth -> outputs on one dedicated thread.
+//! The colour engine: capture -> reduce -> smooth -> lights on one dedicated thread.
 //!
-//! Capture runs at `captureFps`; the smoother ticks at a fixed output rate that is independent
-//! of the capture rate and stops entirely once the output has reached its target.
+//! Capture runs at `captureFps`; the smoother ticks at a fixed smoothing rate that is independent
+//! of the capture rate and stops entirely once the smoothed colour has reached the target colour.
 
 use std::io;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -13,7 +13,7 @@ use glowdrift_capture::{CaptureError, Capturer};
 use glowdrift_core::{ColorAdjust, Config, LinearRgb, Rgb, Smoother, reduce};
 use serde::{Deserialize, Serialize};
 
-use crate::outputs_manager::OutputsManager;
+use crate::lights_manager::LightsManager;
 
 /// Rate at which the smoother is advanced while the colour is still moving.
 const TICK_INTERVAL: Duration = Duration::from_micros(16_667);
@@ -40,9 +40,9 @@ pub struct EngineStatus {
     pub running: bool,
     pub measured_fps: f32,
     pub last_error: Option<String>,
-    /// Unsmoothed target colour as `#rrggbb`.
-    pub raw: String,
-    /// Smoothed output colour as `#rrggbb`.
+    /// Target colour as `#rrggbb`.
+    pub target: String,
+    /// Smoothed colour as `#rrggbb`.
     pub smoothed: String,
 }
 
@@ -52,7 +52,7 @@ impl Default for EngineStatus {
             running: false,
             measured_fps: 0.0,
             last_error: None,
-            raw: IDLE_COLOR.to_owned(),
+            target: IDLE_COLOR.to_owned(),
             smoothed: IDLE_COLOR.to_owned(),
         }
     }
@@ -61,8 +61,8 @@ impl Default for EngineStatus {
 /// Receiver of engine notifications. Implementations must not block.
 pub trait EngineEvents: Send + 'static {
     /// Throttled colour preview, only called while previews are enabled.
-    fn color(&self, raw: Rgb, smoothed: Rgb);
-    /// Called when the running flag, the error, or the rounded frame rate changes.
+    fn color(&self, target: Rgb, smoothed: Rgb);
+    /// Called when the running flag, the error, or the rounded measured capture rate changes.
     fn status(&self, status: &EngineStatus);
 }
 
@@ -93,7 +93,7 @@ pub fn describe_capture_error(error: &CaptureError) -> String {
 // Pure scheduling pieces
 // ---------------------------------------------------------------------------------------------
 
-/// Interval between captures for a frame rate, clamped to the supported range.
+/// Interval between captures for a capture rate, clamped to the supported range.
 pub fn capture_interval(fps: u32) -> Duration {
     let range = Config::CAPTURE_FPS_RANGE;
     Duration::from_secs_f64(1.0 / f64::from(fps.clamp(*range.start(), *range.end())))
@@ -106,7 +106,7 @@ pub fn advance_deadline(previous: Instant, now: Instant, interval: Duration) -> 
     if next <= now { now + interval } else { next }
 }
 
-/// True when the 8-bit output has reached the 8-bit target, so smoothing can stop ticking.
+/// True when the 8-bit smoothed colour has reached the 8-bit target, so smoothing can stop ticking.
 pub fn is_settled(smoothed: Rgb, target: Rgb) -> bool {
     smoothed == target
 }
@@ -183,7 +183,7 @@ impl Throttle {
     }
 }
 
-/// Frames-per-second meter over fixed windows, lightly smoothed.
+/// Meter of the achieved capture rate over fixed windows, lightly smoothed.
 #[derive(Debug, Clone)]
 pub struct FpsMeter {
     window_start: Instant,
@@ -245,7 +245,7 @@ impl EngineHandle {
     /// Starts the engine thread, running, with `config`.
     pub fn spawn(
         config: Config,
-        outputs: Arc<OutputsManager>,
+        lights: Arc<LightsManager>,
         events: impl EngineEvents,
     ) -> io::Result<Self> {
         let (tx, rx) = mpsc::channel();
@@ -253,7 +253,7 @@ impl EngineHandle {
             running: true,
             ..EngineStatus::default()
         }));
-        let engine = Engine::new(rx, Arc::clone(&status), outputs, events, config);
+        let engine = Engine::new(rx, Arc::clone(&status), lights, events, config);
         let join = thread::Builder::new()
             .name("glowdrift-engine".to_owned())
             .spawn(move || engine.run())?;
@@ -287,7 +287,7 @@ impl EngineHandle {
         lock(&self.status).clone()
     }
 
-    /// Stops the thread, releasing outputs, and waits for it. Safe to call repeatedly.
+    /// Stops the thread, releasing lights, and waits for it. Safe to call repeatedly.
     pub fn shutdown(&self) {
         let Some(join) = lock(&self.join).take() else {
             return;
@@ -316,7 +316,7 @@ struct ReportKey {
 struct Engine<E: EngineEvents> {
     rx: Receiver<EngineCommand>,
     shared: Arc<Mutex<EngineStatus>>,
-    outputs: Arc<OutputsManager>,
+    lights: Arc<LightsManager>,
     events: E,
     config: Config,
     running: bool,
@@ -348,16 +348,16 @@ impl<E: EngineEvents> Engine<E> {
     fn new(
         rx: Receiver<EngineCommand>,
         shared: Arc<Mutex<EngineStatus>>,
-        outputs: Arc<OutputsManager>,
+        lights: Arc<LightsManager>,
         events: E,
         config: Config,
     ) -> Self {
         let now = Instant::now();
-        outputs.apply_config(&config.outputs);
+        lights.apply_config(&config.lights);
         Self {
             rx,
             shared,
-            outputs,
+            lights,
             events,
             config,
             running: true,
@@ -406,7 +406,7 @@ impl<E: EngineEvents> Engine<E> {
             self.step(now);
             self.sleep_until_next(now);
         }
-        self.outputs.shutdown();
+        self.lights.shutdown();
     }
 
     /// Returns false when the engine must stop.
@@ -431,7 +431,7 @@ impl<E: EngineEvents> Engine<E> {
     }
 
     fn step(&mut self, now: Instant) {
-        if self.outputs.take_resend() {
+        if self.lights.take_resend() {
             self.last_sent = None;
             if self.has_target {
                 self.send_current();
@@ -566,14 +566,14 @@ impl<E: EngineEvents> Engine<E> {
     }
 
     fn send_current(&mut self) {
-        self.outputs.set_color(self.smoothed_rgb);
+        self.lights.set_color(self.smoothed_rgb);
         self.last_sent = Some(self.smoothed_rgb);
     }
 
     fn publish_colors(&mut self) {
         {
             let mut shared = lock(&self.shared);
-            shared.raw = self.target_rgb.to_hex();
+            shared.target = self.target_rgb.to_hex();
             shared.smoothed = self.smoothed_rgb.to_hex();
         }
         if self.preview {
@@ -593,11 +593,11 @@ impl<E: EngineEvents> Engine<E> {
         if old.capture_fps != config.capture_fps {
             self.next_capture = now;
         }
-        let outputs_changed = old.outputs != config.outputs;
+        let lights_changed = old.lights != config.lights;
         let adjust_changed =
             old.brightness != config.brightness || old.saturation != config.saturation;
-        if outputs_changed {
-            self.outputs.apply_config(&config.outputs);
+        if lights_changed {
+            self.lights.apply_config(&config.lights);
             self.last_sent = None;
             if self.has_target {
                 self.send_current();
@@ -631,7 +631,7 @@ impl<E: EngineEvents> Engine<E> {
                 shared.last_error = None;
             }
         }
-        self.outputs.set_paused(!running);
+        self.lights.set_paused(!running);
         self.report();
         if self.preview {
             self.throttle.mark();
@@ -755,7 +755,7 @@ mod tests {
     struct Recorder(Arc<Mutex<Vec<EngineStatus>>>);
 
     impl EngineEvents for Recorder {
-        fn color(&self, _raw: Rgb, _smoothed: Rgb) {}
+        fn color(&self, _target: Rgb, _smoothed: Rgb) {}
         fn status(&self, status: &EngineStatus) {
             lock(&self.0).push(status.clone());
         }
@@ -775,9 +775,9 @@ mod tests {
     #[test]
     fn thread_pauses_resumes_and_shuts_down() {
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let outputs = OutputsManager::new(Vec::new(), &Config::default().outputs, |_| {});
+        let lights = LightsManager::new(Vec::new(), &Config::default().lights, |_| {});
         let handle =
-            EngineHandle::spawn(Config::default(), outputs, Recorder(Arc::clone(&seen))).unwrap();
+            EngineHandle::spawn(Config::default(), lights, Recorder(Arc::clone(&seen))).unwrap();
         assert!(handle.status().running);
 
         handle.set_running(false);
@@ -805,6 +805,6 @@ mod tests {
     fn default_status_is_idle() {
         let status = EngineStatus::default();
         assert!(!status.running);
-        assert_eq!(status.raw, "#000000");
+        assert_eq!(status.target, "#000000");
     }
 }

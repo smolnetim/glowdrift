@@ -13,7 +13,7 @@ const INK_DARK = "#111114";
 /** Luminance at which black and white text have equal contrast. */
 const INK_THRESHOLD = 0.179;
 
-let current: ColorEvent = { raw: "#000000", smoothed: "#000000" };
+let current: ColorEvent = { target: "#000000", smoothed: "#000000" };
 let frame = 0;
 const listeners = new Set<Listener>();
 
@@ -24,16 +24,16 @@ function flush(): void {
   const style = document.documentElement.style;
   const lum = luminance(current.smoothed);
   style.setProperty("--live", current.smoothed);
-  style.setProperty("--live-raw", current.raw);
+  style.setProperty("--live-target", current.target);
   style.setProperty("--live-ink", inkFor(current.smoothed));
-  style.setProperty("--live-raw-ink", inkFor(current.raw));
+  style.setProperty("--live-target-ink", inkFor(current.target));
   // Near-black or near-white colours fall back to the theme accent for UI chrome.
   style.setProperty("--live-strength", clamp(Math.min(lum / 0.15, (1 - lum) / 0.15), 0, 1).toFixed(3));
   for (const listener of listeners) listener(current);
 }
 
 export function pushLiveColor(next: ColorEvent): void {
-  if (next.raw === current.raw && next.smoothed === current.smoothed) return;
+  if (next.target === current.target && next.smoothed === current.smoothed) return;
   current = next;
   if (!frame) frame = requestAnimationFrame(flush);
 }

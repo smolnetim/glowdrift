@@ -1,10 +1,10 @@
 import { Page } from "../components/layout";
-import { OutputsPanel } from "../components/Outputs";
+import { LightsPanel } from "../components/LightsPanel";
 
 export function Lights() {
   return (
     <Page title="Lights" description="Choose where Glowdrift sends its colour.">
-      <OutputsPanel />
+      <LightsPanel />
     </Page>
   );
 }
