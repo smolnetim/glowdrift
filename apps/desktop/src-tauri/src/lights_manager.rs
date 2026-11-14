@@ -200,6 +200,25 @@ impl LightsManager {
         }
     }
 
+    /// The shortest gap between colours that the fastest active light can use, so the colour only
+    /// needs advancing that often. `None` when no light is active, meaning nothing consumes the
+    /// colour. A light with no limit gives a zero gap.
+    ///
+    /// A light counts while it is wanted and not paused, whatever its connection state: a light
+    /// that is still connecting or has dropped out keeps its rate, so a reconnect needs no change.
+    pub fn fastest_interval(&self) -> Option<Duration> {
+        let inner = lock(&self.inner);
+        if inner.paused || inner.closed {
+            return None;
+        }
+        inner
+            .slots
+            .iter()
+            .filter(|slot| slot.wanted)
+            .map(|slot| slot.light.min_send_interval().unwrap_or(Duration::ZERO))
+            .min()
+    }
+
     /// True once after a light (re)connected; the caller should resend the current colour.
     pub fn take_resend(&self) -> bool {
         self.resend.swap(false, Ordering::AcqRel)
@@ -269,6 +288,7 @@ mod tests {
 
     #[derive(Default)]
     struct Shared {
+        interval: Option<Duration>,
         enabled: Option<bool>,
         colors: Vec<Rgb>,
         connected: bool,
@@ -301,6 +321,9 @@ mod tests {
                 device_count: 0,
                 code: None,
             }
+        }
+        fn min_send_interval(&self) -> Option<Duration> {
+            lock(&self.0).interval
         }
         fn retry(&mut self) {
             lock(&self.0).retries += 1;
@@ -401,6 +424,53 @@ mod tests {
         manager.shutdown();
         manager.retry(ICUE_LIGHT_ID);
         assert_eq!(lock(&shared).retries, 1);
+    }
+
+    fn with_interval(
+        manager: &LightsManager,
+        shared: &Mutex<Shared>,
+        interval: Option<Duration>,
+    ) -> Option<Duration> {
+        lock(shared).interval = interval;
+        manager.fastest_interval()
+    }
+
+    #[test]
+    fn fastest_interval_follows_the_active_lights() {
+        let (manager, shared, _) = setup(true);
+        let ms = Duration::from_millis;
+        assert_eq!(with_interval(&manager, &shared, Some(ms(33))), Some(ms(33)));
+        assert_eq!(with_interval(&manager, &shared, None), Some(Duration::ZERO));
+
+        lock(&shared).interval = Some(ms(33));
+        assert!(!lock(&shared).connected, "a light still connecting counts");
+        manager.set_paused(true);
+        assert_eq!(manager.fastest_interval(), None);
+        manager.set_paused(false);
+        manager.apply_config(&config(false));
+        assert_eq!(manager.fastest_interval(), None);
+        manager.apply_config(&config(true));
+        assert_eq!(manager.fastest_interval(), Some(ms(33)));
+        manager.shutdown();
+        assert_eq!(manager.fastest_interval(), None);
+    }
+
+    #[test]
+    fn fastest_interval_is_the_shortest_among_active_lights() {
+        let slow = Arc::new(Mutex::new(Shared {
+            interval: Some(Duration::from_millis(50)),
+            ..Shared::default()
+        }));
+        let fast = Arc::new(Mutex::new(Shared {
+            interval: Some(Duration::from_millis(33)),
+            ..Shared::default()
+        }));
+        let manager = LightsManager::new(
+            vec![Box::new(Fake(slow)), Box::new(Fake(fast))],
+            &config(true),
+            |_| {},
+        );
+        assert_eq!(manager.fastest_interval(), Some(Duration::from_millis(33)));
     }
 
     #[test]

@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use glowdrift_core::Rgb;
 
-use self::controller::{Controller, Status};
+use self::controller::{Controller, MIN_SEND_INTERVAL, Status};
 use self::ffi::FfiSdk;
 use self::sdk::{EventSink, Sdk, SdkEvent};
 use crate::{Light, LightError, LightState, LightStatus};
@@ -214,6 +214,10 @@ impl Light for IcueLight {
 
     fn retry(&mut self) {
         self.shared.update(|inbox| inbox.retry = true);
+    }
+
+    fn min_send_interval(&self) -> Option<Duration> {
+        Some(MIN_SEND_INTERVAL)
     }
 
     fn set_enabled(&mut self, enabled: bool) {

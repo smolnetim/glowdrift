@@ -143,6 +143,9 @@ impl Light for CountingLight {
         }
     }
     fn set_enabled(&mut self, _enabled: bool) {}
+    fn min_send_interval(&self) -> Option<Duration> {
+        None
+    }
     fn set_color(&mut self, _color: Rgb) -> Result<(), LightError> {
         self.0.fetch_add(1, Ordering::Relaxed);
         Ok(())

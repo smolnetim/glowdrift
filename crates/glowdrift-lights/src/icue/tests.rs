@@ -794,6 +794,13 @@ fn dropping_the_light_stops_the_worker_and_releases_control() {
     assert_eq!(fake.state().disconnects, 1);
 }
 
+#[test]
+fn declares_the_worker_send_interval_as_its_rate_limit() {
+    let mut out = IcueLight::spawn(FakeSdk::default());
+    assert_eq!(out.min_send_interval(), Some(MIN_SEND_INTERVAL));
+    out.shutdown();
+}
+
 /// Live check against a running iCUE: writes a colour and reads it back from the hardware.
 /// Run with `GLOWDRIFT_ICUE_DLL_DIR=<dir> cargo test -p glowdrift-lights -- --ignored live`.
 #[test]

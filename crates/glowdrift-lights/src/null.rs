@@ -1,5 +1,7 @@
 //! A light that records colours and talks to no hardware.
 
+use std::time::Duration;
+
 use glowdrift_core::Rgb;
 
 use crate::{Light, LightError, LightState, LightStatus};
@@ -67,6 +69,10 @@ impl Light for NullLight {
         self.enabled = enabled;
     }
 
+    fn min_send_interval(&self) -> Option<Duration> {
+        None
+    }
+
     fn set_color(&mut self, color: Rgb) -> Result<(), LightError> {
         if !self.enabled {
             return Err(LightError::Unavailable("light is disabled".to_owned()));
@@ -93,6 +99,11 @@ mod tests {
         out.set_color(Rgb::new(4, 5, 6)).unwrap();
         assert_eq!(out.last_color(), Some(Rgb::new(4, 5, 6)));
         assert_eq!(out.color_count(), 2);
+    }
+
+    #[test]
+    fn declares_no_rate_limit() {
+        assert_eq!(NullLight::new().min_send_interval(), None);
     }
 
     #[test]

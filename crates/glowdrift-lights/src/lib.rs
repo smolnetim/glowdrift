@@ -7,6 +7,8 @@ pub mod null;
 
 pub use null::NullLight;
 
+use std::time::Duration;
+
 use glowdrift_core::Rgb;
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +65,10 @@ pub trait Light: Send {
     fn id(&self) -> &str;
     fn status(&self) -> LightStatus;
     fn set_enabled(&mut self, enabled: bool);
+    /// The shortest useful gap between colours sent to this light, which sets its maximum
+    /// smoothing rate: colours arriving faster are dropped or coalesced. `None` means the
+    /// light has no limit and can use any rate.
+    fn min_send_interval(&self) -> Option<Duration>;
     /// Sends a colour. Must be cheap and non-blocking; implementations own their
     /// reconnect logic and drop colours while disconnected.
     fn set_color(&mut self, color: Rgb) -> Result<(), LightError>;
