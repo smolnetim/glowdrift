@@ -94,6 +94,8 @@ export interface ColorEvent {
 
 export interface UpdaterReadyEvent {
   version: string;
+  /** Installing shows a Windows permission prompt (a per-machine install). */
+  needsElevation: boolean;
 }
 
 type Mock = typeof import("./ipc.mock");
@@ -125,6 +127,9 @@ export const listOutputs = () => call<OutputStatus[]>("list_outputs", undefined,
 /** Installs the update the shell has already downloaded; resolves false when none is staged. */
 export const installPendingUpdate = () =>
   call<boolean>("install_pending_update", undefined, () => Promise.resolve(false));
+/** True when installing an update shows a Windows permission prompt (a per-machine install). */
+export const updateNeedsElevation = () =>
+  call<boolean>("update_needs_elevation", undefined, (m) => m.updateNeedsElevation());
 /**
  * Downloads and verifies Corsair's iCUE SDK library, then makes the iCUE output retry loading it.
  * Rejects with a user-presentable message.
@@ -145,6 +150,6 @@ export const onEngineStatus = (handler: (s: EngineStatus) => void): Promise<Unli
   subscribe<EngineStatus>("engine://status", handler);
 export const onOutputsStatus = (handler: (s: OutputStatus[]) => void): Promise<UnlistenFn> =>
   subscribe<OutputStatus[]>("outputs://status", handler);
-/** An update has been downloaded and only needs a restart. */
+/** An update has been downloaded and only needs to be installed. */
 export const onUpdaterReady = (handler: (e: UpdaterReadyEvent) => void): Promise<UnlistenFn> =>
   subscribe<UpdaterReadyEvent>("updater://ready", handler);

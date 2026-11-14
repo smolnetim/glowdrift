@@ -17,6 +17,7 @@ pub use crate::engine::EngineStatus;
 use crate::engine::{EngineHandle, describe_capture_error};
 use crate::icue_sdk;
 use crate::outputs_manager::{self, OutputsManager};
+use crate::per_machine;
 use crate::updater::{self, PendingUpdate};
 
 /// How long `install_icue_sdk` waits for the iCUE output to pick up a newly installed library.
@@ -212,12 +213,20 @@ pub fn get_app_info(app: AppHandle) -> AppInfo {
 }
 
 /// Installs an update that was downloaded in the background. Returns false when none is
-/// pending. On success the process exits and the installer restarts the app.
+/// pending. On success the process exits and the installer restarts the app. For a per-machine
+/// install the installer is started elevated first; a declined permission prompt is an error
+/// and leaves the app running with the update still staged.
 #[tauri::command]
 pub async fn install_pending_update(app: AppHandle) -> Result<bool, String> {
     tauri::async_runtime::spawn_blocking(move || updater::install_pending(&app))
         .await
         .map_err(|e| format!("Update task failed: {e}"))?
+}
+
+/// True when installing an update shows a Windows permission prompt (a per-machine install).
+#[tauri::command]
+pub fn update_needs_elevation() -> bool {
+    per_machine::running_app_is_per_machine()
 }
 
 /// Downloads the pinned, verified iCUE SDK library into the app data directory and makes the

@@ -33,6 +33,13 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring"] }
 sha2 = "0.10.9"
 zip = { version = "9.5.1", default-features = false, features = ["deflate-flate2"] }
 
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-single-instance = { workspace = true }
 tauri-plugin-autostart = { workspace = true }
