@@ -29,6 +29,10 @@ struct FakeState {
     releases: Vec<String>,
     priorities: Vec<u32>,
     writes: Vec<(String, usize, Rgb)>,
+    buffered: Vec<(String, usize, Rgb)>,
+    batches: Vec<Vec<(String, usize, Rgb)>>,
+    flushes: u32,
+    flush_error: Option<ErrorCode>,
 }
 
 #[derive(Clone, Default)]
@@ -131,6 +135,38 @@ impl Sdk for FakeSdk {
             });
         }
         s.writes.push((device.to_owned(), led_ids.len(), color));
+        Ok(())
+    }
+    fn buffer_leds_color(
+        &mut self,
+        device: &str,
+        led_ids: &[u32],
+        color: Rgb,
+    ) -> Result<(), SdkError> {
+        let mut s = self.state();
+        if let Some((id, code)) = s.set_error.clone()
+            && id == device
+        {
+            return Err(SdkError::Call {
+                function: "CorsairSetLedColorsBuffer",
+                code,
+            });
+        }
+        s.buffered.push((device.to_owned(), led_ids.len(), color));
+        Ok(())
+    }
+    fn flush_leds(&mut self) -> Result<(), SdkError> {
+        let mut s = self.state();
+        s.flushes += 1;
+        if let Some(code) = s.flush_error {
+            return Err(SdkError::Call {
+                function: "CorsairSetLedColorsFlushBufferAsync",
+                code,
+            });
+        }
+        let buffered = std::mem::take(&mut s.buffered);
+        s.writes.extend(buffered.iter().cloned());
+        s.batches.push(buffered);
         Ok(())
     }
     fn led_colors(&mut self, _device: &str, led_ids: &[u32]) -> Result<Vec<Rgb>, SdkError> {
@@ -382,6 +418,55 @@ fn identical_colours_are_written_once() {
     let writes = h.fake.state().writes.clone();
     assert_eq!(writes[0], ("kb".to_owned(), 3, Rgb::new(10, 20, 30)));
     assert_eq!(writes[1], ("mouse".to_owned(), 2, Rgb::new(10, 20, 30)));
+}
+
+#[test]
+fn every_device_is_written_in_one_flush() {
+    let mut h = Harness::connected(FakeSdk::with_devices(&[("kb", 3), ("mouse", 2)]));
+    h.ctl.set_color(Rgb::new(10, 20, 30));
+    h.ctl.tick(h.at(100));
+    h.ctl.set_color(Rgb::new(11, 20, 30));
+    h.ctl.tick(h.at(200));
+
+    let s = h.fake.state();
+    assert_eq!(s.flushes, 2, "one flush per colour, not per device");
+    assert_eq!(
+        s.batches[1],
+        vec![
+            ("kb".to_owned(), 3, Rgb::new(11, 20, 30)),
+            ("mouse".to_owned(), 2, Rgb::new(11, 20, 30)),
+        ]
+    );
+}
+
+#[test]
+fn failed_flush_is_retried_per_device_until_devices_are_read_again() {
+    let mut h = Harness::connected(FakeSdk::with_devices(&[("kb", 3), ("mouse", 2)]));
+    h.fake.state().flush_error = Some(ErrorCode::InvalidOperation);
+    h.ctl.set_color(Rgb::new(1, 1, 1));
+    h.ctl.tick(h.at(100));
+    {
+        let s = h.fake.state();
+        assert_eq!(s.batches.len(), 0);
+        assert_eq!(s.writes.len(), 2, "the colour still reached both devices");
+    }
+    assert_eq!(h.ctl.status().state, LightState::Connected);
+
+    // Per-device writes continue without trying to batch again.
+    h.fake.state().flush_error = None;
+    h.ctl.set_color(Rgb::new(2, 2, 2));
+    h.ctl.tick(h.at(200));
+    assert_eq!(h.fake.state().flushes, 1);
+    assert_eq!(h.fake.state().writes.len(), 4);
+
+    // A device event re-reads the devices, which restores batching.
+    h.ctl.on_event(SdkEvent::DevicesChanged, h.at(300));
+    h.ctl.tick(h.at(300) + ENUMERATE_DEBOUNCE);
+    h.ctl.set_color(Rgb::new(3, 3, 3));
+    h.ctl.tick(h.at(400) + ENUMERATE_DEBOUNCE);
+    let s = h.fake.state();
+    assert_eq!(s.batches.len(), 2, "the re-sent and the new colour");
+    assert_eq!(s.batches[1][0].2, Rgb::new(3, 3, 3));
 }
 
 #[test]
@@ -844,12 +929,32 @@ fn live_colour_round_trip() {
         );
         checked += matching;
     }
+    assert!(
+        checked > 0,
+        "no LED reflected the colour written through the SDK"
+    );
+
+    let batched = Rgb::new(10, 180, 60);
+    for info in &devices {
+        let ids = sdk.led_ids(&info.id).unwrap();
+        sdk.buffer_leds_color(&info.id, &ids, batched).unwrap();
+    }
+    sdk.flush_leds().unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    let mut batched_checked = 0;
+    for info in &devices {
+        let ids = sdk.led_ids(&info.id).unwrap();
+        let read = sdk.led_colors(&info.id, &ids).unwrap();
+        batched_checked += read.iter().filter(|c| **c == batched).count();
+    }
+    // A failed transfer is reported by the next flush.
+    sdk.flush_leds().unwrap();
     for info in &devices {
         sdk.release_control(&info.id);
     }
     sdk.disconnect();
-    assert!(
-        checked > 0,
-        "no LED reflected the colour written through the SDK"
+    assert_eq!(
+        batched_checked, checked,
+        "the batched write must reach as many LEDs as the per-device writes"
     );
 }
