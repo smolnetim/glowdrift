@@ -14,6 +14,7 @@ use glowdrift_core::{ColorAdjust, Config, LinearRgb, Rgb, Smoother, reduce};
 use serde::{Deserialize, Serialize};
 
 use crate::lights_manager::LightsManager;
+use crate::timing::{Stage, Timing};
 
 /// Rate at which the smoother is advanced while the colour is still moving.
 const TICK_INTERVAL: Duration = Duration::from_micros(16_667);
@@ -342,6 +343,7 @@ struct Engine<E: EngineEvents> {
     fps: FpsMeter,
     throttle: Throttle,
     reported: Option<ReportKey>,
+    timing: Timing,
 }
 
 impl<E: EngineEvents> Engine<E> {
@@ -379,10 +381,12 @@ impl<E: EngineEvents> Engine<E> {
             fps: FpsMeter::new(now),
             throttle: Throttle::new(PREVIEW_INTERVAL),
             reported: None,
+            timing: Timing::new(),
         }
     }
 
     fn run(mut self) {
+        self.timing.begin();
         loop {
             let command = if self.running {
                 match self.rx.try_recv() {
@@ -403,9 +407,13 @@ impl<E: EngineEvents> Engine<E> {
                 continue;
             }
             let now = Instant::now();
+            let pass = Timing::start();
             self.step(now);
+            self.timing.record(Stage::Pass, pass);
             self.sleep_until_next(now);
+            self.timing.poll();
         }
+        self.timing.finish();
         self.lights.shutdown();
     }
 
@@ -431,7 +439,10 @@ impl<E: EngineEvents> Engine<E> {
     }
 
     fn step(&mut self, now: Instant) {
-        if self.lights.take_resend() {
+        let mark = Timing::start();
+        let resend = self.lights.take_resend();
+        self.timing.record(Stage::Resend, mark);
+        if resend {
             self.last_sent = None;
             if self.has_target {
                 self.send_current();
@@ -448,16 +459,22 @@ impl<E: EngineEvents> Engine<E> {
         if !self.settled && now >= self.next_tick {
             self.tick(now);
         }
-        if self.preview && self.throttle.poll(now) {
-            self.events.color(self.target_rgb, self.smoothed_rgb);
+        if self.preview {
+            let mark = Timing::start();
+            if self.throttle.poll(now) {
+                self.events.color(self.target_rgb, self.smoothed_rgb);
+                self.timing.record(Stage::Preview, mark);
+            }
         }
+        let mark = Timing::start();
         if let Some(fps) = self.fps.poll(now) {
             lock(&self.shared).measured_fps = fps;
             self.report();
+            self.timing.record(Stage::Meter, mark);
         }
     }
 
-    fn sleep_until_next(&self, now: Instant) {
+    fn sleep_until_next(&mut self, now: Instant) {
         let mut wake = self.next_capture.min(self.fps.deadline());
         if !self.settled {
             wake = wake.min(self.next_tick);
@@ -469,7 +486,9 @@ impl<E: EngineEvents> Engine<E> {
         }
         let wait = wake.saturating_duration_since(now).min(MAX_SLEEP);
         if !wait.is_zero() {
+            let mark = Timing::start();
             thread::sleep(wait);
+            self.timing.record_sleep(wait, mark);
         }
     }
 
@@ -492,16 +511,33 @@ impl<E: EngineEvents> Engine<E> {
         let Some(capturer) = self.capturer.as_mut() else {
             return;
         };
-        match capturer.grab(self.config.region, GRAB_TIMEOUT) {
+        let mark = Timing::start();
+        let grabbed = capturer.grab(self.config.region, GRAB_TIMEOUT);
+        self.timing.record(Stage::Grab, mark);
+        match grabbed {
             Ok(Some(frame)) => {
+                self.timing.frame();
                 self.fps.record_frame();
                 self.backoff.reset();
-                self.set_error(None);
+                let mark = Timing::start();
                 self.last_reduced = reduce(&frame.view(), self.config.mode);
+                self.timing.record(Stage::Reduce, mark);
+                self.note_grab_timings();
+                self.set_error(None);
                 self.recompute_target(now);
             }
-            Ok(None) => {}
+            Ok(None) => self.note_grab_timings(),
             Err(error) => self.on_capture_error(&error, now),
+        }
+    }
+
+    /// Feeds the capturer's internal split of the last grab to the timer.
+    fn note_grab_timings(&mut self) {
+        #[cfg(windows)]
+        if Timing::ENABLED
+            && let Some(capturer) = &self.capturer
+        {
+            self.timing.grab_detail(capturer.last_timings());
         }
     }
 
@@ -517,9 +553,12 @@ impl<E: EngineEvents> Engine<E> {
     }
 
     fn set_error(&mut self, error: Option<String>) {
+        let mark = Timing::start();
         {
             let mut shared = lock(&self.shared);
             if shared.last_error == error {
+                drop(shared);
+                self.timing.record(Stage::Error, mark);
                 return;
             }
             if let Some(message) = &error {
@@ -528,13 +567,16 @@ impl<E: EngineEvents> Engine<E> {
             shared.last_error = error;
         }
         self.report();
+        self.timing.record(Stage::Error, mark);
     }
 
     fn recompute_target(&mut self, now: Instant) {
+        let mark = Timing::start();
         let adjust = ColorAdjust::new(self.config.brightness, self.config.saturation);
         let adjusted = adjust.apply(self.last_reduced);
         self.target = adjusted;
         let rgb = adjusted.to_srgb();
+        self.timing.record(Stage::Target, mark);
         if self.has_target && rgb == self.target_rgb {
             return;
         }
@@ -552,9 +594,11 @@ impl<E: EngineEvents> Engine<E> {
         let dt = now.saturating_duration_since(self.last_tick).min(MAX_DT);
         self.last_tick = now;
         self.next_tick = advance_deadline(self.next_tick, now, TICK_INTERVAL);
+        let mark = Timing::start();
         let time_constant = Duration::from_millis(u64::from(self.config.smoothing_ms));
         let smoothed = self.smoother.update(self.target, dt, time_constant);
         let rgb = smoothed.to_srgb();
+        self.timing.record(Stage::Tick, mark);
         if rgb != self.smoothed_rgb {
             self.smoothed_rgb = rgb;
             self.publish_colors();
@@ -566,11 +610,14 @@ impl<E: EngineEvents> Engine<E> {
     }
 
     fn send_current(&mut self) {
+        let mark = Timing::start();
         self.lights.set_color(self.smoothed_rgb);
         self.last_sent = Some(self.smoothed_rgb);
+        self.timing.record(Stage::Send, mark);
     }
 
     fn publish_colors(&mut self) {
+        let mark = Timing::start();
         {
             let mut shared = lock(&self.shared);
             shared.target = self.target_rgb.to_hex();
@@ -579,6 +626,7 @@ impl<E: EngineEvents> Engine<E> {
         if self.preview {
             self.throttle.mark();
         }
+        self.timing.record(Stage::Publish, mark);
     }
 
     fn apply_config(&mut self, new: Config, now: Instant) {

@@ -6,6 +6,7 @@ pub mod engine;
 pub mod icue_sdk;
 pub mod lights_manager;
 pub mod per_machine;
+mod timing;
 pub mod tray;
 pub mod updater;
 pub mod window;
