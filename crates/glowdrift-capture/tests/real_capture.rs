@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use glowdrift_capture::{Capturer, capture_thumbnail, list_monitors};
+use glowdrift_capture::{Capturer, Frame, capture_thumbnail, list_monitors};
 use glowdrift_core::NormRect;
 
 fn mean_bgr(data: &[u8]) -> [f64; 3] {
@@ -40,10 +40,11 @@ fn lists_at_least_one_monitor_with_stable_ids() {
 #[ignore = "needs an interactive desktop"]
 fn captures_a_real_frame_and_scales_consistently() {
     let mut small = Capturer::new(None, 64).expect("capturer");
-    let frame = small
+    let grabbed = small
         .grab(NormRect::full(), Duration::from_secs(2))
         .expect("grab")
         .expect("first grab delivers the current desktop image");
+    let frame = Frame::from_view(&grabbed);
     assert!(frame.view().is_valid());
     assert!(frame.width.max(frame.height) >= 64);
     assert!(frame.width.max(frame.height) < 128 + 1);
@@ -59,7 +60,7 @@ fn captures_a_real_frame_and_scales_consistently() {
         .expect("grab")
         .expect("frame");
     assert!(big_frame.width.max(big_frame.height) >= 1024);
-    let (a, b) = (mean_bgr(&frame.data), mean_bgr(&big_frame.data));
+    let (a, b) = (mean_bgr(&frame.data), mean_bgr(big_frame.data));
     for c in 0..3 {
         assert!(
             (a[c] - b[c]).abs() < 12.0,
@@ -111,7 +112,7 @@ fn snapshot_reuses_the_active_session() {
     let mut capturer = Capturer::new(None, 16).expect("capturer");
     let small = NormRect::new(0.0, 0.0, 0.5, 0.5);
     let before = capturer.grab(small, Duration::from_secs(2)).expect("grab");
-    let before = before.expect("frame");
+    let before_width = before.expect("frame").width;
     let snap = capturer
         .snapshot(500, Duration::from_secs(1))
         .expect("snapshot");
@@ -125,7 +126,7 @@ fn snapshot_reuses_the_active_session() {
     let started = std::time::Instant::now();
     let after = capturer.grab(small, Duration::from_secs(2)).expect("grab");
     assert!(after.is_some() && started.elapsed() < Duration::from_millis(500));
-    assert_eq!(after.expect("frame").width, before.width);
+    assert_eq!(after.expect("frame").width, before_width);
 }
 
 #[test]

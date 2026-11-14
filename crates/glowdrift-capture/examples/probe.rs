@@ -175,10 +175,10 @@ fn run_capture(capturer: &mut Capturer, target: Option<&str>, args: &Args) -> Ru
         let used = thread_cycles() - cycles;
         match result {
             Ok(Some(frame)) => {
+                last = Some(Frame::from_view(&frame));
                 grab_times.push(begin.elapsed());
                 cpu_times.push(Duration::from_secs_f64(used as f64 / hz));
                 timings.push(capturer.last_timings());
-                last = Some(frame);
             }
             Ok(None) => timeouts += 1,
             Err(CaptureError::AccessLost) => {

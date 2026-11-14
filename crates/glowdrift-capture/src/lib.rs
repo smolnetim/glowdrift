@@ -92,6 +92,16 @@ impl Frame {
     pub fn view(&self) -> FrameView<'_> {
         FrameView::new(&self.data, self.width, self.height, self.stride)
     }
+
+    /// Copies a borrowed frame into an owned one.
+    pub fn from_view(view: &FrameView<'_>) -> Frame {
+        Frame {
+            data: view.data.to_vec(),
+            width: view.width,
+            height: view.height,
+            stride: view.stride,
+        }
+    }
 }
 
 /// Lists all attached monitors, primary first, then left to right.
@@ -215,11 +225,15 @@ impl Capturer {
     /// updates do not count as a change. When `region` differs from the previously delivered
     /// one, a frame is returned immediately from the last desktop image seen.
     /// [`CaptureError::AccessLost`] means the caller must recreate the capturer.
+    ///
+    /// The frame borrows a buffer owned by the capturer and reused by every grab, so steady-state
+    /// grabs do not allocate; it is valid until the next call. Copy it with [`Frame::from_view`]
+    /// to keep it.
     pub fn grab(
         &mut self,
         region: NormRect,
         timeout: Duration,
-    ) -> Result<Option<Frame>, CaptureError> {
+    ) -> Result<Option<FrameView<'_>>, CaptureError> {
         #[cfg(windows)]
         {
             self.inner.grab(region, timeout)

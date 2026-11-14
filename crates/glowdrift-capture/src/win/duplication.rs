@@ -15,7 +15,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use glowdrift_core::{NormRect, PixelRect};
+use glowdrift_core::{FrameView, NormRect, PixelRect};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_10_1,
@@ -181,6 +181,8 @@ pub(crate) struct Duplicator {
     /// Presentation time (QPC ticks) of the image in the cache.
     present_qpc: i64,
     timings: GrabTimings,
+    /// Pixels of the most recent read-back, reused so steady-state grabs do not allocate.
+    pixels: Vec<u8>,
 }
 
 // SAFETY: The D3D11 device is free-threaded, and every other COM object (immediate context,
@@ -256,14 +258,32 @@ impl Duplicator {
             dirty: false,
             present_qpc: 0,
             timings: GrabTimings::default(),
+            pixels: Vec::new(),
         })
     }
 
+    /// Waits up to `timeout` for a frame of `region`. The returned view borrows the reused
+    /// read-back buffer and stays valid until the next call.
     pub(crate) fn grab(
         &mut self,
         region: NormRect,
         timeout: Duration,
-    ) -> Result<Option<Frame>, CaptureError> {
+    ) -> Result<Option<FrameView<'_>>, CaptureError> {
+        Ok(self
+            .grab_size(region, timeout)?
+            .map(|(width, height)| self.view(width, height)))
+    }
+
+    fn view(&self, width: u32, height: u32) -> FrameView<'_> {
+        FrameView::new(&self.pixels, width, height, width as usize * 4)
+    }
+
+    /// Like [`Self::grab`], leaving the frame in `self.pixels` and returning its size.
+    fn grab_size(
+        &mut self,
+        region: NormRect,
+        timeout: Duration,
+    ) -> Result<Option<(u32, u32)>, CaptureError> {
         let key = Key {
             region: region.clamped(),
             max_dimension: self.max_dimension,
@@ -351,12 +371,17 @@ impl Duplicator {
             return Err(CaptureError::Os("no desktop image cached".into()));
         };
         let dimension = thumbnail_dimension(cache.width, cache.height, max_width);
-        let frame = self.render_sync(Key {
+        let (width, height) = self.render_sync(Key {
             region: NormRect::full(),
             max_dimension: dimension,
         })?;
         self.last_key = None;
-        Ok(frame)
+        Ok(Frame {
+            data: self.pixels.clone(),
+            width,
+            height,
+            stride: width as usize * 4,
+        })
     }
 
     /// Time since the desktop image presented at `present_qpc` was presented.
@@ -649,13 +674,17 @@ impl Duplicator {
     }
 
     /// Renders `key` from the cached desktop image and waits for the result.
-    fn render_sync(&mut self, key: Key) -> Result<Frame, CaptureError> {
+    fn render_sync(&mut self, key: Key) -> Result<(u32, u32), CaptureError> {
         let (staging, width, height) = self.record(key, None)?;
-        let frame = self.read_back(&staging, width, height, false)?;
+        let read = self.read_back(&staging, width, height, false, true)?;
         self.last_key = Some(key);
         self.dirty = false;
         self.timings.latency = Self::since_present(self.present_qpc);
-        frame.ok_or_else(|| CaptureError::Os("blocking Map returned no data".into()))
+        if read {
+            Ok((width, height))
+        } else {
+            Err(CaptureError::Os("blocking Map returned no data".into()))
+        }
     }
 
     /// Records a render of the cached desktop image into a free ring slot without waiting for
@@ -686,40 +715,43 @@ impl Duplicator {
         Ok(())
     }
 
-    /// Reads back every in-flight render the GPU has finished and returns the newest one that
-    /// was made for `key`. Never waits.
-    fn collect_ready(&mut self, key: Key) -> Result<Option<Frame>, CaptureError> {
+    /// Reads back every in-flight render the GPU has finished and leaves the newest one that
+    /// was made for `key` in `self.pixels`, returning its size. Never waits.
+    fn collect_ready(&mut self, key: Key) -> Result<Option<(u32, u32)>, CaptureError> {
         let mut newest = None;
         while let Some(pending) = self.pending.front() {
             let (slot, width, height) = (pending.slot, pending.width, pending.height);
+            let wanted = pending.key == key;
             let Some(texture) = self.ring[slot].staging.as_ref().map(|s| s.texture.clone()) else {
                 return Err(CaptureError::Os("staging texture missing".into()));
             };
-            let Some(frame) = self.read_back(&texture, width, height, true)? else {
+            if !self.read_back(&texture, width, height, true, wanted)? {
                 break;
-            };
+            }
             if let Some(done) = self.pending.pop_front() {
                 self.ring[done.slot].busy = false;
-                if done.key == key {
-                    newest = Some((frame, done.present_qpc));
+                if wanted {
+                    newest = Some((width, height, done.present_qpc));
                 }
             }
         }
-        Ok(newest.map(|(frame, present_qpc)| {
+        Ok(newest.map(|(width, height, present_qpc)| {
             self.timings.latency = Self::since_present(present_qpc);
-            frame
+            (width, height)
         }))
     }
 
-    /// Copies the staging texture to a [`Frame`]. With `poll`, returns `Ok(None)` when the GPU
-    /// has not finished writing it; otherwise waits.
+    /// Maps the staging texture and, with `copy`, stores its pixels in `self.pixels` with the
+    /// alpha channel forced opaque. With `poll`, returns `Ok(false)` when the GPU has not
+    /// finished writing the texture; otherwise waits.
     fn read_back(
         &mut self,
         staging: &ID3D11Texture2D,
         width: u32,
         height: u32,
         poll: bool,
-    ) -> Result<Option<Frame>, CaptureError> {
+        copy: bool,
+    ) -> Result<bool, CaptureError> {
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         let flags = if poll {
             D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32
@@ -735,35 +767,32 @@ impl Duplicator {
         self.timings.map += started.elapsed();
         if let Err(e) = mapped_ok {
             return if poll && e.code() == DXGI_ERROR_WAS_STILL_DRAWING {
-                Ok(None)
+                Ok(false)
             } else {
                 Err(map_err("Map", &e))
             };
         }
 
-        let row_bytes = width as usize * 4;
-        let mut data = vec![0u8; row_bytes * height as usize];
-        let base = mapped.pData.cast::<u8>().cast_const();
-        for (y, row) in data.chunks_exact_mut(row_bytes).enumerate() {
-            // SAFETY: while mapped, `pData` addresses `height` rows of `RowPitch` bytes, each at
-            // least `width * 4` bytes long; `y < height`.
-            let src = unsafe {
-                std::slice::from_raw_parts(base.add(y * mapped.RowPitch as usize), row_bytes)
-            };
-            row.copy_from_slice(src);
+        if copy {
+            let row_bytes = width as usize * 4;
+            self.pixels.resize(row_bytes * height as usize, 0);
+            let base = mapped.pData.cast::<u8>().cast_const();
+            for (y, row) in self.pixels.chunks_exact_mut(row_bytes).enumerate() {
+                // SAFETY: while mapped, `pData` addresses `height` rows of `RowPitch` bytes, each
+                // at least `width * 4` bytes long; `y < height`.
+                let src = unsafe {
+                    std::slice::from_raw_parts(base.add(y * mapped.RowPitch as usize), row_bytes)
+                };
+                let (src, _) = src.as_chunks::<4>();
+                let (dst, _) = row.as_chunks_mut::<4>();
+                for (out, pixel) in dst.iter_mut().zip(src) {
+                    *out = (u32::from_le_bytes(*pixel) | 0xFF00_0000).to_le_bytes();
+                }
+            }
         }
         // SAFETY: the resource was mapped above.
         unsafe { self.context.Unmap(staging, 0) };
-
-        for pixel in data.as_chunks_mut::<4>().0 {
-            pixel[3] = 255;
-        }
-        Ok(Some(Frame {
-            data,
-            width,
-            height,
-            stride: row_bytes,
-        }))
+        Ok(true)
     }
 }
 
@@ -790,11 +819,10 @@ mod tests {
     use super::*;
     use crate::win::find_monitor;
 
-    fn max_channel_difference(a: &Frame, b: &Frame) -> u8 {
-        assert_eq!((a.width, a.height), (b.width, b.height));
-        a.data
-            .iter()
-            .zip(&b.data)
+    fn max_channel_difference(a: &[u8], b: &[u8]) -> u8 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
             .map(|(x, y)| x.abs_diff(*y))
             .max()
             .unwrap_or(0)
@@ -813,7 +841,9 @@ mod tests {
         let sync = duplicator
             .grab(region, Duration::from_secs(2))
             .expect("grab")
-            .expect("first grab renders synchronously");
+            .expect("first grab renders synchronously")
+            .data
+            .to_vec();
         duplicator.submit(key).expect("submit");
         assert_eq!(duplicator.pending.len(), 1);
         duplicator.wait_for_gpu(Duration::from_secs(1));
@@ -825,10 +855,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
             asynchronous = duplicator.collect_ready(key).expect("collect");
         }
-        let asynchronous = asynchronous.expect("the GPU finished the render");
+        asynchronous.expect("the GPU finished the render");
         assert!(duplicator.pending.is_empty());
         assert!(duplicator.ring.iter().all(|slot| !slot.busy));
-        assert!(max_channel_difference(&sync, &asynchronous) <= 1);
+        assert!(max_channel_difference(&sync, &duplicator.pixels) <= 1);
     }
 
     #[test]

@@ -520,7 +520,7 @@ impl<E: EngineEvents> Engine<E> {
                 self.fps.record_frame();
                 self.backoff.reset();
                 let mark = Timing::start();
-                self.last_reduced = reduce(&frame.view(), self.config.mode);
+                self.last_reduced = reduce(&frame, self.config.mode);
                 self.timing.record(Stage::Reduce, mark);
                 self.note_grab_timings();
                 self.set_error(None);
