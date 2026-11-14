@@ -131,7 +131,7 @@ FunctionEnd
 
 ; Points an existing autostart entry at the executable in the install folder, so it keeps working
 ; after the install folder changes. Nothing is written when there is no entry, or when its value has no
-; executable in it.
+; executable in it. The app writes the entry per user, so it stays in HKCU in every install mode.
 !macro NSIS_HOOK_POSTINSTALL
   ReadRegStr $0 HKCU "${GLOWDRIFT_RUN_KEY}" "${PRODUCTNAME}"
   ${If} $0 != ""
@@ -152,6 +152,8 @@ FunctionEnd
 
 ; Forgets the remembered install folder on every uninstall except the one an update runs, so a later
 ; first install starts from the default folder again. The vendor key goes only when nothing else is in it.
+; SHCTX is the hive of the install mode of the installation being removed (HKLM for all users, HKCU for the
+; current user), which the uninstaller sets up before its sections run.
 ;
 ; Removes the vendor folder above the install directory once nothing else is in it. RMDir without /r
 ; never removes a folder that still has content, and the folder name must equal the manufacturer, so

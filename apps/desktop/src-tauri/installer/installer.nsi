@@ -1,8 +1,15 @@
 ; Derived from tauri-bundler 2.10.4 (src/bundle/windows/nsis/installer.nsi, the template used by
 ; tauri-cli 2.12.4). Differences from upstream, each marked "Glowdrift:" below:
-;   1. The default per-user install directory is %LOCALAPPDATA%\Programs\<vendor>\<product>.
+;   1. The default per-user install directory is %LOCALAPPDATA%\Programs\<vendor>\<product>. With
+;      installMode "both" the default is <vendor>\<product> below Program Files (all users) or below the
+;      per-user Programs folder (current user).
 ;   2. The stock directory page is replaced by a custom install folder page (folder-page.nsh) that is shown
 ;      only on a first interactive install; later installs and updates reuse the remembered folder.
+;   3. With installMode "both" the setup file starts without elevation and asks for it only for all users
+;      (install-mode.nsh). MULTIUSER_INIT and MULTIUSER_UNINIT are replaced by install-mode.nsh, the mode
+;      page is shown only when nothing else decided the mode, and an existing installation keeps its mode.
+;   4. /D= survives the mode functions, which would otherwise reset $INSTDIR.
+;   5. The delete-app-data step of the uninstaller restores the shell folder context it switched.
 ; When updating tauri-cli, diff this file against the new upstream installer.nsi and re-apply the changes.
 
 Unicode true
@@ -94,10 +101,6 @@ OutFile "${OUTFILE}"
 !define PLACEHOLDER_INSTALL_DIR "placeholder\${PRODUCTNAME}"
 InstallDir "${PLACEHOLDER_INSTALL_DIR}"
 
-; Glowdrift: install folder page (first interactive install only). Needs the defines and variables above.
-; The path is relative to the hooks file, which Tauri passes as an absolute path.
-!include "{{installer_hooks}}\..\folder-page.nsh"
-
 VIProductVersion "${VERSIONWITHBUILD}"
 VIAddVersionKey "ProductName" "${PRODUCTNAME}"
 VIAddVersionKey "FileDescription" "${PRODUCTNAME}"
@@ -124,19 +127,32 @@ VIAddVersionKey "ProductVersion" "${VERSION}"
 
 !if "${INSTALLMODE}" == "both"
   !define MULTIUSER_MUI
-  !define MULTIUSER_INSTALLMODE_INSTDIR "${PRODUCTNAME}"
-  !define MULTIUSER_INSTALLMODE_COMMANDLINE
+  ; Glowdrift: upstream uses "${PRODUCTNAME}". With the vendor folder both modes end in <vendor>\<product>.
+  !define MULTIUSER_INSTALLMODE_INSTDIR "${MANUFACTURER}\${PRODUCTNAME}"
   !if "${ARCH}" == "x64"
     !define MULTIUSER_USE_PROGRAMFILES64
   !else if "${ARCH}" == "arm64"
     !define MULTIUSER_USE_PROGRAMFILES64
   !endif
-  !define MULTIUSER_INSTALLMODE_DEFAULT_REGISTRY_KEY "${UNINSTKEY}"
-  !define MULTIUSER_INSTALLMODE_DEFAULT_REGISTRY_VALUENAME "CurrentUser"
   !define MULTIUSER_INSTALLMODEPAGE_SHOWUSERNAME
   !define MULTIUSER_INSTALLMODE_FUNCTION RestorePreviousInstallLocation
-  !define MULTIUSER_EXECUTIONLEVEL Highest
+  ; Glowdrift: upstream also defines MULTIUSER_INSTALLMODE_COMMANDLINE and the DEFAULT_REGISTRY values, and
+  ; uses MULTIUSER_EXECUTIONLEVEL Highest, which makes every administrator see a UAC prompt at launch. The
+  ; mode and its switches are handled in install-mode.nsh instead, and the setup file starts unelevated.
+  ; MultiUser.nsh requires MULTIUSER_EXECUTIONLEVEL_ALLUSERS for its mode page.
+  !define MULTIUSER_EXECUTIONLEVEL Standard
+  !define MULTIUSER_EXECUTIONLEVEL_ALLUSERS
+  !define MULTIUSER_PAGE_CUSTOMFUNCTION_PRE ImModePagePre
+  !define MULTIUSER_PAGE_CUSTOMFUNCTION_LEAVE ImModePageLeave
   !include MultiUser.nsh
+!endif
+
+; Glowdrift: install folder page (first interactive install only) and, for installMode "both", the install
+; mode handling. They need the defines and variables above. The paths are relative to the hooks file, which
+; Tauri passes as an absolute path.
+!include "{{installer_hooks}}\..\folder-page.nsh"
+!if "${INSTALLMODE}" == "both"
+  !include "{{installer_hooks}}\..\install-mode.nsh"
 !endif
 
 ; Installer icon
@@ -177,13 +193,21 @@ VIAddVersionKey "ProductVersion" "${VERSION}"
 !define MUI_LANGDLL_REGISTRY_VALUENAME "Installer Language"
 
 ; Installer pages, must be ordered as they appear
+; Glowdrift: the process that was started elevated by the install mode handling does not show the pages
+; again that the process which started it already showed.
+!if "${INSTALLMODE}" == "both"
+  !define FIRST_PAGES_SKIP SkipIfPassiveOrElevatedChild
+!else
+  !define FIRST_PAGES_SKIP SkipIfPassive
+!endif
+
 ; 1. Welcome Page
-!define MUI_PAGE_CUSTOMFUNCTION_PRE SkipIfPassive
+!define MUI_PAGE_CUSTOMFUNCTION_PRE ${FIRST_PAGES_SKIP}
 !insertmacro MUI_PAGE_WELCOME
 
 ; 2. License Page (if defined)
 !if "${LICENSE}" != ""
-  !define MUI_PAGE_CUSTOMFUNCTION_PRE SkipIfPassive
+  !define MUI_PAGE_CUSTOMFUNCTION_PRE ${FIRST_PAGES_SKIP}
   !insertmacro MUI_PAGE_LICENSE "${LICENSE}"
 !endif
 
@@ -514,6 +538,9 @@ FunctionEnd
 !insertmacro MUI_LANGUAGE "{{this}}"
 LangString choowHowToInstall 0 ""
 !insertmacro GlowdriftFolderPageLangStrings
+!if "${INSTALLMODE}" == "both"
+  !insertmacro GlowdriftInstallModeLangStrings
+!endif
 {{/each}}
 !insertmacro MUI_RESERVEFILE_LANGDLL
 {{#each language_files}}
@@ -573,7 +600,9 @@ Function .onInit
 
 
   !if "${INSTALLMODE}" == "both"
-    !insertmacro MULTIUSER_INIT
+    ; Glowdrift: upstream calls MULTIUSER_INIT here. This sets $INSTDIR for the mode, and may start an
+    ; elevated copy of the setup file and end this process.
+    Call ImInitInstallMode
   !endif
 
   ; Abort downgrades if they are disabled, in the modes that skip the reinstall page choice:
@@ -823,7 +852,8 @@ Function un.onInit
   !insertmacro SetContext
 
   !if "${INSTALLMODE}" == "both"
-    !insertmacro MULTIUSER_UNINIT
+    ; Glowdrift: upstream calls MULTIUSER_UNINIT here.
+    Call un.ImInitInstallMode
   !endif
 
   !insertmacro MUI_UNGETLANGUAGE
@@ -947,6 +977,10 @@ Section Uninstall
     SetShellVarContext current
     RmDir /r "$APPDATA\${BUNDLEID}"
     RmDir /r "$LOCALAPPDATA\${BUNDLEID}"
+    ; Glowdrift: SetShellVarContext also switches SHCTX, which the uninstall hook uses afterwards.
+    !if "${INSTALLMODE}" == "both"
+      Call un.ImApplyShellContext
+    !endif
   ${EndIf}
 
   !ifmacrodef NSIS_HOOK_POSTUNINSTALL
@@ -961,6 +995,11 @@ Section Uninstall
 SectionEnd
 
 Function RestorePreviousInstallLocation
+  ; Glowdrift: a folder given with /D= wins over the mode defaults and the remembered folder.
+  ${If} $FpDirGiven = 1
+    StrCpy $INSTDIR $FpGivenDir
+    Return
+  ${EndIf}
   ReadRegStr $4 SHCTX "${MANUPRODUCTKEY}" ""
   StrCmp $4 "" +2 0
     StrCpy $INSTDIR $4

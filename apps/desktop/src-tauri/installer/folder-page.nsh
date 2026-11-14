@@ -1,11 +1,19 @@
 ; Install folder page for the first interactive install. Included by installer.nsi after the product
-; defines (MANUFACTURER, PRODUCTNAME, UNINSTKEY, ESTIMATEDSIZE, PLACEHOLDER_INSTALL_DIR) and before the
-; pages. The template must also have PassiveMode and UpdateMode variables, and nsDialogs, LogicLib and
-; Win\COM.nsh available.
+; defines (MANUFACTURER, PRODUCTNAME, UNINSTKEY, ESTIMATEDSIZE, PLACEHOLDER_INSTALL_DIR) and the MultiUser
+; include, and before the pages. The template must also have PassiveMode and UpdateMode variables, and
+; nsDialogs, LogicLib and Win\COM.nsh available.
 ;
 ; The page is skipped for silent, passive and update runs, when /D= was given, and when an install is
-; already registered. Both flags are computed once in FolderPageDetect, called from .onInit, because the
-; reinstall page can run the previous uninstaller before this page is reached.
+; already registered, in the hive of either install mode. These flags are computed once in
+; FolderPageDetect, called from .onInit, because the reinstall page can run the previous uninstaller before
+; this page is reached.
+;
+; The page follows the install mode page and applies to the selected mode. The start folder is $INSTDIR,
+; which the mode functions set to the default of the mode. For current user that folder lies below the
+; per-user Programs folder, and folders that need elevation (Program Files, Windows) are rejected, because
+; the installer is not elevated. For all users the installer is elevated, so Program Files is allowed and
+; only the Windows folder is rejected. The writability probe runs in the installer process and therefore
+; accepts exactly the folders that Setup can write to in the selected mode.
 ;
 ; Validation never opens a message box. nsDialogs has no notification for an edit field losing keyboard
 ; focus (it routes only EN_CHANGE and button clicks), so a short timer polls GetFocus and validates when
@@ -20,7 +28,9 @@
 !define FP_IID_IFileDialog {42F85136-DB7E-439C-85F1-E4075D135FC8}
 
 Var FpDirGiven
+Var FpGivenDir
 Var FpExisting
+Var FpAllUsers
 Var FpPageActive
 Var FpBusy
 Var FpHadFocus
@@ -54,25 +64,43 @@ Var FpR
   LangString fpErrNotLocal 0 "Choose a folder on a local drive. Network drives and optical drives are not supported."
   LangString fpErrDriveRoot 0 "Choose a folder, not a whole drive."
   LangString fpErrProtected 0 "Choose a folder that does not need administrator rights. The Program Files and Windows folders are not allowed."
+  LangString fpErrWindowsFolder 0 "The Windows folder is not allowed. Choose another folder."
   LangString fpErrIsFile 0 "Part of this path is a file, not a folder. Choose another folder."
   LangString fpErrNotWritable 0 "Setup cannot write to this folder. Choose another one."
   LangString fpErrNoSpace 0 "There is not enough free space on this drive."
 !macroend
 
 ; Called from .onInit after SetContext and before $INSTDIR is defaulted: a $INSTDIR that already differs
-; from the placeholder was set by /D=.
+; from the placeholder was set by /D=, and is kept in $FpGivenDir.
 Function FolderPageDetect
   Push $0
+  Push $1
   StrCpy $FpDirGiven 0
+  StrCpy $FpGivenDir ""
   ${If} $INSTDIR != "${PLACEHOLDER_INSTALL_DIR}"
     StrCpy $FpDirGiven 1
+    StrCpy $FpGivenDir $INSTDIR
   ${EndIf}
   StrCpy $FpExisting 0
-  ReadRegStr $0 SHCTX "${UNINSTKEY}" "UninstallString"
-  ${If} $0 != ""
+  ReadRegStr $0 HKLM "${UNINSTKEY}" "UninstallString"
+  ReadRegStr $1 HKCU "${UNINSTKEY}" "UninstallString"
+  ${If} "$0$1" != ""
     StrCpy $FpExisting 1
   ${EndIf}
+  Pop $1
   Pop $0
+FunctionEnd
+
+; Out: $FpAllUsers 1 when the install mode is all users.
+Function FpDetectMode
+  StrCpy $FpAllUsers 0
+  !if "${INSTALLMODE}" == "both"
+    ${If} $MultiUser.InstallMode == "AllUsers"
+      StrCpy $FpAllUsers 1
+    ${EndIf}
+  !else if "${INSTALLMODE}" == "perMachine"
+    StrCpy $FpAllUsers 1
+  !endif
 FunctionEnd
 
 ; In: $FpA path. Out: $FpR parent folder, or "" when the path is a drive root or has no parent.
@@ -187,12 +215,12 @@ Function FpFolderIsEmpty
   Pop $0
 FunctionEnd
 
-!macro FpFailIfProtected BASE
+!macro FpFailIfProtected BASE MESSAGE
   StrCpy $FpA $0
   StrCpy $FpB "${BASE}"
   Call FpIsUnder
   ${If} $FpR == 1
-    StrCpy $FpMsg "$(fpErrProtected)"
+    StrCpy $FpMsg "${MESSAGE}"
     Goto validate_done
   ${EndIf}
 !macroend
@@ -326,13 +354,18 @@ Function FpValidate
     ${EndIf}
   ${EndIf}
 
-  ; Folders that need elevation to write
-  !insertmacro FpFailIfProtected $PROGRAMFILES
-  !insertmacro FpFailIfProtected $PROGRAMFILES64
-  !insertmacro FpFailIfProtected $WINDIR
+  ; Folders that need elevation to write, which only an all users installation has
+  ${If} $FpAllUsers == 1
+    !insertmacro FpFailIfProtected $WINDIR $(fpErrWindowsFolder)
+  ${Else}
+    !insertmacro FpFailIfProtected $PROGRAMFILES $(fpErrProtected)
+    !insertmacro FpFailIfProtected $PROGRAMFILES64 $(fpErrProtected)
+    !insertmacro FpFailIfProtected $WINDIR $(fpErrProtected)
+  ${EndIf}
 
-  ; Writable without elevation: probe the folder itself, or the nearest existing ancestor when the folder
-  ; does not exist yet and Setup will create it.
+  ; Writable by this process: probe the folder itself, or the nearest existing ancestor when the folder
+  ; does not exist yet and Setup will create it. A current user installation runs without elevation, so
+  ; this rejects folders that need it.
   StrCpy $FpA $0
   Call FpNearestExisting
   StrCpy $5 $FpR
@@ -557,6 +590,7 @@ Function FolderPageCreate
     Abort
   ${EndIf}
 
+  Call FpDetectMode
   !insertmacro MUI_HEADER_TEXT "$(fpHeaderTitle)" "$(fpHeaderSubtitle)"
   nsDialogs::Create 1018
   Pop $0

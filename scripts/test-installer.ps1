@@ -172,9 +172,9 @@ function Invoke-Program([string]$File, [string]$Arguments, [string]$Label) {
 
 # NSIS needs /D= as the last argument and unquoted, even when the folder contains spaces.
 function Install-Silent([string]$Setup, [string]$Folder, [string]$Label) {
-    $arguments = '/S'
+    $arguments = '/S /currentuser'
     if ($Folder) {
-        $arguments = "/S /D=$Folder"
+        $arguments = "/S /currentuser /D=$Folder"
         if (-not $script:Folders.Contains($Folder)) { $script:Folders.Add($Folder) }
     }
     $code = Invoke-Program $Setup $arguments $Label

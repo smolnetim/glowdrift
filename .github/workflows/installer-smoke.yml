@@ -1,8 +1,10 @@
 name: Installer smoke test
 
 # Builds the setup file with a version above any published release, then installs, updates and
-# uninstalls it on the runner (scripts/test-installer.ps1). The test changes HKCU and the user
-# profile, which is fine on a throwaway runner.
+# uninstalls it on the runner (scripts/test-installer.ps1), and exercises both install modes: current
+# user (/currentuser, HKCU, user Start menu) and all users (/allusers, HKLM, Program Files, common Start
+# menu). The tests change HKCU, HKLM, Program Files and the user profile, which is fine on a throwaway
+# runner.
 on:
   push:
     branches: [main]
@@ -99,6 +101,192 @@ jobs:
           if ($env:OLD_SETUP_URL) { $arguments.OldSetupUrl = $env:OLD_SETUP_URL }
           & ./scripts/test-installer.ps1 @arguments
 
+      # Runs after the test above, which leaves nothing behind, and uses the same setup file. The runner is
+      # an administrator without UAC prompts, so the all users pass runs without a prompt.
+      - name: Run the install mode smoke test
+        shell: pwsh
+        env:
+          SETUP_FILE: ${{ steps.setup.outputs.path }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = $env:SETUP_FILE
+          $product = 'Glowdrift'
+          $vendor = 'T1M'
+          $exe = 'glowdrift-desktop.exe'
+          $uninstallSubKey = "Software\Microsoft\Windows\CurrentVersion\Uninstall\$product"
+          $modes = @{
+            CurrentUser = @{
+              Uninstall = "HKCU:\$uninstallSubKey"
+              Product   = "HKCU:\Software\$vendor\$product"
+              Programs  = [Environment]::GetFolderPath('Programs')
+              Desktop   = [Environment]::GetFolderPath('Desktop')
+            }
+            AllUsers = @{
+              Uninstall = "HKLM:\$uninstallSubKey"
+              Product   = "HKLM:\Software\$vendor\$product"
+              Programs  = [Environment]::GetFolderPath('CommonPrograms')
+              Desktop   = [Environment]::GetFolderPath('CommonDesktopDirectory')
+            }
+          }
+
+          $root = Join-Path $env:RUNNER_TEMP 'glowdrift-install-modes'
+          if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+          New-Item -ItemType Directory -Path $root -Force | Out-Null
+          try { Start-Transcript -Path (Join-Path $root 'modes.log') -Force | Out-Null } catch { }
+
+          $failures = New-Object System.Collections.Generic.List[string]
+          function Assert-That([string]$Name, [bool]$Condition) {
+            if ($Condition) { Write-Host "PASS  $Name" } else { $script:failures.Add($Name); Write-Host "FAIL  $Name" }
+          }
+
+          function Get-DefaultValue([string]$Path) {
+            $key = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+            if ($null -eq $key) { return $null }
+            return $key.GetValue('')
+          }
+
+          function Get-RegValue([string]$Path, [string]$Name) {
+            $key = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+            if ($null -eq $key) { return $null }
+            return $key.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+          }
+
+          function Test-SamePath($Left, $Right) {
+            if ([string]::IsNullOrEmpty([string]$Left) -or [string]::IsNullOrEmpty([string]$Right)) { return $false }
+            $a = [System.IO.Path]::GetFullPath([string]$Left).TrimEnd('\')
+            $b = [System.IO.Path]::GetFullPath([string]$Right).TrimEnd('\')
+            return [string]::Equals($a, $b, [System.StringComparison]::OrdinalIgnoreCase)
+          }
+
+          function Wait-Until([scriptblock]$Condition, [int]$Seconds) {
+            $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+            while ([DateTime]::UtcNow -lt $deadline) {
+              if (& $Condition) { return $true }
+              Start-Sleep -Milliseconds 500
+            }
+            return [bool](& $Condition)
+          }
+
+          # Runs a program to completion and returns its exit code, or -1 after killing it on timeout.
+          function Invoke-Program([string]$File, [string]$Arguments) {
+            Write-Host "  run: $File $Arguments"
+            $process = Start-Process -FilePath $File -ArgumentList $Arguments -PassThru
+            $null = $process.Handle
+            if (-not $process.WaitForExit(180000)) {
+              & taskkill.exe /PID $process.Id /T /F | Out-Null
+              return -1
+            }
+            return $process.ExitCode
+          }
+
+          # Removes everything either install mode can leave, so that each pass starts clean.
+          function Clear-State {
+            foreach ($mode in $modes.Values) {
+              Remove-Item -LiteralPath $mode.Uninstall -Recurse -Force -ErrorAction SilentlyContinue
+              Remove-Item -LiteralPath $mode.Product -Recurse -Force -ErrorAction SilentlyContinue
+              Remove-Item -LiteralPath (Join-Path $mode.Programs "$product.lnk") -Force -ErrorAction SilentlyContinue
+              Remove-Item -LiteralPath (Join-Path $mode.Desktop "$product.lnk") -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+          # Asserts that the installation is registered for the mode and for no other mode.
+          function Assert-Installed([string]$Mode, [string]$Other, [string]$Folder, [string]$Label) {
+            $here = $modes[$Mode]
+            $there = $modes[$Other]
+            Assert-That "$Label : $exe exists" (Test-Path -LiteralPath (Join-Path $Folder $exe) -PathType Leaf)
+            Assert-That "$Label : uninstall.exe exists" (Test-Path -LiteralPath (Join-Path $Folder 'uninstall.exe') -PathType Leaf)
+            Assert-That "$Label : Uninstall DisplayName is $product in $Mode hive" ((Get-RegValue $here.Uninstall 'DisplayName') -eq $product)
+            Assert-That "$Label : Uninstall InstallLocation is the quoted folder" ((Get-RegValue $here.Uninstall 'InstallLocation') -eq ('"' + $Folder + '"'))
+            Assert-That "$Label : Uninstall UninstallString points at uninstall.exe in the folder" ((Get-RegValue $here.Uninstall 'UninstallString') -eq ('"' + (Join-Path $Folder 'uninstall.exe') + '"'))
+            Assert-That "$Label : remembered folder equals the install folder" (Test-SamePath (Get-DefaultValue $here.Product) $Folder)
+            Assert-That "$Label : no Uninstall entry in the $Other hive" (-not (Test-Path -LiteralPath $there.Uninstall))
+            Assert-That "$Label : no remembered folder in the $Other hive" (-not (Test-Path -LiteralPath $there.Product))
+            Assert-That "$Label : Start menu shortcut is in the $Mode Programs folder" (Test-Path -LiteralPath (Join-Path $here.Programs "$product.lnk") -PathType Leaf)
+            Assert-That "$Label : no Start menu shortcut in the $Other Programs folder" (-not (Test-Path -LiteralPath (Join-Path $there.Programs "$product.lnk")))
+          }
+
+          function Assert-Removed([string]$Folder, [string]$Label) {
+            Assert-That "$Label : program files removed from the install folder" (-not (Test-Path -LiteralPath (Join-Path $Folder $exe)))
+            foreach ($name in $modes.Keys) {
+              $entry = $modes[$name]
+              Assert-That "$Label : no Uninstall entry in the $name hive" (-not (Test-Path -LiteralPath $entry.Uninstall))
+              Assert-That "$Label : no remembered folder in the $name hive" (-not (Test-Path -LiteralPath $entry.Product))
+              Assert-That "$Label : no Start menu shortcut in the $name Programs folder" (-not (Test-Path -LiteralPath (Join-Path $entry.Programs "$product.lnk")))
+              Assert-That "$Label : no desktop shortcut in the $name desktop folder" (-not (Test-Path -LiteralPath (Join-Path $entry.Desktop "$product.lnk")))
+            }
+          }
+
+          # One mode: install with its switch, update without a switch, refuse the other mode's switch, uninstall.
+          function Test-Mode([string]$Mode, [string]$Other, [string]$Folder) {
+            $switch = '/' + $Mode.ToLowerInvariant()
+            $otherSwitch = '/' + $Other.ToLowerInvariant()
+            Write-Host "== $Mode pass"
+            Clear-State
+
+            $code = Invoke-Program $setup "/S $switch /D=$Folder"
+            Assert-That "$Mode install exits with code 0 (got $code)" ($code -eq 0)
+            Assert-Installed $Mode $Other $Folder "$Mode install"
+
+            # An update keeps the mode and the folder without being told either.
+            $code = Invoke-Program $setup '/S /UPDATE'
+            Assert-That "$Mode update exits with code 0 (got $code)" ($code -eq 0)
+            Assert-Installed $Mode $Other $Folder "$Mode update"
+
+            # The other mode must not create a second installation.
+            $code = Invoke-Program $setup "/S $otherSwitch"
+            Assert-That "$Mode : the $Other switch is refused (exit code $code)" ($code -ne 0)
+            Assert-Installed $Mode $Other $Folder "$Mode after the refused $Other switch"
+
+            # In place with _?=, so the run is synchronous; that mode keeps uninstall.exe and the folder.
+            $code = Invoke-Program (Join-Path $Folder 'uninstall.exe') "/S _?=$Folder"
+            Assert-That "$Mode uninstall exits with code 0 (got $code)" ($code -eq 0)
+            Assert-Removed $Folder "$Mode uninstall"
+            if (Test-Path -LiteralPath $Folder) { Remove-Item -LiteralPath $Folder -Recurse -Force }
+          }
+
+          try {
+            $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+            Assert-That 'the runner is an administrator, so the all users pass needs no prompt' $isAdmin
+
+            Test-Mode 'CurrentUser' 'AllUsers' (Join-Path $root 'per user')
+            Test-Mode 'AllUsers' 'CurrentUser' (Join-Path $root 'all users')
+
+            # No switch and no folder: all users, in Program Files. A real uninstall copies itself to TEMP and
+            # returns at once, so the end of it is waited for.
+            Write-Host '== All users by default'
+            Clear-State
+            $vendorFolder = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) $vendor
+            $defaultFolder = Join-Path $vendorFolder $product
+            $vendorExisted = Test-Path -LiteralPath $vendorFolder
+            $code = Invoke-Program $setup '/S'
+            Assert-That "default install exits with code 0 (got $code)" ($code -eq 0)
+            Assert-Installed 'AllUsers' 'CurrentUser' $defaultFolder 'default install'
+            $code = Invoke-Program (Join-Path $defaultFolder 'uninstall.exe') '/S'
+            Assert-That "default uninstall exits with code 0 (got $code)" ($code -eq 0)
+            $finished = Wait-Until {
+              -not (Test-Path -LiteralPath $modes.AllUsers.Uninstall) -and -not (Test-Path -LiteralPath $defaultFolder) -and
+              ($null -eq (Get-Process -Name 'Au_' -ErrorAction SilentlyContinue))
+            } 180
+            Assert-That 'default uninstall completes' $finished
+            Assert-Removed $defaultFolder 'default uninstall'
+            if (-not $vendorExisted) {
+              $vendorGone = Wait-Until { -not (Test-Path -LiteralPath $vendorFolder) } 30
+              Assert-That 'default uninstall removes the empty vendor folder' $vendorGone
+            }
+          } catch {
+            Write-Host "FAIL  the test stopped on an error: $($_.Exception.Message)"
+            Write-Host $_.ScriptStackTrace
+            $failures.Add("error: $($_.Exception.Message)")
+          } finally {
+            Clear-State
+          }
+
+          Write-Host ''
+          Write-Host "$($failures.Count) failed"
+          foreach ($name in $failures) { Write-Host "  FAILED: $name" }
+          try { Stop-Transcript | Out-Null } catch { }
+          if ($failures.Count -gt 0) { exit 1 }
+
       - name: Upload the setup file and test log
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -106,6 +294,7 @@ jobs:
           name: installer-smoke-diagnostics
           path: |
             ${{ runner.temp }}/glowdrift-installer-smoke/smoke.log
+            ${{ runner.temp }}/glowdrift-install-modes/modes.log
             ${{ steps.setup.outputs.path }}
           if-no-files-found: warn
           retention-days: 7
