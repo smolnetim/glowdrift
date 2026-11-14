@@ -2,16 +2,28 @@ import { useStore } from "../lib/store";
 import { checkNow, installUpdate, restartToUpdate, updateStore } from "../state/updates";
 import { Icon } from "./Icon";
 
-/** Non-blocking pill shown once an update only needs a restart. */
+const PERMISSION_HINT = "Windows will ask for permission to install the update.";
+
+/** Non-blocking pill shown once an update has been downloaded and only needs to be installed. */
 export function UpdatePill() {
   const state = useStore(updateStore);
   if (state.phase !== "ready") return null;
   return (
-    <button type="button" className="update-pill" title={state.error} onClick={() => void restartToUpdate()}>
+    <button
+      type="button"
+      className="update-pill"
+      title={state.error ?? (state.needsElevation ? PERMISSION_HINT : undefined)}
+      onClick={() => void restartToUpdate()}
+    >
       <Icon name="download" size={16} />
-      <span>{state.error ? "Update failed – Try again" : "Update ready – Restart"}</span>
+      <span>{pillLabel(state.needsElevation, state.error !== undefined)}</span>
     </button>
   );
+}
+
+function pillLabel(needsElevation: boolean, failed: boolean): string {
+  if (failed) return "Update failed – Try again";
+  return needsElevation ? "Update ready – Install (needs permission)" : "Update ready – Restart";
 }
 
 /** Check-now control with its status line, used on the Settings page. */
@@ -28,7 +40,10 @@ export function UpdateChecker() {
       state.progress === null
         ? `Downloading version ${state.version}…`
         : `Downloading version ${state.version}… ${Math.round(state.progress * 100)}%`;
-  } else if (state.phase === "ready") status = `Version ${state.version} is ready to install.`;
+  } else if (state.phase === "ready") {
+    status = state.error ?? `Version ${state.version} is ready to install.`;
+    if (state.needsElevation && !state.error) status += " Windows will ask for permission.";
+  }
   else if (state.phase === "failed") {
     status = state.stage === "check" ? "Could not check for updates." : "Could not install the update.";
   }
@@ -38,7 +53,7 @@ export function UpdateChecker() {
       <div className="update-actions">
         {state.phase === "ready" ? (
           <button type="button" className="btn btn--primary" onClick={() => void restartToUpdate()}>
-            Restart to finish
+            {state.needsElevation ? "Install update" : "Restart to finish"}
           </button>
         ) : state.phase === "available" ? (
           <button type="button" className="btn btn--primary" onClick={() => void installUpdate(state.update)}>

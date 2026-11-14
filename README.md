@@ -23,8 +23,8 @@ See [docs/integrations.md](docs/integrations.md) for what each lighting route do
 
 1. Open the [Releases](https://github.com/smolnetim/glowdrift/releases) page and download the latest
    `Glowdrift_<version>_x64-setup.exe`.
-2. Run it. It installs for the current user only, into `%LOCALAPPDATA%\Programs\T1M\Glowdrift`, so it does not ask
-   for administrator rights.
+2. Run it and choose who to install for: all users (`C:\Program Files\T1M\Glowdrift`, asks for administrator
+   permission) or only you (`%LOCALAPPDATA%\Programs\T1M\Glowdrift`, no prompt). Updates keep the choice.
 3. Start Glowdrift. It lives in the system tray, and closing the window hides it rather than quitting.
 
 Requirements: Windows 11, and Corsair iCUE running if you want to drive Corsair devices. The

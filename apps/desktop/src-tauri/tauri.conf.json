@@ -43,7 +43,7 @@
     ],
     "windows": {
       "nsis": {
-        "installMode": "currentUser",
+        "installMode": "both",
         "template": "installer/installer.nsi",
         "installerHooks": "installer/hooks.nsh"
       }

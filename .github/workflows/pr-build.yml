@@ -1,0 +1,212 @@
+name: PR build
+
+# Builds the unsigned setup file for every pull request and links it from one sticky comment on the
+# pull request (found by its hidden marker and updated in place). Pull requests from forks get a
+# read-only token, so they skip the comment and only get the job summary. No secrets are used.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+
+concurrency:
+  group: pr-build-${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  pr-build:
+    name: Build the setup file (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      pull-requests: write # create and update the sticky comment
+    env:
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      SHA: ${{ github.event.pull_request.head.sha }}
+      RUN_ID: ${{ github.run_id }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      SERVER_URL: ${{ github.server_url }}
+      SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    steps:
+      - name: Comment that the build started
+        if: env.SAME_REPO == 'true'
+        continue-on-error: true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $marker = '<!-- glowdrift-pr-build -->'
+          $short = $env:SHA.Substring(0, 7)
+          $body = @(
+            $marker
+            "<!-- run:$env:RUN_ID -->"
+            '![Build: building](https://img.shields.io/badge/build-building-yellow?logo=windows)'
+            ''
+            ('Commit [`{0}`]({1}/{2}/commit/{3}) · [workflow run]({4})' -f $short, $env:SERVER_URL, $env:REPO, $env:SHA, $env:RUN_URL)
+          ) -join "`n"
+          $file = Join-Path $env:RUNNER_TEMP 'pr-comment.md'
+          Set-Content -Path $file -Value $body -Encoding utf8
+          # The listing is collected completely before it is filtered: stopping the pipe early at the
+          # first match would cut gh off and make it exit non-zero.
+          $listing = @(gh api "repos/$env:REPO/issues/$env:PR_NUMBER/comments" --paginate --jq '.[] | {id, body} | tojson')
+          if ($LASTEXITCODE -ne 0) { throw 'Could not list the pull request comments.' }
+          $existing = $listing |
+            ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.body.Contains($marker) } |
+            Select-Object -First 1
+          if ($existing) {
+            gh api --method PATCH "repos/$env:REPO/issues/comments/$($existing.id)" -F "body=@$file" --silent
+          } else {
+            gh api --method POST "repos/$env:REPO/issues/$env:PR_NUMBER/comments" -F "body=@$file" --silent
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Could not write the pull request comment.' }
+
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: windows-release
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      # The version stays the one in Cargo.toml. Without the updater artifacts no signing key is needed.
+      - name: Write the build override
+        shell: pwsh
+        run: |
+          $override = '{"bundle":{"createUpdaterArtifacts":false}}'
+          Set-Content -Path "$env:RUNNER_TEMP/pr-build.tauri.conf.json" -Value $override -Encoding ascii
+
+      - name: Build the setup file
+        working-directory: apps/desktop
+        shell: pwsh
+        run: npm run tauri -- build --bundles nsis --config "$env:RUNNER_TEMP/pr-build.tauri.conf.json"
+
+      - name: Stage the setup file
+        id: setup
+        shell: pwsh
+        run: |
+          $files = @(Get-ChildItem -Path target/release/bundle/nsis -Filter '*-setup.exe')
+          if ($files.Count -ne 1) { throw "Expected one setup file in target/release/bundle/nsis, found $($files.Count)." }
+          $name = 'Glowdrift-pr{0}-{1}-setup.exe' -f $env:PR_NUMBER, $env:SHA.Substring(0, 7)
+          $staged = Join-Path $env:RUNNER_TEMP $name
+          Copy-Item -Path $files[0].FullName -Destination $staged
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "path=$staged" >> $env:GITHUB_OUTPUT
+          "size_mb=$(([math]::Round((Get-Item $staged).Length / 1MB, 1)).ToString('0.0', [cultureinfo]::InvariantCulture))" >> $env:GITHUB_OUTPUT
+          "sha256=$((Get-FileHash -Path $staged -Algorithm SHA256).Hash.ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
+      # archive: false uploads the file itself, so the artifact link downloads the .exe, not a zip.
+      # The artifact is named after the file; the name input is ignored in this mode.
+      - name: Upload the setup file
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: ${{ steps.setup.outputs.path }}
+          archive: false
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Add the download link to the job summary
+        shell: pwsh
+        env:
+          FILE_NAME: ${{ steps.setup.outputs.name }}
+          FILE_SIZE_MB: ${{ steps.setup.outputs.size_mb }}
+          FILE_SHA256: ${{ steps.setup.outputs.sha256 }}
+          DOWNLOAD_URL: ${{ steps.upload.outputs.artifact-url }}
+        run: |
+          @(
+            '### Setup file'
+            ''
+            ('[{0}]({1}) ({2} MB)' -f $env:FILE_NAME, $env:DOWNLOAD_URL, $env:FILE_SIZE_MB)
+            ''
+            ('SHA-256: `{0}`' -f $env:FILE_SHA256)
+            ''
+            'Downloading needs a signed-in GitHub account. The file is unsigned, so Windows SmartScreen will warn. Kept for 14 days.'
+          ) -join "`n" >> $env:GITHUB_STEP_SUMMARY
+
+      # Guarded by the run id so a cancelled run cannot overwrite the comment of the newer run that replaced it.
+      - name: Comment the result
+        if: always() && env.SAME_REPO == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_STATUS: ${{ job.status }}
+          FILE_NAME: ${{ steps.setup.outputs.name }}
+          FILE_SIZE_MB: ${{ steps.setup.outputs.size_mb }}
+          FILE_SHA256: ${{ steps.setup.outputs.sha256 }}
+          DOWNLOAD_URL: ${{ steps.upload.outputs.artifact-url }}
+        run: |
+          $marker = '<!-- glowdrift-pr-build -->'
+          $short = $env:SHA.Substring(0, 7)
+          $commit = 'Commit [`{0}`]({1}/{2}/commit/{3}) · [workflow run]({4})' -f $short, $env:SERVER_URL, $env:REPO, $env:SHA, $env:RUN_URL
+          $head = @($marker, "<!-- run:$env:RUN_ID -->")
+          # shields.io static badge: a dash is written "--", an underscore "__" and a space "_".
+          $esc = { param($text) $text.Replace('-', '--').Replace('_', '__').Replace(' ', '_') }
+          $badge = 'https://img.shields.io/badge/build-{0}-{1}?logo=windows'
+          $lines = switch ($env:JOB_STATUS) {
+            'success' {
+              $download = 'https://img.shields.io/badge/download-{0}-blue' -f (& $esc ('{0} {1} MB' -f $env:FILE_NAME, $env:FILE_SIZE_MB))
+              $head + @(
+                ('![Build: passing]({0}) [![Download the setup file]({1})]({2})' -f ($badge -f 'passing', 'brightgreen'), $download, $env:DOWNLOAD_URL)
+                ''
+                $commit
+                ''
+                ('**Download:** [{0}]({1}) ({2} MB)' -f $env:FILE_NAME, $env:DOWNLOAD_URL, $env:FILE_SIZE_MB)
+                ''
+                ('SHA-256: `{0}`' -f $env:FILE_SHA256)
+                ''
+                '> Downloading needs a signed-in GitHub account. The file is unsigned, so Windows SmartScreen will warn. Kept for 14 days.'
+              )
+            }
+            'cancelled' { $head + @(('![Build: superseded]({0}) Superseded by a newer commit' -f ($badge -f 'superseded', 'lightgrey')), '', $commit) }
+            default { $head + @(('![Build: failed]({0})' -f ($badge -f 'failed', 'red')), '', $commit) }
+          }
+          $file = Join-Path $env:RUNNER_TEMP 'pr-comment.md'
+          Set-Content -Path $file -Value ($lines -join "`n") -Encoding utf8
+          # The listing is collected completely before it is filtered: stopping the pipe early at the
+          # first match would cut gh off and make it exit non-zero.
+          $listing = @(gh api "repos/$env:REPO/issues/$env:PR_NUMBER/comments" --paginate --jq '.[] | {id, body} | tojson')
+          if ($LASTEXITCODE -ne 0) { throw 'Could not list the pull request comments.' }
+          $existing = $listing |
+            ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.body.Contains($marker) } |
+            Select-Object -First 1
+          if ($existing -and -not $existing.body.Contains("<!-- run:$env:RUN_ID -->")) {
+            Write-Host 'The comment belongs to a newer run; leaving it alone.'
+            return
+          }
+          if ($existing) {
+            gh api --method PATCH "repos/$env:REPO/issues/comments/$($existing.id)" -F "body=@$file" --silent
+          } else {
+            gh api --method POST "repos/$env:REPO/issues/$env:PR_NUMBER/comments" -F "body=@$file" --silent
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Could not write the pull request comment.' }

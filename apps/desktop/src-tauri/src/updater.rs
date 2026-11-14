@@ -1,6 +1,7 @@
 //! Background update checks. Updates are downloaded and verified in the background, then
 //! staged; installing is an explicit action because the Windows installer ends the process.
 
+use std::ffi::OsString;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,6 +12,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::{Error as UpdaterError, Update, UpdaterExt};
 
 use crate::commands::{AppState, events};
+use crate::{per_machine, tray};
 
 const FIRST_CHECK_DELAY: Duration = Duration::from_secs(10);
 const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -38,6 +40,8 @@ impl std::fmt::Debug for PendingUpdate {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateReady {
     pub version: String,
+    /// Installing shows a Windows permission prompt.
+    pub needs_elevation: bool,
 }
 
 /// Time until the next scheduled check: the normal interval, doubled for each consecutive
@@ -156,27 +160,47 @@ fn try_check_and_stage(app: &AppHandle) -> Result<Option<String>, UpdaterError> 
         events::UPDATER_READY,
         UpdateReady {
             version: version.clone(),
+            needs_elevation: per_machine::running_app_is_per_machine(),
         },
     );
     Ok(Some(version))
 }
 
-/// Installs the staged update. The engine is stopped first; on Windows a successful install
-/// exits the process, so `Ok(true)` is only seen on platforms where it returns. A failed
-/// install leaves the update staged so it can be retried.
+/// Installs the staged update and exits the process once the installer has started. A failed
+/// install, including a declined permission prompt, leaves the update staged so it can be
+/// retried.
 pub fn install_pending(app: &AppHandle) -> Result<bool, String> {
     let Some(state) = app.try_state::<AppState>() else {
         return Ok(false);
     };
     install_staged(&state.pending_update, |pending| {
-        pending.update.install(&pending.bytes).map_err(|e| {
-            let mut message = format!("The update could not be installed: {e}.");
-            if pending.engine_stopped.load(Ordering::Acquire) {
-                message.push_str(" The lights are off until Glowdrift is restarted.");
-            }
-            message
-        })
+        if per_machine::running_app_is_per_machine() {
+            install_elevated(app, pending)
+        } else {
+            install_in_place(pending)
+        }
     })
+}
+
+/// Installs through the updater plugin, which stops the engine, starts the installer and exits.
+fn install_in_place(pending: &PendingUpdate) -> Result<(), String> {
+    pending.update.install(&pending.bytes).map_err(|e| {
+        let mut message = format!("The update could not be installed: {e}.");
+        if pending.engine_stopped.load(Ordering::Acquire) {
+            message.push_str(" The lights are off until Glowdrift is restarted.");
+        }
+        message
+    })
+}
+
+/// Starts the installer with administrator rights. The engine keeps running until the
+/// elevated launch has succeeded; then it is stopped and the app exits.
+fn install_elevated(app: &AppHandle, pending: &PendingUpdate) -> Result<(), String> {
+    let app_args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    per_machine::launch_elevated(&pending.bytes, &per_machine::installer_arguments(&app_args))?;
+    pending.engine_stopped.store(true, Ordering::Release);
+    tray::quit(app);
+    Ok(())
 }
 
 /// Runs `install` on the staged value and clears the slot only when it succeeds.

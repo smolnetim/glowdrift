@@ -5,6 +5,7 @@ pub mod config_store;
 pub mod engine;
 pub mod icue_sdk;
 pub mod outputs_manager;
+pub mod per_machine;
 pub mod tray;
 pub mod updater;
 pub mod window;
@@ -204,6 +205,7 @@ pub fn run() {
             commands::list_outputs,
             commands::get_app_info,
             commands::install_pending_update,
+            commands::update_needs_elevation,
             commands::install_icue_sdk,
             commands::frontend_ready,
             commands::stage_update,

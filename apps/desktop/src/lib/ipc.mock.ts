@@ -1,6 +1,7 @@
 // In-memory stand-in for the Rust shell, used when the UI runs in a plain browser.
 // Query flags: ?onboarded starts with setup complete, ?icue=unavailable simulates
-// iCUE being unreachable, ?update=1 simulates an available update.
+// iCUE being unreachable, ?update=1 simulates an available update (?update=machine one that
+// needs a Windows permission prompt to install).
 
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { CAPTURE_FPS_MAX, CAPTURE_FPS_MIN, DEFAULT_CONFIG, SATURATION_MAX, SMOOTHING_MS_MAX } from "./defaults";
@@ -202,3 +203,5 @@ export async function checkForUpdate(): Promise<AvailableUpdate | null> {
     },
   };
 }
+
+export const updateNeedsElevation = async (): Promise<boolean> => params.get("update") === "machine";

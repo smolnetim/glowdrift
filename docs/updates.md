@@ -9,8 +9,9 @@ How Glowdrift ships updates, how they are verified, and what that means for wher
 - The installer and the update payload are the same NSIS setup file. Every update payload carries a **minisign
   signature** that the app verifies against a public key compiled into it.
 - Updates download silently in the background and are applied when the app restarts.
-- The app installs **per user** in `%LOCALAPPDATA%\Programs\T1M\Glowdrift`, so neither installing nor updating needs
-  administrator rights or shows a prompt. See [Installation and updates](#installation-and-updates).
+- The installer lets the user choose: **all users** (`C:\Program Files\T1M\Glowdrift`, administrator permission
+  on install and update) or **only me** (`%LOCALAPPDATA%\Programs\T1M\Glowdrift`, never a prompt). An update keeps
+  the mode of the existing installation. See [Installation and updates](#installation-and-updates).
 - To roll back, install an older installer over the current one.
 
 ## How the built-in updater works
@@ -23,8 +24,9 @@ The app uses the official Tauri updater plugin (`tauri-plugin-updater`).
 2. `latest.json` lists, per platform, the version, a download URL and the contents of the matching `.sig` file.
 3. If the version is newer than the running one, the app downloads the installer and verifies its minisign
    signature against the embedded public key. A file that fails verification is discarded.
-4. The new version is applied on the next restart. The Windows install mode is `passive`: the installer shows a
-   small progress window and asks no questions.
+4. The update is installed when the user clicks the update notice (or **Install update** in Settings). The
+   installer runs in `passive` mode: a small progress window, no questions. For an all-users installation Windows
+   asks for administrator permission first; see [Installation and updates](#installation-and-updates).
 5. `autoUpdate` in the config turns the background check off.
 
 The updater and installer settings live in `apps/desktop/src-tauri/tauri.conf.json` (`plugins.updater` and
@@ -34,33 +36,91 @@ GitHub contains, because the endpoint is a plain static file.
 
 ## Installation and updates
 
-The app installs **per user** and never asks for administrator rights, for the first install or for updates.
-The NSIS installer is configured with install mode `currentUser` (`bundle.windows.nsis.installMode`), which makes
-its manifest request the invoking user's own rights (`RequestExecutionLevel user`), so Windows shows no UAC
-prompt on administrator and standard accounts alike. It uses a copy of the bundler's installer template
-(`apps/desktop/src-tauri/installer/installer.nsi`, with the changes listed at the top of that file) and hooks
-(`installer/hooks.nsh`).
+The setup file is an NSIS installer in install mode `both` (`bundle.windows.nsis.installMode`). It uses a copy of
+the bundler's installer template (`apps/desktop/src-tauri/installer/installer.nsi`, with the changes listed at the
+top of that file), the install mode logic (`install-mode.nsh`), the folder page (`folder-page.nsh`) and hooks
+(`hooks.nsh`).
 
-- **Install folder.** `%LOCALAPPDATA%\Programs\T1M\Glowdrift`, with registry data under `HKCU`. The wizard has no
-  folder page. The path is built from the user's "Programs" known folder, falling back to
-  `%LOCALAPPDATA%\Programs` if that lookup fails. A folder given on the command line with `/D=` overrides the
-  default; the updater never passes it.
-- **Start menu.** One `Glowdrift` shortcut directly in the user's Start menu Programs folder.
-- **What the updater runs.** It starts the downloaded setup file with `ShellExecuteW("open", ...)` and the
-  arguments `/P /UPDATE` (passive mode: a small progress window, no questions), then exits the app. Because the
-  installer needs no elevation, the update runs without a prompt.
-- **Location is reused.** For an update or a reinstall, the installer reads the previous folder from
-  `Software\T1M\Glowdrift` in `HKCU` and installs there, so an installation is updated where it is and is never
-  moved. The default folder only applies to a first install.
+- **Install mode.** An interactive first install shows a page with **all users** (preselected) and **only me**.
+  The setup file starts without elevation and asks Windows for administrator permission only for all users, so a
+  per-user install never shows a prompt. The mode is decided in this order: an existing installation (Uninstall key
+  in `HKLM` means all users, in `HKCU` means current user), then `/allusers` or `/currentuser`, then all users.
+  Updates and reinstalls therefore never change the mode. A switch for the other mode than the installed one is
+  refused (exit code 2): uninstall first to change the mode. If the permission prompt is declined, setup ends with
+  exit code 1223, or stays on the mode page when it was declined there.
+- **Default folder.** All users: `C:\Program Files\T1M\Glowdrift`, registry data under `HKLM`. Only me:
+  `%LOCALAPPDATA%\Programs\T1M\Glowdrift` (the user's "Programs" known folder, falling back to
+  `%LOCALAPPDATA%\Programs`), registry data under `HKCU`.
+- **Folder page (first install only).** An interactive first install shows a page for the install folder, with an
+  editable path field (typing and pasting work), a **Browse...** button that opens the standard Windows folder
+  picker, and the required and free space of the target drive. The page is skipped for silent (`/S`) and passive
+  (`/P`) installs, for `/UPDATE`, when `/D=` is given, and whenever an installation already exists. An existing
+  installation of either mode is detected once at startup by its Uninstall entry, so the reinstall page cannot cause the
+  folder page to appear. If a remembered folder exists, the page starts with it; otherwise with the default.
+  - Browse treats the picked folder as a parent and shows `<picked>\Glowdrift`, unless the picked folder is an
+    existing empty folder or already ends in `Glowdrift`, in which case it is used as is. A drive root such as
+    `D:\` becomes `D:\Glowdrift`. Typed text is used exactly as written.
+  - The path is validated when the field loses focus, after Browse and when **Next** is pressed, with an inline
+    message under the field (never a dialog). **Back** and **Cancel** are never blocked. **Next** stays enabled and
+    stays on the page while the path is invalid.
+  - Rejected in both modes: relative paths, UNC and network paths, paths with environment variables, characters
+    Windows does not allow in paths, a drive root alone, the Windows folder, network drives, and drives with too
+    little free space. Only me additionally rejects Program Files and folders that cannot be written without
+    elevation; all users allows them, because the setup is elevated by then. A folder that does not exist yet is
+    accepted and created during the install.
+  - The messages are `LangString`s, so they can be translated.
+- **Location is reused.** The installer stores the install folder in the default value of `Software\T1M\Glowdrift`
+  in `HKLM` (all users) or `HKCU` (only me). An update or a reinstall reads it and installs there without showing the folder page, so an
+  installation is updated where it is and is never moved.
+- **Moving an install** means uninstalling and installing again; there is no "change folder" action for an existing
+  installation. Uninstall first, then run the setup file again and pick the new folder on the folder page.
+- **Start menu.** One `Glowdrift` shortcut directly in the Start menu Programs folder of the user (only me) or of all users. `/NS` skips it.
+- **What the updater runs.** The app downloads and verifies the update in the background and installs it only
+  after a click. For an only-me installation it uses the updater plugin: the setup file starts with `/P /UPDATE`
+  (passive mode: a small progress window, no questions) and the app exits, with no prompt. For an all-users
+  installation (the app runs from under Program Files) the app writes the verified setup file to a uniquely named
+  file in the temp folder and starts it with `ShellExecuteExW` and the `runas` verb, with `/P /UPDATE /R` plus the
+  app's own arguments. Only after the permission prompt was accepted does it stop the engine and exit. If the
+  prompt is declined the app keeps running, the update stays staged, and the next click asks again.
 - **A running instance is asked to quit first.** Before replacing or removing files, the installer starts
   `glowdrift-desktop.exe --quit`, which makes the running instance stop the engine, release the lights and exit,
   then waits at most 10 seconds for the executable to be released. If the app is not running, nothing is started.
   If it is still running after the wait, the bundler's standard running-app check takes over (a prompt, or in
   silent and passive modes a forced close through the Windows Restart Manager).
-- **Uninstall.** Removes the shortcut and the files, and removes the empty `T1M` folder above the install folder.
+- **Autostart entry.** The app writes its autostart entry itself, as the value `Glowdrift` under
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (path to the executable plus `--minimized`). On every
+  install the installer rewrites that value, if it exists, to the current install folder's executable and keeps the
+  original arguments, so the entry keeps working after a reinstall into a different folder. It adds nothing if the
+  value is absent. The entry is removed on uninstall, not during an update. It is per Windows user even for an
+  all-users installation: the installer and uninstaller only touch the entry of the account they run as, and when
+  a standard user supplies an administrator's credentials that is the administrator's account.
+- **Uninstall.** Removes the shortcut, the files and the empty `T1M` folder above the install folder. Every real
+  uninstall also removes the remembered install folder (`Software\T1M\Glowdrift`, and `Software\T1M` if it is then
+  empty), so the next install starts from the default again. During an update the remembered folder and the
+  autostart entry are kept.
+- **Delete app data.** The uninstaller offers an opt-in checkbox, unchecked by default. Only when it is checked are
+  the app data folders `%APPDATA%\gg.t1m.glowdrift` and `%LOCALAPPDATA%\gg.t1m.glowdrift` deleted. Otherwise app data
+  survives an uninstall and a later install picks it up.
+- **Repair.** Windows Settings offers no Modify or Repair (`NoModify` and `NoRepair` are set). To repair, run the
+  setup file again over the installation; it reinstalls into the same folder.
 
-These points follow from the updater plugin source, the bundler template and the built installer's manifest; the
-installer's runtime behaviour is not covered by automated tests.
+### Setup file switches
+
+| Switch | Effect |
+| --- | --- |
+| `/S` | Silent: no UI, no questions. Without a mode switch it uses the existing installation's mode, otherwise all users. |
+| `/P` | Passive: progress window only, no questions. The updater uses `/P /UPDATE`. |
+| `/UPDATE` | Marks the run as an update: keeps the remembered folder and the autostart entry. |
+| `/allusers` | Install for all users (Program Files, `HKLM`). Asks for administrator permission. Refused when an only-me installation exists. |
+| `/currentuser` | Install for the current user only (`HKCU`). Never asks for permission. Refused when an all-users installation exists. |
+| `/NS` | Do not create the Start menu shortcut. |
+| `/R` | Restart the app after a silent or passive install. |
+| `/ARGS <arguments>` | Command-line arguments for the app started by `/R`. |
+| `/D=<folder>` | Install folder. Must be the last argument and must not be quoted, even if the path contains spaces. Skips the folder page. |
+
+The installer's behaviour is verified by the installer smoke test in CI (silent install into a temporary folder,
+update over it, uninstall; files and registry keys are asserted after each step) plus manual checks of the
+interactive pages, which the smoke test cannot drive.
 
 ## Signing keys
 
