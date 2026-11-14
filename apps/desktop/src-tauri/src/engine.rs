@@ -354,6 +354,8 @@ pub struct Engine<E: EngineEvents> {
     fps: FpsMeter,
     throttle: Throttle,
     reported: Option<ReportKey>,
+    /// The shared status holds an error, so clearing it has work to do.
+    error_shown: bool,
     timing: Timing,
 }
 
@@ -400,6 +402,7 @@ impl<E: EngineEvents> Engine<E> {
             fps: FpsMeter::new(now),
             throttle: Throttle::new(PREVIEW_INTERVAL),
             reported: None,
+            error_shown: false,
             timing: Timing::new(),
         }
     }
@@ -572,9 +575,13 @@ impl<E: EngineEvents> Engine<E> {
     }
 
     fn set_error(&mut self, error: Option<String>) {
+        if error.is_none() && !self.error_shown {
+            return;
+        }
         let mark = Timing::start();
         {
             let mut shared = lock(&self.shared);
+            self.error_shown = error.is_some();
             if shared.last_error == error {
                 drop(shared);
                 self.timing.record(Stage::Error, mark);
@@ -639,8 +646,8 @@ impl<E: EngineEvents> Engine<E> {
         let mark = Timing::start();
         {
             let mut shared = lock(&self.shared);
-            shared.target = self.target_rgb.to_hex();
-            shared.smoothed = self.smoothed_rgb.to_hex();
+            self.target_rgb.write_hex(&mut shared.target);
+            self.smoothed_rgb.write_hex(&mut shared.smoothed);
         }
         if self.preview {
             self.throttle.mark();
@@ -706,16 +713,22 @@ impl<E: EngineEvents> Engine<E> {
     }
 
     fn report(&mut self) {
-        let snapshot = lock(&self.shared).clone();
-        let key = ReportKey {
-            running: snapshot.running,
-            fps: snapshot.measured_fps.round() as u32,
-            error: snapshot.last_error.clone(),
-        };
-        if self.reported.as_ref() != Some(&key) {
-            self.reported = Some(key);
-            self.events.status(&snapshot);
+        let shared = lock(&self.shared);
+        let fps = shared.measured_fps.round() as u32;
+        let unchanged = self.reported.as_ref().is_some_and(|key| {
+            key.running == shared.running && key.fps == fps && key.error == shared.last_error
+        });
+        if unchanged {
+            return;
         }
+        let snapshot = shared.clone();
+        drop(shared);
+        self.reported = Some(ReportKey {
+            running: snapshot.running,
+            fps,
+            error: snapshot.last_error.clone(),
+        });
+        self.events.status(&snapshot);
     }
 }
 
@@ -866,6 +879,55 @@ mod tests {
         handle.set_preview_enabled(true);
         handle.shutdown();
         handle.shutdown();
+    }
+
+    #[test]
+    fn error_is_shown_until_the_next_frame_clears_it() {
+        struct Flat(Vec<u8>);
+
+        impl FrameSource for Flat {
+            fn grab(
+                &mut self,
+                _region: glowdrift_core::NormRect,
+                _timeout: Duration,
+            ) -> Result<Option<glowdrift_core::FrameView<'_>>, CaptureError> {
+                Ok(Some(glowdrift_core::FrameView::new(&self.0, 2, 2, 8)))
+            }
+        }
+
+        let mut attempts = 0;
+        let open: OpenSource = Box::new(move |_, _| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(CaptureError::Os("boom".into()))
+            } else {
+                Ok(Box::new(Flat(vec![255; 16])))
+            }
+        });
+        let shared = Arc::new(Mutex::new(EngineStatus::default()));
+        let lights = LightsManager::new(Vec::new(), &Config::default().lights, |_| {});
+        let (_commands, rx) = mpsc::channel();
+        let events = Recorder(Arc::default());
+        let mut engine = Engine::new(
+            rx,
+            Arc::clone(&shared),
+            lights,
+            events,
+            Config::default(),
+            open,
+        );
+
+        let t0 = base();
+        engine.step(t0);
+        assert!(
+            lock(&shared)
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("boom"))
+        );
+        engine.step(t0 + ERROR_RETRY + Duration::from_millis(1));
+        assert_eq!(lock(&shared).last_error, None);
+        assert_eq!(lock(&shared).target, "#ffffff");
     }
 
     #[test]

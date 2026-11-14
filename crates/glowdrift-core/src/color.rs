@@ -21,7 +21,20 @@ impl Rgb {
 
     /// Formats as lowercase `#rrggbb`.
     pub fn to_hex(self) -> String {
-        format!("#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
+        let mut hex = String::with_capacity(7);
+        self.write_hex(&mut hex);
+        hex
+    }
+
+    /// Replaces the contents of `out` with the lowercase `#rrggbb` form, reusing its buffer.
+    pub fn write_hex(self, out: &mut String) {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        out.clear();
+        out.push('#');
+        for byte in [self.r, self.g, self.b] {
+            out.push(char::from(DIGITS[usize::from(byte >> 4)]));
+            out.push(char::from(DIGITS[usize::from(byte & 0xf)]));
+        }
     }
 
     /// Parses `#rrggbb` or `rrggbb` (case-insensitive). Returns `None` on any other input.
@@ -118,6 +131,16 @@ mod tests {
         assert_eq!(Rgb::from_hex("12abff"), Some(c));
         assert_eq!(Rgb::from_hex("#12ab"), None);
         assert_eq!(Rgb::from_hex("#gggggg"), None);
+    }
+
+    #[test]
+    fn write_hex_replaces_previous_contents_without_growing() {
+        let mut out = String::with_capacity(7);
+        Rgb::new(0x12, 0xab, 0xff).write_hex(&mut out);
+        assert_eq!(out, "#12abff");
+        Rgb::new(0, 0x0a, 0x80).write_hex(&mut out);
+        assert_eq!(out, "#000a80");
+        assert_eq!(out.capacity(), 7);
     }
 
     #[test]
