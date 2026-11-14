@@ -1,7 +1,9 @@
 //! The colour engine: capture -> reduce -> smooth -> lights on one dedicated thread.
 //!
-//! Capture runs at `captureFps`; the smoother ticks at a fixed smoothing rate that is independent
-//! of the capture rate and stops entirely once the smoothed colour has reached the target colour.
+//! Capture runs at `captureFps`. The smoother ticks at a smoothing rate that is independent of the
+//! capture rate: the fastest rate the active lights or the preview can use, never above
+//! [`MIN_TICK_INTERVAL`]. It stops once the smoothed colour has reached the target colour, and does
+//! not run at all while nothing consumes the colour.
 
 use std::io;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -17,8 +19,8 @@ use crate::frame_source::{FrameSource, OpenSource, open_desktop};
 use crate::lights_manager::LightsManager;
 use crate::timing::{Stage, Timing};
 
-/// Rate at which the smoother is advanced while the colour is still moving.
-const TICK_INTERVAL: Duration = Duration::from_micros(16_667);
+/// Shortest gap between smoother ticks, which caps the smoothing rate at about 60 Hz.
+const MIN_TICK_INTERVAL: Duration = Duration::from_micros(16_667);
 /// Longest wait for a desktop frame inside one capture attempt.
 const GRAB_TIMEOUT: Duration = Duration::from_millis(2);
 /// Longest side, in pixels, of the frames requested from the capturer.
@@ -111,6 +113,16 @@ pub fn advance_deadline(previous: Instant, now: Instant, interval: Duration) -> 
 /// True when the 8-bit smoothed colour has reached the 8-bit target, so smoothing can stop ticking.
 pub fn is_settled(smoothed: Rgb, target: Rgb) -> bool {
     smoothed == target
+}
+
+/// Gap between smoother ticks for the fastest active light and the preview, or `None` when neither
+/// consumes the smoothed colour. `lights` is [`LightsManager::fastest_interval`].
+pub fn smoothing_interval(lights: Option<Duration>, preview: bool) -> Option<Duration> {
+    lights
+        .into_iter()
+        .chain(preview.then_some(PREVIEW_INTERVAL))
+        .min()
+        .map(|interval| interval.max(MIN_TICK_INTERVAL))
 }
 
 /// Doubling delay between recovery attempts.
@@ -338,6 +350,8 @@ pub struct Engine<E: EngineEvents> {
     retry_at: Option<Instant>,
     backoff: Backoff,
 
+    /// Gap between smoother ticks; `None` while nothing consumes the smoothed colour.
+    tick_interval: Option<Duration>,
     smoother: Smoother,
     last_reduced: LinearRgb,
     has_target: bool,
@@ -376,6 +390,7 @@ impl<E: EngineEvents> Engine<E> {
     ) -> Self {
         let now = Instant::now();
         lights.apply_config(&config.lights);
+        let tick_interval = smoothing_interval(lights.fastest_interval(), false);
         Self {
             rx,
             shared,
@@ -388,6 +403,7 @@ impl<E: EngineEvents> Engine<E> {
             capturer: None,
             retry_at: None,
             backoff: Backoff::new(RECOVERY_MIN, RECOVERY_MAX),
+            tick_interval,
             smoother: Smoother::new(),
             last_reduced: LinearRgb::BLACK,
             has_target: false,
@@ -453,6 +469,7 @@ impl<E: EngineEvents> Engine<E> {
                     } else {
                         self.throttle.clear();
                     }
+                    self.refresh_tick_interval();
                 }
             }
             EngineCommand::Shutdown => return false,
@@ -479,8 +496,11 @@ impl<E: EngineEvents> Engine<E> {
                 capture_interval(self.config.capture_fps),
             );
         }
-        if !self.settled && now >= self.next_tick {
-            self.tick(now);
+        if let Some(interval) = self.tick_interval
+            && !self.settled
+            && now >= self.next_tick
+        {
+            self.tick(now, interval);
         }
         if self.preview {
             let mark = Timing::start();
@@ -499,7 +519,7 @@ impl<E: EngineEvents> Engine<E> {
 
     fn sleep_until_next(&mut self, now: Instant) {
         let mut wake = self.next_capture.min(self.fps.deadline());
-        if !self.settled {
+        if self.tick_interval.is_some() && !self.settled {
             wake = wake.min(self.next_tick);
         }
         if self.preview
@@ -608,18 +628,25 @@ impl<E: EngineEvents> Engine<E> {
         }
         self.has_target = true;
         self.target_rgb = rgb;
-        if self.settled {
-            self.settled = false;
-            self.last_tick = now.checked_sub(TICK_INTERVAL).unwrap_or(now);
-            self.next_tick = now;
+        match self.tick_interval {
+            Some(interval) => {
+                if self.settled {
+                    self.settled = false;
+                    self.last_tick = now.checked_sub(interval).unwrap_or(now);
+                    self.next_tick = now;
+                }
+            }
+            None => self.jump_to_target(),
         }
         self.publish_colors();
     }
 
-    fn tick(&mut self, now: Instant) {
-        let dt = now.saturating_duration_since(self.last_tick).min(MAX_DT);
+    fn tick(&mut self, now: Instant, interval: Duration) {
+        let dt = now
+            .saturating_duration_since(self.last_tick)
+            .min(MAX_DT.max(interval * 2));
         self.last_tick = now;
-        self.next_tick = advance_deadline(self.next_tick, now, TICK_INTERVAL);
+        self.next_tick = advance_deadline(self.next_tick, now, interval);
         let mark = Timing::start();
         let time_constant = Duration::from_millis(u64::from(self.config.smoothing_ms));
         let smoothed = self.smoother.update(self.target, dt, time_constant);
@@ -633,6 +660,27 @@ impl<E: EngineEvents> Engine<E> {
             self.send_current();
         }
         self.settled = is_settled(rgb, self.target_rgb);
+    }
+
+    /// Recomputes the smoothing rate after the lights or the preview changed. When nothing
+    /// consumes the colour any more, the smoothed colour jumps to the target colour, so a light
+    /// enabled later starts from the current picture rather than from a stale colour.
+    fn refresh_tick_interval(&mut self) {
+        self.tick_interval = smoothing_interval(self.lights.fastest_interval(), self.preview);
+        if self.tick_interval.is_none() && self.has_target {
+            self.jump_to_target();
+            self.publish_colors();
+        }
+    }
+
+    /// Puts the smoother and the smoothed colour on the target colour and stops ticking.
+    fn jump_to_target(&mut self) {
+        let time_constant = Duration::from_millis(u64::from(self.config.smoothing_ms));
+        self.smoother.reset();
+        self.smoother
+            .update(self.target, Duration::ZERO, time_constant);
+        self.smoothed_rgb = self.target_rgb;
+        self.settled = true;
     }
 
     fn send_current(&mut self) {
@@ -677,6 +725,7 @@ impl<E: EngineEvents> Engine<E> {
                 self.send_current();
             }
         }
+        self.refresh_tick_interval();
         if adjust_changed && self.has_target {
             self.recompute_target(now);
         }
@@ -706,6 +755,7 @@ impl<E: EngineEvents> Engine<E> {
             }
         }
         self.lights.set_paused(!running);
+        self.refresh_tick_interval();
         self.report();
         if self.preview {
             self.throttle.mark();
@@ -767,6 +817,31 @@ mod tests {
     fn settled_requires_equal_bytes() {
         assert!(is_settled(Rgb::new(1, 2, 3), Rgb::new(1, 2, 3)));
         assert!(!is_settled(Rgb::new(1, 2, 3), Rgb::new(1, 2, 4)));
+    }
+
+    #[test]
+    fn smoothing_interval_picks_the_fastest_consumer() {
+        let ms = Duration::from_millis;
+        // Nothing consumes the colour.
+        assert_eq!(smoothing_interval(None, false), None);
+        // One 30 Hz light, or the 20 Hz preview, alone.
+        assert_eq!(smoothing_interval(Some(ms(33)), false), Some(ms(33)));
+        assert_eq!(smoothing_interval(None, true), Some(PREVIEW_INTERVAL));
+        // Both: the faster of the two.
+        assert_eq!(smoothing_interval(Some(ms(33)), true), Some(ms(33)));
+        assert_eq!(
+            smoothing_interval(Some(ms(100)), true),
+            Some(PREVIEW_INTERVAL)
+        );
+        // A light without a limit is capped at the maximum tick rate.
+        assert_eq!(
+            smoothing_interval(Some(Duration::ZERO), false),
+            Some(MIN_TICK_INTERVAL)
+        );
+        assert_eq!(
+            smoothing_interval(Some(Duration::ZERO), true),
+            Some(MIN_TICK_INTERVAL)
+        );
     }
 
     #[test]
