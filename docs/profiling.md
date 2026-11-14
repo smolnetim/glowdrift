@@ -1,7 +1,33 @@
 # Profiling the engine thread
 
-The `engine-timing` Cargo feature of `glowdrift-desktop` times each stage of the engine loop and
-reads the engine thread's CPU time. It is compiled out by default, so normal builds carry no cost.
+Two tools, both reading the thread cycle counter (`QueryThreadCycleTime`):
+
+- `cpu_meter` example: CPU of a running process and its threads, from outside. Use it for totals,
+  for comparing builds, and to see non-engine threads (iCUE worker and SDK threads).
+- `engine-timing` feature of `glowdrift-desktop`: per-stage wall time and CPU of the engine loop,
+  from inside. Compiled out by default, so normal builds carry no cost.
+
+Do not trust `GetThreadTimes` (Task Manager's per-thread views, older meters): it is sampled by the
+scheduler tick, about 15.6 ms, and under-counts a thread that wakes briefly and often by roughly
+10x (the engine thread reads 0.03-0.27 % where the cycle counter says about 0.5 %).
+Cycles become time with a rate measured by spinning the meter's own thread for a known wall time,
+best of several rounds, so a thread running flat out reads 100 %. The measured rate is within about
+1.5 % of the TSC and the registry `~MHz`; the registry value is only the nominal frequency, so it
+is not used. Record the CPU model next to every number; the meter prints it.
+
+## Meter a running app
+
+```sh
+cargo run --release -p glowdrift-capture --example cpu_meter -- --process glowdrift-desktop --seconds 60
+cargo run --release -p glowdrift-capture --example cpu_meter -- --process glowdrift-desktop --seconds 60 --all-threads
+```
+
+`--process` takes a name or PID (give a PID when several instances run). The default thread is
+`glowdrift-engine`; `--thread <name>` picks another and `--list-threads` shows the names. Output is
+percent of one core for the thread and for the whole process, plus a `GetThreadTimes` line labelled
+coarse. `--all-threads` lists every thread busiest first (unnamed ones are SDK or runtime threads)
+and shows how much of the process total the listed threads account for. Use 60 s windows; 10 s is
+only a smoke check.
 
 ## Enable
 
@@ -24,26 +50,31 @@ go to the normal log file, `glowdrift.log` in the app's log directory
 print to stdout.
 
 ```
-engine timing window 10.0s: passes=… frames=… ticks=… wakes=… busy=…% cpu=…% (user …% kernel …%) cpu/frame=…us | stage mean_us calls/s share% | resend … | grab … | grab.acquire … | … | sleep mean (asked mean) calls/s
+engine timing window 10.0s: passes=… frames=… ticks=… wakes=… busy=…% cpu=…% (in pass …%) cpu/frame=…us | stage wall_us calls/s share% cpu_us | resend … | grab … | grab.acquire … | … | sleep mean (asked mean) calls/s
 ```
 
 - `passes`: loop passes; `frames`: frames delivered by the capturer; `ticks`: smoother ticks;
   `wakes`: sleeps.
 - `busy`: wall time inside a pass as a share of one core's wall time. `cpu`: the engine thread's
-  CPU time (`GetThreadTimes`) as a share of one core; `cpu/frame`: that CPU time per delivered frame.
-- `GetThreadTimes` is sampled by the scheduler in roughly 15.6 ms steps, so `cpu` is coarse over
-  short windows and reads 0 when the thread uses little CPU. Compare the `final` line, or raise the
-  interval, before trusting it.
-- Each stage shows the mean duration per call in microseconds, calls per second, and its share of
-  total pass time. Stages are wall-clock, so waits count: `grab.acquire` and `grab.map` include
-  blocking, which is not CPU.
-- Stages: `resend`, `grab` (split into `grab.acquire`, `grab.store`, `grab.submit`, `grab.map`
-  from `Capturer::last_timings()` and the remainder `grab.other`, which is readback), `reduce`,
+  CPU (cycle counter) as a share of one core, `in pass` the part of it inside a pass; `cpu/frame`:
+  `cpu` per delivered frame. The user/kernel split is not available from cycle counts.
+- The cycle rate is measured once at start (about 0.3 s of spinning on the engine thread) and
+  logged in the `engine timing on` line.
+- Each stage shows `wall_us` (mean wall duration per call in microseconds), calls per second, its
+  share of total pass time, and `cpu_us` (mean CPU cycles per call, as microseconds; `-` where not
+  measured). `wall_us` includes waits and `cpu_us` does not, so `grab.acquire` and `grab.wait_gpu`
+  show a large wall time and a small CPU time. CPU is measured for `pass`, `grab`, `reduce` and the
+  `grab.*` parts only; the other stages are as short as the cost of reading the counter.
+- Stages: `resend`, `grab` (split into `grab.acquire`, `grab.store`, `grab.submit`, `grab.map`,
+  `grab.collect` (ready-render bookkeeping), `grab.wait_gpu` (fence sleep) and `grab.read_back`
+  (pixel copy), all from `Capturer::last_timings()`, and the remainder `grab.other`), `reduce`,
   `target` (brightness, saturation, sRGB), `tick` (smoother update), `send` (lights `set_color`),
   `publish` (shared status colours), `error` (`set_error`), `preview` (`events.color`), `meter`
   (FPS meter and `report`), `other` (rest of the pass), and `sleep` (actual wall time, with the
   requested time in parentheses).
 - `grab.*` call counts equal `grab` calls, including grabs that returned no new frame.
 
-Each timed span costs two clock reads, so the instrumented build runs slightly hotter than a
-normal one.
+Each timed span costs two clock reads, and each CPU-timed span two counter reads (a system call
+each), so the instrumented build runs slightly hotter than a normal one. The `cpu-timing` feature
+of `glowdrift-capture`, enabled by `engine-timing`, adds the counter reads inside the capturer.
+`probe` run with `--features cpu-timing` prints the same per-phase CPU for the capturer alone.

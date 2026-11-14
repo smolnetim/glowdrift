@@ -11,7 +11,7 @@ publish = false
 
 [features]
 # Logs per-stage engine-loop timings and thread CPU time; see docs/profiling.md.
-engine-timing = []
+engine-timing = ["glowdrift-capture/cpu-timing"]
 
 [lib]
 name = "glowdrift_desktop_lib"
