@@ -445,7 +445,7 @@ impl<E: EngineEvents> Engine<E> {
                 continue;
             }
             let now = Instant::now();
-            let pass = Timing::start();
+            let pass = Timing::start_cpu();
             self.step(now);
             self.timing.record(Stage::Pass, pass);
             self.sleep_until_next(now);
@@ -554,7 +554,7 @@ impl<E: EngineEvents> Engine<E> {
         let Some(capturer) = self.capturer.as_mut() else {
             return;
         };
-        let mark = Timing::start();
+        let mark = Timing::start_cpu();
         let grabbed = capturer.grab(self.config.region, GRAB_TIMEOUT);
         self.timing.record(Stage::Grab, mark);
         match grabbed {
@@ -562,7 +562,7 @@ impl<E: EngineEvents> Engine<E> {
                 self.timing.frame();
                 self.fps.record_frame();
                 self.backoff.reset();
-                let mark = Timing::start();
+                let mark = Timing::start_cpu();
                 self.last_reduced = reduce(&frame, self.config.mode);
                 self.timing.record(Stage::Reduce, mark);
                 self.note_grab_timings();
