@@ -14,20 +14,20 @@ publicly downloadable; see [updates.md](updates.md) for the options if the repos
 ### 2. Create the `release` environment and add secrets
 
 The release job runs in a GitHub Environment named `release` (`environment: release` in `release.yml`). It is
-what lets you gate the signing secrets behind approvals and tag rules. The workflow also runs when the
-environment has no protection rules, and GitHub creates an unprotected `release` environment automatically the
-first time the job references it, but create it yourself to configure it:
+what gates the signing secrets behind approvals and tag rules, and each release job shows up as a deployment to
+`release` in the repository's Deployments. GitHub creates an unprotected `release` environment automatically the
+first time the job references it, so configure it:
 
 1. Settings, Environments, New environment, name it `release`.
-2. Optional: **Required reviewers**, so a release job waits for approval before it receives any secret.
-3. Optional: **Deployment branches and tags**, select "Selected branches and tags" and add a tag rule `v*`, so
-   only `v*` tags can use the environment. A manual run (`workflow_dispatch`) uses the ref picked under "Use
-   workflow from"; pick the tag itself, or it will be refused by this rule.
-4. Put the secrets below on the environment (Environment secrets) to keep them away from other workflows. Secrets
-   that already exist as repository secrets, such as `TAURI_SIGNING_PRIVATE_KEY`, keep working with the
-   environment and can stay there; an environment secret with the same name takes precedence.
+2. **Required reviewers**: add the Maintainers, so a release job waits for approval before it receives any secret.
+3. **Deployment branches and tags**: select "Selected branches and tags" and add a tag rule `v*`, so only `v*`
+   tags can use the environment. A manual run (`workflow_dispatch`) uses the ref picked under "Use workflow
+   from"; pick the tag itself, or it will be refused by this rule.
+4. Put the secrets below on the environment (Environment secrets), not on the repository, to keep them away from
+   other workflows. An environment secret with the same name takes precedence over a repository secret, but a
+   repository secret stays readable by every workflow, so delete the repository copy.
 
-Secrets (repository or environment scope, Settings, Secrets and variables, Actions):
+Secrets (environment scope, Settings, Environments, `release`):
 
 | Secret | Required | Value |
 | --- | --- | --- |
@@ -57,13 +57,35 @@ steps (`npm ci`, `cargo install`, release notes) never see them.
   repositories need GitHub Secret Protection).
 - **Private vulnerability reporting**: Settings, Advanced Security, enable "Private vulnerability reporting". It is
   what [SECURITY.md](../SECURITY.md) points reporters to.
-- **Branch protection (or a ruleset) for `main`**, suggested:
-  - require a pull request before merging;
-  - require the `Build and test (Windows)` check from CI and the `cargo-deny`, `npm audit` and `Secret scan` checks
-    from Security;
-  - require branches to be up to date and linear history;
+- **Actions, General, Fork pull request workflows**: keep "Require approval for first-time contributors" (or
+  stricter).
+- **Require actions to be pinned to a full-length commit SHA**: enabled. All `uses:` lines in the workflows are
+  already pinned; Dependabot keeps the pins current.
+- **Ruleset for `main`** (Settings, Rules, Rulesets):
+  - require a pull request before merging, with no required approvals (a sole Maintainer cannot approve their own
+    pull request; raise this once there is a second Maintainer);
+  - require the `Build and test (Windows)` check from CI and the `cargo-deny`, `npm audit (production
+    dependencies)` and `Secret scan (gitleaks)` checks from Security;
+  - require linear history;
   - block force pushes and deletions;
-  - restrict who can create `v*` tags with a tag ruleset, so only maintainers can trigger a release.
+  - the repository admin role may bypass the pull request rule only through a pull request, so the bump commit
+    also goes through a pull request.
+- **Ruleset for release tags**: only the repository admin role (the Maintainers) can create, move or delete `v*`
+  tags. A tag push is what starts a release, so this is what limits who can release.
+- **Immutable releases**: off. `tauri-action` creates the release and then uploads assets, and the manual trigger
+  republishes an existing tag; both would fail on an immutable release. Updates are verified by the minisign
+  signature regardless.
+
+Who may publish a release:
+
+- Pushing a `v*` tag needs the repository admin role (tag ruleset).
+- The release job then waits for a reviewer to approve the `release` environment, and only `v*` tags may use that
+  environment. The signing key is an environment secret, so no other workflow can read it.
+- "Prevent self-review" on the environment is **off** while there is a single Maintainer, because otherwise
+  nobody could approve a release. When a second Maintainer is added, add them as a required reviewer and turn it
+  on so one person cannot both tag and approve.
+- Contributors without the admin role propose changes through pull requests from forks; do not add them as
+  collaborators with write access, because write access is enough to push branches that run workflows.
 
 ### 4. Features that depend on repository visibility
 
@@ -155,19 +177,29 @@ See [Tauri's Windows signing guide](https://v2.tauri.app/distribute/sign/windows
    cargo test --workspace
    ```
 
-6. Commit, tag and push as printed by the script:
+6. Open a pull request for the bump, as printed by the script, and merge it once its checks pass:
 
    ```powershell
+   git switch -c chore/release-v0.2.0
    git add Cargo.toml Cargo.lock CHANGELOG.md apps/desktop/package.json apps/desktop/package-lock.json
    git commit -m "chore(release): v0.2.0"
-   git tag -a v0.2.0 -m "Glowdrift v0.2.0"
-   git push origin main v0.2.0
+   git push -u origin chore/release-v0.2.0
    ```
 
-7. Watch the **Release** workflow. When it finishes, open the release and confirm it contains the `-setup.exe`,
-   the `.sig` and `latest.json`.
-8. Check that `https://github.com/smolnetim/glowdrift/releases/latest/download/latest.json` serves the new
+7. Tag the merged commit on `main` and push the tag. Only a Maintainer can create a `v*` tag.
+
+   ```powershell
+   git switch main
+   git pull
+   git tag -a v0.2.0 -m "Glowdrift v0.2.0"
+   git push origin v0.2.0
+   ```
+
+8. The **Release** workflow starts and waits for approval of the `release` environment. Open the run, review the
+   deployment and approve it. When the workflow finishes, open the release and confirm it contains the
+   `-setup.exe`, the `.sig` and `latest.json`.
+9. Check that `https://github.com/smolnetim/glowdrift/releases/latest/download/latest.json` serves the new
    version.
-9. Install the previous version on a test machine, let it update (or check manually), and confirm the app starts,
-   the tray icon appears and the lights respond.
-10. If something is wrong, follow the rollback notes in [updates.md](updates.md).
+10. Install the previous version on a test machine, let it update (or check manually), and confirm the app starts,
+    the tray icon appears and the lights respond.
+11. If something is wrong, follow the rollback notes in [updates.md](updates.md).

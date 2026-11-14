@@ -105,9 +105,16 @@ if (-not $SkipLock) {
 }
 
 Write-Host ''
-Write-Host 'Review the changes, then release with:'
+Write-Host 'Review the changes, then open a pull request for the bump (main only accepts pull requests):'
 Write-Host ''
+Write-Host "  git switch -c chore/release-v$Version"
 Write-Host '  git add Cargo.toml Cargo.lock CHANGELOG.md apps/desktop/package.json apps/desktop/package-lock.json apps/desktop/src-tauri/tauri.conf.json'
 Write-Host "  git commit -m `"chore(release): v$Version`""
+Write-Host "  git push -u origin chore/release-v$Version"
+Write-Host ''
+Write-Host 'Merge the pull request once its checks pass, then tag the merged commit on main:'
+Write-Host ''
+Write-Host '  git switch main'
+Write-Host '  git pull'
 Write-Host "  git tag -a v$Version -m `"Glowdrift v$Version`""
-Write-Host "  git push origin main v$Version"
+Write-Host "  git push origin v$Version"
