@@ -47,3 +47,20 @@ engine timing window 10.0s: passes=… frames=… ticks=… wakes=… busy=…% 
 
 Each timed span costs two clock reads, so the instrumented build runs slightly hotter than a
 normal one.
+
+## Profiling the iCUE light
+
+The `icue_load` example drives the real iCUE light with a colour that changes on every update, so
+the light's cost can be measured without capture:
+
+```sh
+cargo build --profile profiling -p glowdrift-lights --example icue_load
+icue_load.exe --dll-dir <dir with iCUESDK.x64_2019.dll> --secs 60 --hz 60
+```
+
+It prints its process id once connected. Read per-thread CPU with `QueryThreadCycleTime` (the
+worker is the thread named `glowdrift-icue`; the SDK's own threads are unnamed), not
+`GetThreadTimes`. The worker writes at most about 30 times per second whatever `--hz` is.
+
+The SDK's cost per write grows with the number of LEDs (about 1.2 us per LED on the calling
+thread, plus about 0.9 us per LED on SDK threads), so compare runs on the same set of devices.
