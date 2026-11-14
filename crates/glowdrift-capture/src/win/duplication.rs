@@ -49,6 +49,47 @@ use crate::math::{
 };
 use crate::{CaptureError, Frame, GrabTimings};
 
+/// Thread cycles of the calling thread; 0 unless the `cpu-timing` feature is on.
+fn cycles_now() -> u64 {
+    #[cfg(feature = "cpu-timing")]
+    {
+        crate::cpu::thread_cycles()
+    }
+    #[cfg(not(feature = "cpu-timing"))]
+    {
+        0
+    }
+}
+
+/// Start of a span timed in wall clock and, with `cpu-timing`, thread cycles.
+struct Span {
+    wall: Instant,
+    cycles: u64,
+}
+
+impl Span {
+    fn start() -> Self {
+        Self {
+            wall: Instant::now(),
+            cycles: cycles_now(),
+        }
+    }
+
+    /// Wall time and cycles since the start.
+    fn lap(&self) -> (Duration, u64) {
+        (
+            self.wall.elapsed(),
+            cycles_now().saturating_sub(self.cycles),
+        )
+    }
+
+    fn add_to(&self, wall: &mut Duration, cycles: &mut u64) {
+        let (w, c) = self.lap();
+        *wall += w;
+        *cycles += c;
+    }
+}
+
 use super::error::{Class, classify, map_err};
 use super::monitors::MonitorEntry;
 
@@ -328,10 +369,15 @@ impl Duplicator {
     }
 
     /// Sleeps until the newest in-flight render is finished, at most `timeout`.
-    fn wait_for_gpu(&self, timeout: Duration) {
+    fn wait_for_gpu(&mut self, timeout: Duration) {
         let value = self.pending.back().and_then(|p| p.fence_value);
         if let (Some(fence), Some(value)) = (&self.fence, value) {
+            let span = Span::start();
             fence.wait(value, timeout);
+            span.add_to(
+                &mut self.timings.wait_for_gpu,
+                &mut self.timings.cpu.wait_for_gpu,
+            );
         }
     }
 
@@ -342,6 +388,15 @@ impl Duplicator {
 
     pub(crate) fn timings(&self) -> GrabTimings {
         self.timings
+    }
+
+    /// Wall time and cycles recorded so far for `Map` and pixel copies, the spans nested in
+    /// `collect_ready`.
+    fn nested_in_collect(&self) -> (Duration, u64) {
+        (
+            self.timings.map + self.timings.read_back,
+            self.timings.cpu.map + self.timings.cpu.read_back,
+        )
     }
 
     pub(crate) fn set_max_dimension(&mut self, max_dimension: u32) {
@@ -409,13 +464,13 @@ impl Duplicator {
         let millis = u32::try_from(wait.as_micros().div_ceil(1000)).unwrap_or(u32::MAX);
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
-        let started = Instant::now();
+        let span = Span::start();
         // SAFETY: out pointers refer to live locals.
         let acquired = unsafe {
             self.duplication
                 .AcquireNextFrame(millis, &raw mut info, &raw mut resource)
         };
-        self.timings.acquire += started.elapsed();
+        span.add_to(&mut self.timings.acquire, &mut self.timings.cpu.acquire);
         if let Err(e) = acquired {
             return match classify(e.code().0) {
                 Class::Timeout => Ok(false),
@@ -424,7 +479,7 @@ impl Duplicator {
         }
 
         let desktop_updated = info.LastPresentTime != 0 || info.AccumulatedFrames > 0;
-        let store_started = Instant::now();
+        let store_span = Span::start();
         let stored = if desktop_updated {
             resource
                 .ok_or_else(|| CaptureError::Os("AcquireNextFrame returned no resource".into()))
@@ -435,7 +490,7 @@ impl Duplicator {
         // SAFETY: a frame was acquired above and has not been released yet. It is released on
         // every path, including after a failed copy.
         let released = unsafe { self.duplication.ReleaseFrame() };
-        self.timings.store += store_started.elapsed();
+        store_span.add_to(&mut self.timings.store, &mut self.timings.cpu.store);
         stored?;
         released.map_err(|e| map_err("ReleaseFrame", &e))?;
         if desktop_updated {
@@ -640,7 +695,7 @@ impl Duplicator {
             bottom: rect.y + rect.height,
             back: 1,
         };
-        let started = Instant::now();
+        let span = Span::start();
         // SAFETY: all resources belong to `self.device`; the box lies inside the cached surface
         // (guaranteed by `PixelRect` clamping) and the destination mip 0 has the region's size.
         // For a full mip chain, subresource index equals the mip level.
@@ -669,7 +724,7 @@ impl Duplicator {
                 None,
             );
         }
-        self.timings.submit += started.elapsed();
+        span.add_to(&mut self.timings.submit, &mut self.timings.cpu.submit);
         Ok((staging_texture, out_w, out_h))
     }
 
@@ -718,6 +773,8 @@ impl Duplicator {
     /// Reads back every in-flight render the GPU has finished and leaves the newest one that
     /// was made for `key` in `self.pixels`, returning its size. Never waits.
     fn collect_ready(&mut self, key: Key) -> Result<Option<(u32, u32)>, CaptureError> {
+        let span = Span::start();
+        let nested_before = self.nested_in_collect();
         let mut newest = None;
         while let Some(pending) = self.pending.front() {
             let (slot, width, height) = (pending.slot, pending.width, pending.height);
@@ -735,6 +792,12 @@ impl Duplicator {
                 }
             }
         }
+        let (wall, cycles) = span.lap();
+        let (nested_wall, nested_cycles) = self.nested_in_collect();
+        self.timings.collect_ready +=
+            wall.saturating_sub(nested_wall.saturating_sub(nested_before.0));
+        self.timings.cpu.collect_ready +=
+            cycles.saturating_sub(nested_cycles.saturating_sub(nested_before.1));
         Ok(newest.map(|(width, height, present_qpc)| {
             self.timings.latency = Self::since_present(present_qpc);
             (width, height)
@@ -758,13 +821,14 @@ impl Duplicator {
         } else {
             0
         };
-        let started = Instant::now();
+        let map_span = Span::start();
         // SAFETY: the staging texture is CPU-readable and not mapped elsewhere.
         let mapped_ok = unsafe {
             self.context
                 .Map(staging, 0, D3D11_MAP_READ, flags, Some(&raw mut mapped))
         };
-        self.timings.map += started.elapsed();
+        map_span.add_to(&mut self.timings.map, &mut self.timings.cpu.map);
+        let copy_span = Span::start();
         if let Err(e) = mapped_ok {
             return if poll && e.code() == DXGI_ERROR_WAS_STILL_DRAWING {
                 Ok(false)
@@ -792,6 +856,7 @@ impl Duplicator {
         }
         // SAFETY: the resource was mapped above.
         unsafe { self.context.Unmap(staging, 0) };
+        copy_span.add_to(&mut self.timings.read_back, &mut self.timings.cpu.read_back);
         Ok(true)
     }
 }
