@@ -1,6 +1,6 @@
 # Stay on NSIS and offer a folder choice on first install
 
-Status: accepted. Supersedes the earlier decision to remove the install folder page from the NSIS template.
+Status: accepted, amended by [0002](0002-install-mode-choice.md): the installer is no longer per-user only. Supersedes the earlier decision to remove the install folder page from the NSIS template.
 
 ## Context
 

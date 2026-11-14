@@ -121,7 +121,7 @@ if ($lines.Count -eq 0) {
 
 [void]$lines.Add('### Install')
 [void]$lines.Add('')
-[void]$lines.Add('Download the Windows installer (`.exe`) below and run it. It installs for the current user into `%LOCALAPPDATA%\Programs\T1M\Glowdrift` and needs no administrator rights. Installed copies update themselves from later releases.')
+[void]$lines.Add('Download the Windows installer (`.exe`) below and run it. The installer lets you choose all users (`C:\Program Files\T1M\Glowdrift`, needs administrator permission) or only you (`%LOCALAPPDATA%\Programs\T1M\Glowdrift`, no prompt). Installed copies download updates in the background and install them when you click the update notice; an all-users install asks for permission again.')
 [void]$lines.Add('')
 
 if ($env:GITHUB_REPOSITORY) {
