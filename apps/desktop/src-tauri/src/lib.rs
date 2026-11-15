@@ -4,6 +4,7 @@ pub mod commands;
 pub mod config_store;
 pub mod engine;
 pub mod frame_source;
+pub mod hue_store;
 pub mod icue_sdk;
 pub mod lights_manager;
 pub mod per_machine;
