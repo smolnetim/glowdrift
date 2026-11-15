@@ -238,6 +238,7 @@ mod tests {
             enabled: true,
             bridge_id: Some("A".to_owned()),
             area_id: Some("room".to_owned()),
+            ..HueConfig::default()
         };
         let (creds, area) = target_for(Some(stored("A")), &config);
         assert_eq!(creds, Some(stored("A").credentials));

@@ -136,6 +136,8 @@ both load.
 | `lights.hue.enabled` | bool | false | |
 | `lights.hue.bridgeId` | string or null | null | Identifier of the paired Hue bridge; empty or whitespace-only is treated as null. A value of the wrong type takes the default. Bridge credentials are not stored here. Only the Hue commands change it; `set_config` keeps the stored value. |
 | `lights.hue.areaId` | string or null | null | Selected Hue room, zone or entertainment area; normalised and protected from `set_config` like `bridgeId`. |
+| `lights.hue.zones` | map of light id to `{ x, y, width, height }` | `{}` | Per-light zone overrides, fractions of the monitor, clamped like `region`. Lights without an entry use a default zone from their entertainment position. Invalid entries are dropped. `set_config` takes this from the sent config. |
+| `lights.hue.extraLights` | string array | `[]` | Ids of single bridge lights driven in addition to the area; trimmed, de-duplicated, non-strings dropped. `set_config` takes this from the sent config. |
 | `startMinimized` | bool | true | |
 | `autoUpdate` | bool | true | |
 

@@ -44,7 +44,7 @@ use self::api::{ConfigReply, Inventory, PairReply, normalize_bridge_id, parse_pa
 use self::client::{Bridge, REQUEST_TIMEOUT};
 
 pub use self::discovery::{discover, probe};
-pub use self::light::{HueHandle, HueLight};
+pub use self::light::{AreaLightZone, HueHandle, HueLight, ZoneSource};
 
 /// Light id reported by [`HueLight`].
 pub const HUE_LIGHT_ID: &str = "hue";
@@ -110,6 +110,14 @@ pub struct HueArea {
     pub kind: AreaKind,
     pub name: String,
     pub light_count: u32,
+}
+
+/// A single light of a bridge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeLight {
+    pub id: String,
+    pub name: String,
 }
 
 /// Errors from talking to a bridge.
@@ -207,4 +215,13 @@ pub fn list_areas(creds: &BridgeCredentials) -> Result<Vec<HueArea>, HueError> {
         .into_iter()
         .map(|(area, _)| area)
         .collect())
+}
+
+/// Lists the lights of a paired bridge that can be added as extra lights: colour-capable
+/// lights first, each group sorted by name.
+///
+/// Currently returns an empty list without contacting the bridge.
+pub fn list_lights(creds: &BridgeCredentials) -> Result<Vec<BridgeLight>, HueError> {
+    let _ = creds;
+    Ok(Vec::new())
 }

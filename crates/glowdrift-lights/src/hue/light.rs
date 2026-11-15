@@ -1,12 +1,14 @@
 //! [`HueLight`]: the [`Light`] implementation and its handle. All I/O runs on one worker thread;
 //! `set_color` only stores the latest colour and wakes it.
 
+use std::collections::BTreeMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use glowdrift_core::Rgb;
+use glowdrift_core::{LightPosition, NormRect, Rgb};
+use serde::{Deserialize, Serialize};
 
 use super::pacer::round_interval;
 use super::worker::{Inbox, Status, Target, Timing, Worker};
@@ -22,6 +24,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 struct Shared {
+    /// Zone rectangles that replace the default zone of a light, by light id.
+    zone_overrides: Mutex<BTreeMap<String, NormRect>>,
+    /// Ids of single lights driven in addition to the area.
+    extra_lights: Mutex<Vec<String>>,
     inbox: Mutex<Inbox>,
     wake: Condvar,
     status: Mutex<Status>,
@@ -53,6 +59,32 @@ impl std::fmt::Debug for HueLight {
     }
 }
 
+/// Where a light of [`HueHandle::area_lights`] comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ZoneSource {
+    /// A light of the selected entertainment area.
+    Entertainment,
+    /// A single light added through [`HueHandle::set_extra_lights`].
+    Extra,
+}
+
+/// A light the Hue light drives, with the screen zone it samples.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AreaLightZone {
+    pub id: String,
+    pub name: String,
+    /// Entertainment position; `None` for extra lights and lights without one.
+    pub position: Option<LightPosition>,
+    /// The effective zone, as a fraction of the monitor: the override when there is one,
+    /// otherwise the default for the light's position.
+    pub zone: NormRect,
+    /// True when `zone` is an override.
+    pub custom: bool,
+    pub source: ZoneSource,
+}
+
 /// Changes which bridge and area a [`HueLight`] drives, from any thread.
 #[derive(Clone)]
 pub struct HueHandle {
@@ -71,6 +103,26 @@ impl HueHandle {
     pub fn set_target(&self, creds: Option<BridgeCredentials>, area_id: Option<String>) {
         self.shared
             .update(|inbox| inbox.target = Some(Target { creds, area_id }));
+    }
+}
+
+impl HueHandle {
+    /// Replaces the zone overrides: light id to a rectangle of the monitor. Lights without an
+    /// entry use their default zone. Never blocks.
+    pub fn set_zone_overrides(&self, overrides: BTreeMap<String, NormRect>) {
+        *lock(&self.shared.zone_overrides) = overrides;
+    }
+
+    /// Replaces the ids of the single bridge lights driven in addition to the area. Never
+    /// blocks.
+    pub fn set_extra_lights(&self, ids: Vec<String>) {
+        *lock(&self.shared.extra_lights) = ids;
+    }
+
+    /// The lights currently driven with the zone each one samples, entertainment lights
+    /// first. Performs no I/O. `None` until the area is resolved, which is currently always.
+    pub fn area_lights(&self) -> Option<Vec<AreaLightZone>> {
+        None
     }
 }
 
@@ -97,6 +149,8 @@ impl HueLight {
         enabled: bool,
     ) -> (HueLight, HueHandle) {
         let shared = Arc::new(Shared {
+            zone_overrides: Mutex::new(BTreeMap::new()),
+            extra_lights: Mutex::new(Vec::new()),
             inbox: Mutex::new(Inbox {
                 enabled: enabled.then_some(true),
                 target: Some(Target { creds, area_id }),
@@ -270,5 +324,46 @@ fn wait_for_work(shared: &Shared, deadline: Option<Instant>) -> Inbox {
                     .0;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handle_stores_overrides_and_extra_lights_without_a_layout() {
+        let (light, handle) = HueLight::new(None, None);
+        handle.set_zone_overrides(BTreeMap::from([("a".to_owned(), NormRect::full())]));
+        handle.set_extra_lights(vec!["b".to_owned()]);
+        assert_eq!(lock(&light.shared.zone_overrides).len(), 1);
+        assert_eq!(*lock(&light.shared.extra_lights), vec!["b".to_owned()]);
+        assert_eq!(handle.area_lights(), None);
+        assert_eq!(light.zone_layout(), None);
+    }
+
+    #[test]
+    fn area_light_zone_serialises_camel_case() {
+        let zone = AreaLightZone {
+            id: "a".to_owned(),
+            name: "Lamp".to_owned(),
+            position: Some(LightPosition {
+                x: -1.0,
+                y: 0.0,
+                z: 0.5,
+            }),
+            zone: NormRect::full(),
+            custom: false,
+            source: ZoneSource::Extra,
+        };
+        let v = serde_json::to_value(&zone).unwrap();
+        assert_eq!(v["source"], "extra");
+        assert_eq!(v["custom"], false);
+        assert_eq!(v["position"]["z"], 0.5);
+        assert_eq!(v["zone"]["width"], 1.0);
+        assert_eq!(
+            serde_json::to_value(ZoneSource::Entertainment).unwrap(),
+            "entertainment"
+        );
     }
 }

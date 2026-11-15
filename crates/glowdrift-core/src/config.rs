@@ -1,6 +1,8 @@
 //! Persisted configuration schema. Serialised as camelCase JSON; unknown fields are
 //! ignored and missing fields take their defaults.
 
+use std::collections::BTreeMap;
+
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -78,7 +80,7 @@ where
 /// live in the encrypted credential store.
 ///
 /// A field holding a value of the wrong type takes its default.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct HueConfig {
     #[serde(deserialize_with = "lenient")]
@@ -89,22 +91,82 @@ pub struct HueConfig {
     /// Identifier of the room, zone or entertainment area to drive, `None` when none is selected.
     #[serde(deserialize_with = "lenient")]
     pub area_id: Option<String>,
+    /// Per-light zone overrides: Hue light id to a rectangle of the captured region. Lights
+    /// without an entry use their default zone. An entry that is not a rectangle is dropped
+    /// when loading.
+    #[serde(deserialize_with = "zone_map")]
+    pub zones: BTreeMap<String, NormRect>,
+    /// Ids of single bridge lights driven in addition to the area, in order. Entries that are
+    /// not strings are dropped when loading; blank and repeated ids are dropped by validation.
+    #[serde(deserialize_with = "id_list")]
+    pub extra_lights: Vec<String>,
+}
+
+/// Deserialises a list of ids, dropping entries that are not strings; a value that is not a
+/// list yields an empty one.
+fn id_list<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Entry {
+        Id(String),
+        Invalid(IgnoredAny),
+    }
+    Ok(lenient::<D, Vec<Entry>>(deserializer)?
+        .into_iter()
+        .filter_map(|entry| match entry {
+            Entry::Id(id) => Some(id),
+            Entry::Invalid(_) => None,
+        })
+        .collect())
+}
+
+/// Deserialises the zone map, dropping entries that are not rectangles; a value that is not
+/// a map yields an empty one.
+fn zone_map<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, NormRect>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Entry {
+        Rect(NormRect),
+        Invalid(IgnoredAny),
+    }
+    Ok(lenient::<D, BTreeMap<String, Entry>>(deserializer)?
+        .into_iter()
+        .filter_map(|(id, entry)| match entry {
+            Entry::Rect(rect) => Some((id, rect)),
+            Entry::Invalid(_) => None,
+        })
+        .collect())
 }
 
 impl HueConfig {
-    /// Maps empty or whitespace-only identifiers to `None` and trims the rest.
+    /// Maps empty or whitespace-only identifiers to `None` and trims the rest, drops zones of
+    /// blank light ids, clamps the remaining zones into the unit square, and trims, de-duplicates
+    /// and drops blank extra light ids.
     fn validated(mut self) -> Self {
         fn clean(id: Option<String>) -> Option<String> {
             id.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
         }
         self.bridge_id = clean(self.bridge_id);
         self.area_id = clean(self.area_id);
+        self.zones = std::mem::take(&mut self.zones)
+            .into_iter()
+            .filter(|(id, _)| !id.trim().is_empty())
+            .map(|(id, rect)| (id, rect.clamped()))
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        self.extra_lights = std::mem::take(&mut self.extra_lights)
+            .into_iter()
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty() && seen.insert(id.clone()))
+            .collect();
         self
     }
 }
 
 /// Per-light settings.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct LightsConfig {
     pub icue: IcueConfig,
@@ -281,6 +343,11 @@ mod tests {
                     enabled: true,
                     bridge_id: Some("bridge-1".into()),
                     area_id: Some("area-1".into()),
+                    zones: BTreeMap::from([(
+                        "light-1".to_owned(),
+                        NormRect::new(0.1, 0.2, 0.3, 0.4),
+                    )]),
+                    extra_lights: vec!["light-2".to_owned()],
                 },
             },
             start_minimized: false,
@@ -417,5 +484,111 @@ mod tests {
         let mut c = Config::default();
         c.lights.hue.bridge_id = Some(String::new());
         assert_eq!(c.validated().lights.hue.bridge_id, None);
+    }
+
+    #[test]
+    fn zones_default_to_empty_and_are_not_required() {
+        assert!(Config::default().lights.hue.zones.is_empty());
+        let c: Config = serde_json::from_str(r#"{"lights":{"hue":{"enabled":true}}}"#).unwrap();
+        assert!(c.lights.hue.zones.is_empty());
+        let v = serde_json::to_value(Config::default()).unwrap();
+        assert_eq!(v["lights"]["hue"]["zones"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn zones_round_trip_camel_case() {
+        let c: Config = serde_json::from_str(
+            r#"{"lights":{"hue":{"zones":{"a":{"x":0.1,"y":0.2,"width":0.3,"height":0.4}}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            c.lights.hue.zones,
+            BTreeMap::from([("a".to_owned(), NormRect::new(0.1, 0.2, 0.3, 0.4))])
+        );
+        let back: Config = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back, c);
+    }
+
+    #[test]
+    fn invalid_zone_entries_are_dropped() {
+        let c: Config = serde_json::from_str(
+            r#"{"lights":{"hue":{"enabled":true,"zones":{
+                "ok":{"x":0.5,"y":0.5,"width":0.25,"height":0.25},
+                "num":3,"null":null,"text":"x","list":[1,"a"],
+                "badfield":{"x":"left","width":0.5}
+            }}}}"#,
+        )
+        .unwrap();
+        assert!(c.lights.hue.enabled);
+        assert_eq!(c.lights.hue.zones.keys().collect::<Vec<_>>(), vec!["ok"]);
+    }
+
+    #[test]
+    fn zones_of_the_wrong_type_are_empty() {
+        for json in ["[1]", r#""zones""#, "7", "null", "true"] {
+            let c: Config =
+                serde_json::from_str(&format!(r#"{{"lights":{{"hue":{{"zones":{json}}}}}}}"#))
+                    .unwrap();
+            assert!(c.lights.hue.zones.is_empty(), "{json}");
+        }
+    }
+
+    #[test]
+    fn validated_clamps_zones_and_drops_blank_ids() {
+        let mut c = Config::default();
+        c.lights.hue.zones = BTreeMap::from([
+            ("a".to_owned(), NormRect::new(0.9, -1.0, 0.5, f32::NAN)),
+            ("b".to_owned(), NormRect::new(0.0, 0.0, 0.0, 0.0)),
+            (String::new(), NormRect::full()),
+            ("  ".to_owned(), NormRect::full()),
+        ]);
+        let c = c.validated();
+        assert_eq!(c.lights.hue.zones.len(), 2);
+        for rect in c.lights.hue.zones.values() {
+            assert_eq!(*rect, rect.clamped());
+        }
+        assert_eq!(c.lights.hue.zones["a"].height, 1.0);
+        assert_eq!(c.lights.hue.zones["b"].width, NormRect::MIN_SIZE);
+        assert_eq!(c.clone().validated(), c);
+    }
+
+    #[test]
+    fn extra_lights_default_to_empty_and_serialise_camel_case() {
+        assert_eq!(
+            Config::default().lights.hue.extra_lights,
+            Vec::<String>::new()
+        );
+        let v = serde_json::to_value(Config::default()).unwrap();
+        assert_eq!(v["lights"]["hue"]["extraLights"], serde_json::json!([]));
+        let c: Config =
+            serde_json::from_str(r#"{"lights":{"hue":{"extraLights":["a","b"]}}}"#).unwrap();
+        assert_eq!(c.lights.hue.extra_lights, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn invalid_extra_light_entries_are_dropped() {
+        let c: Config = serde_json::from_str(
+            r#"{"lights":{"hue":{"extraLights":["a",3,null,{"x":1},["b"],"c"]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.lights.hue.extra_lights, vec!["a", "c"]);
+        for json in [r#""a""#, "7", "null", r#"{"a":1}"#] {
+            let c: Config = serde_json::from_str(&format!(
+                r#"{{"lights":{{"hue":{{"extraLights":{json}}}}}}}"#
+            ))
+            .unwrap();
+            assert!(c.lights.hue.extra_lights.is_empty(), "{json}");
+        }
+    }
+
+    #[test]
+    fn validated_cleans_extra_lights() {
+        let mut c = Config::default();
+        c.lights.hue.extra_lights = ["a", " b ", "", "  ", "a", "b", "c"]
+            .map(str::to_owned)
+            .to_vec();
+        let c = c.validated();
+        assert_eq!(c.lights.hue.extra_lights, vec!["a", "b", "c"]);
+        assert_eq!(c.clone().validated(), c);
     }
 }
