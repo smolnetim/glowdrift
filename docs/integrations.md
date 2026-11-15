@@ -1,6 +1,6 @@
 # Lighting integrations
 
-Glowdrift computes one smoothed colour. An integration is a way of getting that colour onto lights. There are
+Glowdrift computes smoothed colour from the screen: one for the whole region, and one per Hue lamp zone. An integration is a way of getting colour onto lights. There are
 three routes. The first two are implemented; the third is a plan and may change.
 
 | Route | Status | Control | Needs |
@@ -90,9 +90,17 @@ How it works in Glowdrift:
   and may overlap. Defaults: a light in the entertainment area is centred horizontally at `(x + 1) / 2` and
   vertically at `(1 - z) / 2` from its position in the Hue app's entertainment area setup, one third of the
   display wide and two thirds tall, kept on screen; an extra light has no position and gets a centred box one
-  fifth wide and full height. The Capture page shows the display with the iCUE box and one labelled box per light
-  with its live colour; dragging or resizing a box stores an override in `lights.hue.zones` (light id to
-  rectangle), and "Reset to Hue positions" removes the overrides, for one light or all.
+  fifth wide and full height. The Capture page has a separate section per light, each with its own full-display preview: iCUE
+  (the region frame) and Philips Hue (one labelled box per lamp with its live colour, plus the shared region
+  presets for the selected lamp). A section appears only while that light is turned on.
+- **Position refresh and reset.** Light positions come from the bridge's entertainment configuration.
+  `hue_refresh_area_lights` re-reads them on demand (at most one inventory read per 2 s, joined if one is already
+  running) without dropping the connection or the restore state. While the Capture page is visible the UI calls it
+  every 5 s, and the "Refresh from Hue" button does so at once. Each `AreaLightZone` carries `zone` (effective)
+  and `defaultZone` (from the current Hue position). A light with no entry in `lights.hue.zones` follows its Hue
+  position live. Dragging a box, choosing a preset or pressing Reset writes an override; Reset writes
+  `defaultZone` and is enabled only while the override differs from it. "Reset all" does this for every light with a
+  differing override. When a pinned light's Hue position moves, the list notes it and Reset follows the new position.
 - **State restore.** When Glowdrift starts sending to a light it records the light's on/off state and brightness
   and either its colour or its colour temperature, whichever it had. When it stops sending, each light is put
   back to that state. Stopping means: the Hue light is disabled, the engine is paused, the area or the extra
