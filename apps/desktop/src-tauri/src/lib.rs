@@ -53,7 +53,7 @@ impl EngineEvents for TauriEvents {
         let payload = ColorEvent {
             target: target.to_hex(),
             smoothed: smoothed.to_hex(),
-            zones: zones.iter().map(|zone| zone.to_hex()).collect(),
+            zones: zones.to_vec(),
         };
         let _ = self.app.emit(events::COLOR, payload);
     }

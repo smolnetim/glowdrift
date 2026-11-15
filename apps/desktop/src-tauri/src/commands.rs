@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use glowdrift_capture::{Frame, MonitorInfo};
-use glowdrift_core::Config;
+use glowdrift_core::{Config, Rgb};
 use glowdrift_lights::icue::ICUE_LIGHT_ID;
 use glowdrift_lights::{LightCode, LightStatus};
 use serde::{Deserialize, Serialize};
@@ -52,9 +52,9 @@ pub struct AppInfo {
 pub struct ColorEvent {
     pub target: String,
     pub smoothed: String,
-    /// Smoothed colour of each light zone as `#rrggbb`, in layout order; empty without zones.
+    /// Smoothed colour of each light zone as `{ r, g, b }`, in layout order; empty without zones.
     #[serde(default)]
-    pub zones: Vec<String>,
+    pub zones: Vec<Rgb>,
 }
 
 /// Event names emitted by the shell.
@@ -314,13 +314,16 @@ mod tests {
         let event = ColorEvent {
             target: "#000000".to_owned(),
             smoothed: "#010203".to_owned(),
-            zones: vec!["#ff0000".to_owned(), "#0000ff".to_owned()],
+            zones: vec![Rgb::new(255, 0, 0), Rgb::new(0, 0, 255)],
         };
         let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(json["zones"], serde_json::json!(["#ff0000", "#0000ff"]));
+        assert_eq!(
+            json["zones"],
+            serde_json::json!([{ "r": 255, "g": 0, "b": 0 }, { "r": 0, "g": 0, "b": 255 }])
+        );
         let old: ColorEvent =
             serde_json::from_str(r##"{"target":"#000000","smoothed":"#000000"}"##).unwrap();
-        assert_eq!(old.zones, Vec::<String>::new());
+        assert_eq!(old.zones, Vec::<Rgb>::new());
     }
 
     #[test]
