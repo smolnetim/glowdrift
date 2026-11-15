@@ -67,11 +67,11 @@ export interface EngineStatus {
   smoothed: HexColor;
 }
 
-export type LightKind = "icue";
+export type LightKind = "icue" | "hue";
 export type LightState = "connected" | "connecting" | "unavailable" | "error" | "disabled";
 
 /** Machine-readable cause behind a light state; `detail` is for display only. */
-export type LightCode = "libraryMissing";
+export type LightCode = "libraryMissing" | "notPaired" | "noArea";
 
 export interface LightStatus {
   id: string;
@@ -83,6 +83,30 @@ export interface LightStatus {
   deviceCount: number;
   /** Absent or null when the state has no specific cause. */
   code?: LightCode | null;
+}
+
+/** A Hue bridge found on the network. */
+export interface BridgeCandidate {
+  id: string;
+  address: string;
+  name: string | null;
+}
+
+/** The paired Hue bridge; carries no secrets. */
+export interface HueBridge {
+  id: string;
+  address: string;
+  name: string | null;
+}
+
+export type HueAreaKind = "room" | "zone" | "entertainment";
+
+/** A room, zone or entertainment area whose lights can receive the colour. */
+export interface HueArea {
+  id: string;
+  kind: HueAreaKind;
+  name: string;
+  lightCount: number;
 }
 
 export interface AppInfo {
@@ -139,6 +163,25 @@ export const updateNeedsElevation = () =>
  */
 export const installIcueSdk = () =>
   call<LightStatus[]>("install_icue_sdk", undefined, (m) => m.installIcueSdk());
+/** Looks for Hue bridges on the network (mDNS, then the Hue discovery service); takes about 4 s. */
+export const hueDiscover = () => call<BridgeCandidate[]>("hue_discover", undefined, (m) => m.hueDiscover());
+/** Reads a manually entered bridge address. Rejects with a user-presentable message. */
+export const hueProbe = (address: string) =>
+  call<BridgeCandidate>("hue_probe", { address }, (m) => m.hueProbe(address));
+/**
+ * Pairs with the bridge at `address`: the user must press the bridge's link button while this runs
+ * (it waits up to 30 s). Rejects with a user-presentable message, including on timeout.
+ */
+export const huePair = (address: string) =>
+  call<HueBridge>("hue_pair", { address }, (m) => m.huePair(address));
+/** The paired bridge, or null when not paired. */
+export const hueBridge = () => call<HueBridge | null>("hue_bridge", undefined, (m) => m.hueBridge());
+/** Rooms, zones and entertainment areas of the paired bridge. */
+export const hueListAreas = () => call<HueArea[]>("hue_list_areas", undefined, (m) => m.hueListAreas());
+export const hueSelectArea = (areaId: string) =>
+  call<Config>("hue_select_area", { areaId }, (m) => m.hueSelectArea(areaId));
+/** Deletes the stored bridge credentials and clears the bridge and area from the config. */
+export const hueForget = () => call<Config>("hue_forget", undefined, (m) => m.hueForget());
 /** Tells the shell the first screen is rendered so it can show the window. */
 export const frontendReady = () => call<void>("frontend_ready", undefined, () => Promise.resolve());
 /** Downloads and verifies an available update and stages it; resolves its version, or null when none. */

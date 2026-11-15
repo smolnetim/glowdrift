@@ -1,18 +1,23 @@
 // In-memory stand-in for the Rust shell, used when the UI runs in a plain browser.
 // Query flags: ?onboarded starts with setup complete, ?icue=unavailable simulates
 // iCUE being unreachable, ?update=1 simulates an available update (?update=machine one that
-// needs a Windows permission prompt to install).
+// needs a Windows permission prompt to install), ?hue=paired starts with a bridge already paired,
+// ?hue=nobridge makes bridge discovery find nothing. The first Hue pairing attempt times out
+// (as if the link button was not pressed); the second succeeds.
 
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { CAPTURE_FPS_MAX, CAPTURE_FPS_MIN, DEFAULT_CONFIG, SATURATION_MAX, SMOOTHING_MS_MAX } from "./defaults";
 import { clamp } from "./format";
 import type {
   AppInfo,
+  BridgeCandidate,
   ColorEvent,
   Config,
   EngineStatus,
-  MonitorInfo,
+  HueArea,
+  HueBridge,
   LightStatus,
+  MonitorInfo,
   Thumbnail,
 } from "./ipc";
 import type { AvailableUpdate } from "./system";
@@ -25,9 +30,24 @@ const MONITORS: MonitorInfo[] = [
   { id: "mon-3", name: "Display 3", x: -5360, y: 180, width: 1920, height: 1080, primary: false, scaleFactor: 1 },
 ];
 
+const HUE_BRIDGE: HueBridge = { id: "0017881A2B3C", address: "192.168.1.23", name: "Philips hue" };
+
+const HUE_AREAS: HueArea[] = [
+  { id: "room-living", kind: "room", name: "Living room", lightCount: 4 },
+  { id: "room-office", kind: "room", name: "Office", lightCount: 2 },
+  { id: "zone-tv", kind: "zone", name: "TV wall", lightCount: 3 },
+  { id: "ent-desk", kind: "entertainment", name: "Desk setup", lightCount: 5 },
+];
+
 let config: Config = { ...DEFAULT_CONFIG, onboardingComplete: params.has("onboarded") };
 let running = true;
 let libraryInstalled = false;
+let hueBridgeState: HueBridge | null = null;
+let huePairAttempts = 0;
+if (params.get("hue") === "paired") {
+  hueBridgeState = { ...HUE_BRIDGE };
+  config = { ...config, lights: { ...config.lights, hue: { ...config.lights.hue, bridgeId: HUE_BRIDGE.id } } };
+}
 let engineColor: ColorEvent = { target: "#000000", smoothed: "#000000" };
 
 type Handler = (payload: unknown) => void;
@@ -79,24 +99,45 @@ function engineStatus(): EngineStatus {
   };
 }
 
-function lights(): LightStatus[] {
+function icueStatus(): LightStatus {
   const base = { id: "icue", kind: "icue", name: "Corsair iCUE", enabled: config.lights.icue.enabled } as const;
-  if (!base.enabled) return [{ ...base, state: "disabled", detail: null, deviceCount: 0 }];
+  if (!base.enabled) return { ...base, state: "disabled", detail: null, deviceCount: 0 };
   if (params.get("icue") === "nolibrary" && !libraryInstalled) {
-    return [
-      {
-        ...base,
-        state: "unavailable",
-        detail: "iCUE SDK library (iCUESDK.x64_2019.dll) not found",
-        deviceCount: 0,
-        code: "libraryMissing",
-      },
-    ];
+    return {
+      ...base,
+      state: "unavailable",
+      detail: "iCUE SDK library (iCUESDK.x64_2019.dll) not found",
+      deviceCount: 0,
+      code: "libraryMissing",
+    };
   }
   if (params.get("icue") === "unavailable") {
-    return [{ ...base, state: "unavailable", detail: "Could not reach the iCUE SDK.", deviceCount: 0 }];
+    return { ...base, state: "unavailable", detail: "Could not reach the iCUE SDK.", deviceCount: 0 };
   }
-  return [{ ...base, state: "connected", detail: "Connected to iCUE 5.52", deviceCount: 7 }];
+  return { ...base, state: "connected", detail: "Connected to iCUE 5.52", deviceCount: 7 };
+}
+
+function hueStatus(): LightStatus {
+  const base = { id: "hue", kind: "hue", name: "Philips Hue", enabled: config.lights.hue.enabled } as const;
+  if (!base.enabled) return { ...base, state: "disabled", detail: null, deviceCount: 0 };
+  if (!hueBridgeState || config.lights.hue.bridgeId !== hueBridgeState.id) {
+    return {
+      ...base,
+      state: "unavailable",
+      detail: "Not paired with a Hue bridge",
+      deviceCount: 0,
+      code: "notPaired",
+    };
+  }
+  const area = HUE_AREAS.find((a) => a.id === config.lights.hue.areaId);
+  if (!area) {
+    return { ...base, state: "unavailable", detail: "Choose a Hue area", deviceCount: 0, code: "noArea" };
+  }
+  return { ...base, state: "connected", detail: "Connected", deviceCount: area.lightCount };
+}
+
+function lights(): LightStatus[] {
+  return [icueStatus(), hueStatus()];
 }
 
 export const getConfig = async (): Promise<Config> => config;
@@ -104,7 +145,12 @@ export const getConfig = async (): Promise<Config> => config;
 export async function setConfig(next: Config): Promise<Config> {
   const previous = config;
   config = validated(next);
-  if (previous.lights.icue.enabled !== config.lights.icue.enabled) emit("lights://status", lights());
+  if (
+    previous.lights.icue.enabled !== config.lights.icue.enabled ||
+    previous.lights.hue.enabled !== config.lights.hue.enabled
+  ) {
+    emit("lights://status", lights());
+  }
   return config;
 }
 
@@ -157,6 +203,58 @@ export async function installIcueSdk(): Promise<LightStatus[]> {
   const list = lights();
   emit("lights://status", list);
   return list;
+}
+
+function setHueConfig(bridgeId: string | null, areaId: string | null): Config {
+  config = { ...config, lights: { ...config.lights, hue: { ...config.lights.hue, bridgeId, areaId } } };
+  emit("lights://status", lights());
+  return config;
+}
+
+export async function hueDiscover(): Promise<BridgeCandidate[]> {
+  await delay(1800);
+  return params.get("hue") === "nobridge" ? [] : [{ ...HUE_BRIDGE }];
+}
+
+export async function hueProbe(address: string): Promise<BridgeCandidate> {
+  await delay(500);
+  const host = address.trim();
+  if (host === HUE_BRIDGE.address) return { ...HUE_BRIDGE };
+  if (/^\d{1,3}(\.\d{1,3}){3}(:\d+)?$/.test(host)) {
+    throw `Could not reach a Hue bridge at ${host}. Check the address and that this PC is on the same network.`;
+  }
+  throw "Enter the bridge's IP address, for example 192.168.1.23.";
+}
+
+export async function huePair(address: string): Promise<HueBridge> {
+  huePairAttempts += 1;
+  if (huePairAttempts === 1) {
+    await delay(8000);
+    throw "The link button was not pressed in time.";
+  }
+  await delay(4000);
+  hueBridgeState = { ...HUE_BRIDGE, address: address.trim() || HUE_BRIDGE.address };
+  const bridgeChanged = config.lights.hue.bridgeId !== hueBridgeState.id;
+  setHueConfig(hueBridgeState.id, bridgeChanged ? null : config.lights.hue.areaId);
+  return hueBridgeState;
+}
+
+export const hueBridge = async (): Promise<HueBridge | null> => hueBridgeState;
+
+export async function hueListAreas(): Promise<HueArea[]> {
+  await delay(400);
+  if (!hueBridgeState) throw "Not paired with a Hue bridge.";
+  return HUE_AREAS;
+}
+
+export async function hueSelectArea(areaId: string): Promise<Config> {
+  if (!hueBridgeState) throw "Not paired with a Hue bridge.";
+  return setHueConfig(hueBridgeState.id, areaId);
+}
+
+export async function hueForget(): Promise<Config> {
+  hueBridgeState = null;
+  return setHueConfig(null, null);
 }
 
 export const listLights = async (): Promise<LightStatus[]> => lights();

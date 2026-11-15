@@ -63,7 +63,7 @@ export const STEPS: readonly Step[] = [
   {
     id: "lights",
     title: "Connect your lights",
-    summary: "Glowdrift looks for supported lights on this PC.",
+    summary: "Glowdrift looks for Corsair iCUE on this PC. To use Philips Hue, pair your bridge below. You can also do this later on the Lights page.",
     body: <LightsPanel />,
   },
   {
