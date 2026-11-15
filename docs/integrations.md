@@ -1,12 +1,12 @@
 # Lighting integrations
 
 Glowdrift computes one smoothed colour. An integration is a way of getting that colour onto lights. There are
-three routes. Only the first is being implemented; the other two are plans and may change.
+three routes. The first two are implemented; the third is a plan and may change.
 
 | Route | Status | Control | Needs |
 | --- | --- | --- | --- |
 | 1. Corsair iCUE SDK, direct | In development | Glowdrift sets colours itself | iCUE installed and running |
-| 2. Philips Hue, local bridge API | Planned | Glowdrift sets colours itself | A Hue bridge on the local network |
+| 2. Philips Hue, local bridge API | Implemented | Glowdrift sets colours itself | A Hue bridge on the local network |
 | 3. Virtual display | Planned, optional | Another app samples a display that Glowdrift fills | A virtual display driver you install yourself |
 
 ## 1. Corsair iCUE SDK (default)
@@ -64,24 +64,46 @@ Changing the pinned version means updating the URL and both checksums in `apps/d
 
 ## 2. Philips Hue through the bridge's local API
 
-**Planned. Nothing here is implemented.**
+**Implemented.** Glowdrift talks to the bridge's local CLIP v2 REST API; no Hue account or cloud login is involved.
+Entertainment streaming is deferred; see [ADR 0003](adr/0003-hue-output-rest-first.md) for the reasoning.
 
-The intent is to talk to a Hue bridge directly on the local network rather than going through Hue Sync.
+How it works in Glowdrift:
 
-- Pairing uses the bridge's local authorisation (pressing the link button), and the resulting application key is
-  stored in the app's data on this PC.
-- For slow changes, the bridge's ordinary lighting API can set light colours. It is rate limited, so it suits a
-  calm, heavily smoothed colour, not rapid changes.
-- Hue also offers an Entertainment streaming mode for low-latency, high-rate updates to lights in an
-  entertainment area. It needs an area configured in the Hue app, a streaming session to the bridge, and the
-  bridge only allows limited concurrent streams. Whether Glowdrift needs streaming, given its slow fades, is an
-  open question.
+- **Discovery.** The Lights page's "Find bridge" browses mDNS (`_hue._tcp.local`). Only when mDNS finds nothing is
+  Signify's discovery service (`discovery.meethue.com`) asked, which sends the PC's public address to the
+  internet. A bridge can also be entered by address; its public `/api/0/config` is read to identify it.
+- **Pairing.** The user presses Pair, then the bridge's link button. Glowdrift polls the bridge every 2 s for up to
+  30 s and gives up with "The link button was not pressed in time." The bridge returns an application key and a
+  client key.
+- **Trust.** Bridge certificates are not signed by a public CA, so the SHA-256 of the bridge's leaf certificate is
+  recorded when pairing (trust on first use). Every later connection must present exactly that certificate; a
+  changed certificate is refused and the light shows an error until the user pairs again.
+- **Credentials.** The address, bridge id, application key, client key and certificate pin are stored encrypted for
+  the current Windows user (DPAPI) in `hue-bridge.bin` in the app data directory, never in `config.json`.
+  `config.json` keeps only `lights.hue.enabled`, `bridgeId` and `areaId`. A file that cannot be decrypted, or one
+  whose bridge id differs from `bridgeId`, counts as not paired. "Forget bridge" deletes the file.
+- **Target.** The user picks one room, zone or entertainment area; its lights receive the colour. Entertainment
+  areas are used only as a group of lights here.
+- **Output.** For each light, `PUT /clip/v2/resource/light/{id}` with on/off, brightness, CIE xy colour (clamped
+  into the light's gamut) and a transition. At most 10 requests per second go out in total, one light per slot in
+  round-robin order, so a light is refreshed every `lights x 100 ms`. That period is also the transition time and
+  the light's minimum send interval, so the bridge fades between updates. Only the latest colour is kept; nothing
+  queues. Brightness is the largest 8-bit colour channel as a percentage (at least 1 %); a colour whose largest
+  channel is below 3 turns the light off.
+- **Status.** The light reports `notPaired` or `noArea` (status codes) until a bridge and area are set. An
+  unreachable bridge shows as `unavailable` and is retried with a growing delay (1 s up to 30 s); an area that no
+  longer exists is reported as `noArea` and retried the same way. A rejected application key, a changed
+  certificate or unusable stored details show as `error` and are not retried until the user pairs again.
+- Disabling the light, or pausing the engine, stops the requests. The lights keep the last colour they were
+  given.
 
 Trade-offs:
 
-- Local control, no cloud account involved.
-- Requires the bridge and the PC to be on the same network.
-- Running at the same time as Hue Sync may conflict over the same lights; the details have not been tested.
+- Local control, no cloud account involved. The bridge and the PC must be on the same network.
+- The bridge's rate limit makes this suit calm, heavily smoothed colour; a large area refreshes each light less
+  often.
+- Running at the same time as Hue Sync or another app that sets the same lights may conflict; the details have not
+  been tested.
 
 ## 3. Virtual display for screen-sampling apps
 
