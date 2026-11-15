@@ -22,7 +22,7 @@ function EngineCard() {
           <p className="muted-text">
             {status.running
               ? `Measured capture rate: ${formatFps(status.measuredFps)}${config ? ` of ${config.captureFps} fps` : ""}`
-              : "Your lights keep their last colour while paused."}
+              : "Paused: Hue lights return to how they were, iCUE keeps its last colour."}
           </p>
         </div>
         <button type="button" className="btn btn--primary" onClick={() => void toggleEngine()}>

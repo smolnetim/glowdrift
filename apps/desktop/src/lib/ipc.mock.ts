@@ -10,14 +10,19 @@ import { CAPTURE_FPS_MAX, CAPTURE_FPS_MIN, DEFAULT_CONFIG, SATURATION_MAX, SMOOT
 import { clamp } from "./format";
 import type {
   AppInfo,
+  AreaLightZone,
   BridgeCandidate,
+  BridgeLight,
   ColorEvent,
   Config,
   EngineStatus,
   HueArea,
   HueBridge,
+  LightPosition,
   LightStatus,
   MonitorInfo,
+  NormRect,
+  Rgb,
   Thumbnail,
 } from "./ipc";
 import type { AvailableUpdate } from "./system";
@@ -32,12 +37,68 @@ const MONITORS: MonitorInfo[] = [
 
 const HUE_BRIDGE: HueBridge = { id: "0017881A2B3C", address: "192.168.1.23", name: "Philips hue" };
 
-const HUE_AREAS: HueArea[] = [
-  { id: "room-living", kind: "room", name: "Living room", lightCount: 4 },
-  { id: "room-office", kind: "room", name: "Office", lightCount: 2 },
-  { id: "zone-tv", kind: "zone", name: "TV wall", lightCount: 3 },
-  { id: "ent-desk", kind: "entertainment", name: "Desk setup", lightCount: 5 },
+const HUE_AREAS: HueArea[] = [{ id: "ent-desk", kind: "entertainment", name: "Desk setup", lightCount: 2 }];
+
+/** Entertainment area members with their channel positions. */
+const AREA_MEMBERS: Record<string, { id: string; position: LightPosition }[]> = {
+  "ent-desk": [
+    { id: "lamp-left", position: { x: -0.8, y: 0.2, z: 0.3 } },
+    { id: "lamp-right", position: { x: 0.8, y: 0.2, z: 0.3 } },
+  ],
+};
+
+const BRIDGE_LIGHTS: BridgeLight[] = [
+  { id: "lamp-left", name: "Left desk lamp" },
+  { id: "lamp-right", name: "Right desk lamp" },
+  { id: "lamp-shelf", name: "Shelf lamp" },
+  { id: "lamp-hall", name: "Hallway light" },
 ];
+
+const lightName = (id: string): string => BRIDGE_LIGHTS.find((l) => l.id === id)?.name ?? id;
+
+/** The Rust defaults: 1/3 wide, 2/3 tall around (x + 1) / 2, (1 - z) / 2; extras 1/5 wide, full height, centred. */
+function defaultZone(position: LightPosition | null): NormRect {
+  if (!position) return { x: 0.4, y: 0, width: 0.2, height: 1 };
+  const width = 1 / 3;
+  const height = 2 / 3;
+  const cx = (position.x + 1) / 2;
+  const cy = (1 - position.z) / 2;
+  return {
+    x: clamp(cx - width / 2, 0, 1 - width),
+    y: clamp(cy - height / 2, 0, 1 - height),
+    width,
+    height,
+  };
+}
+
+function clampRect(rect: NormRect): NormRect {
+  const width = clamp(rect.width, 0.01, 1);
+  const height = clamp(rect.height, 0.01, 1);
+  return { x: clamp(rect.x, 0, 1 - width), y: clamp(rect.y, 0, 1 - height), width, height };
+}
+
+function areaLights(): AreaLightZone[] {
+  const hue = config.lights.hue;
+  if (!hue.enabled || !hueBridgeState || hue.bridgeId !== hueBridgeState.id) return [];
+  const members = (hue.areaId ? AREA_MEMBERS[hue.areaId] : undefined) ?? [];
+  const entries = [
+    ...members.map((m) => ({ id: m.id, position: m.position, source: "entertainment" as const })),
+    ...hue.extraLights
+      .filter((id) => !members.some((m) => m.id === id))
+      .map((id) => ({ id, position: null, source: "extra" as const })),
+  ];
+  return entries.map(({ id, position, source }) => {
+    const override = hue.zones[id];
+    return {
+      id,
+      name: lightName(id),
+      position,
+      zone: override ? clampRect(override) : defaultZone(position),
+      custom: override !== undefined,
+      source,
+    };
+  });
+}
 
 let config: Config = { ...DEFAULT_CONFIG, onboardingComplete: params.has("onboarded") };
 let running = true;
@@ -49,6 +110,7 @@ if (params.get("hue") === "paired") {
   config = { ...config, lights: { ...config.lights, hue: { ...config.lights.hue, bridgeId: HUE_BRIDGE.id } } };
 }
 let engineColor: ColorEvent = { target: "#000000", smoothed: "#000000" };
+const zoneColors = new Map<string, Rgb>();
 
 type Handler = (payload: unknown) => void;
 const handlers = new Map<string, Set<Handler>>();
@@ -134,10 +196,11 @@ function hueStatus(): LightStatus {
     };
   }
   const area = HUE_AREAS.find((a) => a.id === config.lights.hue.areaId);
-  if (!area) {
+  const lightCount = areaLights().length;
+  if (!area && lightCount === 0) {
     return { ...base, state: "unavailable", detail: "Choose a Hue area", deviceCount: 0, code: "noArea" };
   }
-  return { ...base, state: "connected", detail: "Connected", deviceCount: area.lightCount };
+  return { ...base, state: "connected", detail: "Connected", deviceCount: lightCount };
 }
 
 function lights(): LightStatus[] {
@@ -151,7 +214,8 @@ export async function setConfig(next: Config): Promise<Config> {
   config = validated(next);
   if (
     previous.lights.icue.enabled !== config.lights.icue.enabled ||
-    previous.lights.hue.enabled !== config.lights.hue.enabled
+    previous.lights.hue.enabled !== config.lights.hue.enabled ||
+    previous.lights.hue.extraLights.join() !== config.lights.hue.extraLights.join()
   ) {
     emit("lights://status", lights());
   }
@@ -251,6 +315,14 @@ export async function hueListAreas(): Promise<HueArea[]> {
   return HUE_AREAS;
 }
 
+export async function hueListLights(): Promise<BridgeLight[]> {
+  await delay(400);
+  if (!hueBridgeState) throw "Not paired with a Hue bridge.";
+  return BRIDGE_LIGHTS;
+}
+
+export const hueAreaLights = async (): Promise<AreaLightZone[]> => areaLights();
+
 export async function hueSelectArea(areaId: string): Promise<Config> {
   if (!hueBridgeState) throw "Not paired with a Hue bridge.";
   return setHueConfig(hueBridgeState.id, areaId);
@@ -291,7 +363,18 @@ setInterval(() => {
   const target = SCENES[scene] ?? "#000000";
   const weight = 1 - Math.exp(-TICK_MS / Math.max(config.smoothingMs, 1));
   engineColor = { target, smoothed: mix(engineColor.smoothed, target, weight) };
-  emit("engine://color", engineColor);
+  const zones = areaLights().map((light, i) => {
+    const zoneTarget = SCENES[(scene + i + 1) % SCENES.length] ?? "#000000";
+    const from = zoneColors.get(light.id) ?? { r: 0, g: 0, b: 0 };
+    const next = {
+      r: Math.round(from.r + (channel(zoneTarget, 0) - from.r) * weight),
+      g: Math.round(from.g + (channel(zoneTarget, 1) - from.g) * weight),
+      b: Math.round(from.b + (channel(zoneTarget, 2) - from.b) * weight),
+    };
+    zoneColors.set(light.id, next);
+    return next;
+  });
+  emit("engine://color", { ...engineColor, zones });
 }, TICK_MS);
 
 let autostart = false;

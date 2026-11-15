@@ -1,18 +1,17 @@
 import { useEffect, useRef, useState } from "react";
-import type { ColorEvent } from "../lib/ipc";
-import { getLiveColor, useLiveHexRef } from "../lib/liveColor";
+import { type LiveColorKind, getLiveColor, useLiveHexRef } from "../lib/liveColor";
 import { Icon } from "./Icon";
 
 const COPIED_MS = 1400;
 
 /** Hex text that follows the live colour without re-rendering. */
-export function LiveHex({ kind }: { kind: keyof ColorEvent }) {
+export function LiveHex({ kind }: { kind: LiveColorKind }) {
   const ref = useLiveHexRef(kind);
   return <span ref={ref} className="mono">{getLiveColor()[kind]}</span>;
 }
 
 interface ColorChipProps {
-  kind: keyof ColorEvent;
+  kind: LiveColorKind;
   label: string;
   size: "large" | "small";
 }

@@ -109,12 +109,44 @@ export interface HueBridge {
 
 export type HueAreaKind = "room" | "zone" | "entertainment";
 
-/** A room, zone or entertainment area whose lights can receive the colour. */
+/** An entertainment area; its lights receive the colour. */
 export interface HueArea {
   id: string;
   kind: HueAreaKind;
   name: string;
   lightCount: number;
+}
+
+/** Hue entertainment coordinates, each -1..1: x left to right, y back to front, z floor to ceiling. */
+export interface LightPosition {
+  x: number;
+  y: number;
+  z: number;
+}
+
+/** A light on the bridge that is not necessarily part of the chosen area. */
+export interface BridgeLight {
+  id: string;
+  name: string;
+}
+
+/** A Hue light that receives its own screen zone. */
+export interface AreaLightZone {
+  id: string;
+  name: string;
+  /** Entertainment area position; null for extra lights. */
+  position: LightPosition | null;
+  /** Effective zone (the override, or the default), as fractions of the monitor. */
+  zone: NormRect;
+  /** True when `lights.hue.zones` overrides the default. */
+  custom: boolean;
+  source: "entertainment" | "extra";
+}
+
+export interface Rgb {
+  r: number;
+  g: number;
+  b: number;
 }
 
 export interface AppInfo {
@@ -125,6 +157,8 @@ export interface AppInfo {
 export interface ColorEvent {
   target: HexColor;
   smoothed: HexColor;
+  /** Smoothed colour per Hue light, in the order of `hueAreaLights`. */
+  zones?: Rgb[];
 }
 
 export interface UpdaterReadyEvent {
@@ -184,8 +218,15 @@ export const huePair = (address: string) =>
   call<HueBridge>("hue_pair", { address }, (m) => m.huePair(address));
 /** The paired bridge, or null when not paired. */
 export const hueBridge = () => call<HueBridge | null>("hue_bridge", undefined, (m) => m.hueBridge());
-/** Rooms, zones and entertainment areas of the paired bridge. */
+/** Entertainment areas of the paired bridge. */
 export const hueListAreas = () => call<HueArea[]>("hue_list_areas", undefined, (m) => m.hueListAreas());
+/** Every light on the paired bridge, colour-capable lights first. */
+export const hueListLights = () => call<BridgeLight[]>("hue_list_lights", undefined, (m) => m.hueListLights());
+/**
+ * The lights receiving their own zone (entertainment area first, then extra lights) with their effective
+ * zones. Empty until the area is resolved. No bridge request is made.
+ */
+export const hueAreaLights = () => call<AreaLightZone[]>("hue_area_lights", undefined, (m) => m.hueAreaLights());
 export const hueSelectArea = (areaId: string) =>
   call<Config>("hue_select_area", { areaId }, (m) => m.hueSelectArea(areaId));
 /** Deletes the stored bridge credentials and clears the bridge and area from the config. */

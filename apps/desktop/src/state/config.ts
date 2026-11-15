@@ -1,5 +1,5 @@
 import { DEFAULT_CONFIG } from "../lib/defaults";
-import { type Config, type LightKind, getConfig, setConfig } from "../lib/ipc";
+import { type Config, type LightKind, type NormRect, getConfig, setConfig } from "../lib/ipc";
 import { createStore } from "../lib/store";
 
 interface ConfigState {
@@ -60,6 +60,30 @@ export function setLightEnabled(kind: LightKind, enabled: boolean): void {
   patchConfig({ lights: { ...config.lights, [kind]: { ...config.lights[kind], enabled } } });
 }
 
+function patchHue(change: (hue: Config["lights"]["hue"]) => Partial<Config["lights"]["hue"]>): void {
+  const config = configStore.get().config;
+  if (!config) return;
+  const hue = config.lights.hue;
+  patchConfig({ lights: { ...config.lights, hue: { ...hue, ...change(hue) } } });
+}
+
+/** Sets one Hue light's zone override (a fraction of the monitor), or removes it with `null`. */
+export function setHueZone(lightId: string, rect: NormRect | null): void {
+  patchHue(({ zones }) => {
+    const { [lightId]: _removed, ...rest } = zones;
+    return { zones: rect ? { ...rest, [lightId]: rect } : rest };
+  });
+}
+
+/** Removes every Hue zone override. */
+export function clearHueZones(): void {
+  patchHue(() => ({ zones: {} }));
+}
+
+export function setHueExtraLights(extraLights: string[]): void {
+  patchHue(() => ({ extraLights }));
+}
+
 /**
  * Takes the Hue bridge and area chosen by the shell into the local config and leaves every other
  * local edit, including ones still waiting to be saved, untouched.
@@ -87,12 +111,12 @@ export function flushConfig(): void {
   void save();
 }
 
-/** Restores every setting except onboarding state, which stays complete, and the paired Hue bridge and area. */
+/** Restores every setting except onboarding state, which stays complete, and the paired Hue bridge, area and extra lights. */
 export function resetConfig(): void {
-  const { bridgeId, areaId } = configStore.get().config?.lights.hue ?? DEFAULT_CONFIG.lights.hue;
+  const { bridgeId, areaId, extraLights } = configStore.get().config?.lights.hue ?? DEFAULT_CONFIG.lights.hue;
   patchConfig({
     ...DEFAULT_CONFIG,
     onboardingComplete: true,
-    lights: { ...DEFAULT_CONFIG.lights, hue: { ...DEFAULT_CONFIG.lights.hue, bridgeId, areaId } },
+    lights: { ...DEFAULT_CONFIG.lights, hue: { ...DEFAULT_CONFIG.lights.hue, bridgeId, areaId, extraLights } },
   });
 }

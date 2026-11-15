@@ -8,9 +8,9 @@ import { patchConfig } from "../state/config";
 export function Capture() {
   const config = useConfig();
   return (
-    <Page title="Capture" description="Choose which part of which display Glowdrift watches.">
+    <Page title="Capture" description="Choose which display Glowdrift watches, which part of it drives iCUE, and where each Hue light looks.">
       <Card>
-        <ScreenRegionPicker />
+        <ScreenRegionPicker withZones />
       </Card>
       <Card>
         <SliderField

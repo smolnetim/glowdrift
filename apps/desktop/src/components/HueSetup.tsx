@@ -1,16 +1,19 @@
 import { type FormEvent, useEffect, useId, useRef, useState } from "react";
+import { useAreaLights } from "../hooks/useAreaLights";
 import { useConfig } from "../hooks/useConfig";
 import {
   type BridgeCandidate,
+  type BridgeLight,
   type HueArea,
-  type HueAreaKind,
   type HueBridge,
   type LightStatus,
   hueDiscover,
   hueListAreas,
+  hueListLights,
   hueProbe,
 } from "../lib/ipc";
 import { useStore } from "../lib/store";
+import { setHueExtraLights } from "../state/config";
 import {
   PAIR_WINDOW_S,
   chooseArea,
@@ -25,12 +28,6 @@ import { ChoiceGroup } from "./controls";
 
 const bridgeLabel = (bridge: { name: string | null }) => bridge.name ?? "Hue bridge";
 const lightsText = (count: number) => `${count} ${count === 1 ? "light" : "lights"}`;
-
-const AREA_GROUPS: { kind: HueAreaKind; label: string }[] = [
-  { kind: "room", label: "Rooms" },
-  { kind: "zone", label: "Zones" },
-  { kind: "entertainment", label: "Entertainment areas" },
-];
 
 type Discovery = { phase: "idle" } | { phase: "working" } | { phase: "done" } | { phase: "failed"; message: string };
 
@@ -206,7 +203,7 @@ function BridgeFinder({ known, onPaired }: { known: HueBridge | null; onPaired: 
   );
 }
 
-/** Rooms, zones and entertainment areas to choose from, grouped by kind. */
+/** Entertainment areas to choose from. */
 function AreaPicker({
   areas,
   loading,
@@ -255,7 +252,10 @@ function AreaPicker({
       <h3 ref={heading} tabIndex={-1}>
         Choose where the colour goes
       </h3>
-      <p className="muted-text">Pick the room, zone or entertainment area whose lights should follow your screen.</p>
+      <p className="muted-text">
+        Pick the entertainment area whose lights should follow your screen. Each light&apos;s place on the screen
+        comes from the positions set up for the area in the Hue app (Entertainment areas).
+      </p>
       {loading && (
         <p className="muted-text" role="status">
           Loading areas…
@@ -272,34 +272,32 @@ function AreaPicker({
         </>
       )}
       {!loading && !error && areas.length === 0 && (
-        <p role="status">No rooms, zones or entertainment areas were found. Create one in the Hue app first.</p>
+        <p role="status">
+          No entertainment areas were found. Create one in the Hue app first: Settings, Entertainment areas.
+        </p>
       )}
-      {AREA_GROUPS.map(({ kind, label }) => {
-        const group = areas.filter((a) => a.kind === kind);
-        if (group.length === 0) return null;
-        return (
-          <fieldset className="choice-group hue-area-group" key={kind}>
-            <legend className="section-label">{label}</legend>
-            <div className="choice-grid choice-grid--auto">
-              {group.map((area) => (
-                <label className="choice" key={area.id}>
-                  <input
-                    type="radio"
-                    name="hue-area"
-                    value={area.id}
-                    checked={area.id === selected}
-                    onChange={() => setPicked(area.id)}
-                  />
-                  <span className="choice-body">
-                    <span className="choice-title">{area.name}</span>
-                    <span className="choice-description">{lightsText(area.lightCount)}</span>
-                  </span>
-                </label>
-              ))}
-            </div>
-          </fieldset>
-        );
-      })}
+      {areas.length > 0 && (
+        <fieldset className="choice-group hue-area-group">
+          <legend className="section-label">Entertainment areas</legend>
+          <div className="choice-grid choice-grid--auto">
+            {areas.map((area) => (
+              <label className="choice" key={area.id}>
+                <input
+                  type="radio"
+                  name="hue-area"
+                  value={area.id}
+                  checked={area.id === selected}
+                  onChange={() => setPicked(area.id)}
+                />
+                <span className="choice-body">
+                  <span className="choice-title">{area.name}</span>
+                  <span className="choice-description">{lightsText(area.lightCount)}</span>
+                </span>
+              </label>
+            ))}
+          </div>
+        </fieldset>
+      )}
       {saveError && <p role="alert">{saveError}</p>}
       {areas.length > 0 && (
         <div className="update-actions">
@@ -316,6 +314,105 @@ function AreaPicker({
               Cancel
             </button>
           )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Single bridge lights driven in addition to the area, each with its own zone. */
+function ExtraLights() {
+  const config = useConfig();
+  const areaLights = useAreaLights();
+  const extras = config.lights.hue.extraLights;
+  const [lights, setLights] = useState<BridgeLight[]>([]);
+  const [state, setState] = useState<AreasState>({ phase: "loading" });
+  const [choice, setChoice] = useState("");
+  const selectId = useId();
+
+  async function load() {
+    setState({ phase: "loading" });
+    try {
+      setLights(await hueListLights());
+      setState({ phase: "ready" });
+    } catch (error) {
+      setState({ phase: "failed", message: errorMessage(error, "The bridge's lights could not be loaded.") });
+    }
+  }
+
+  useEffect(() => {
+    void load();
+  }, []);
+
+  const inArea = new Set(areaLights.filter((l) => l.source === "entertainment").map((l) => l.id));
+  const available = lights.filter((l) => !inArea.has(l.id) && !extras.includes(l.id));
+  const nameOf = (id: string) => lights.find((l) => l.id === id)?.name ?? "Unknown light";
+  const picked = available.some((l) => l.id === choice) ? choice : (available[0]?.id ?? "");
+
+  return (
+    <div className="help hue-flow">
+      <h3>Extra lights</h3>
+      <p className="muted-text">
+        Add single lights that are not in the entertainment area, such as a desk lamp. Place each light&apos;s zone on
+        the Capture page; it starts in the middle of the display.
+      </p>
+      {extras.length > 0 && (
+        <ul className="zone-list">
+          {extras.map((id) => (
+            <li key={id} className="zone-row">
+              <span className="zone-pick zone-pick--static">
+                <span className="zone-name">{nameOf(id)}</span>
+              </span>
+              <button
+                type="button"
+                className="btn btn--subtle"
+                aria-label={`Remove ${nameOf(id)}`}
+                onClick={() => setHueExtraLights(extras.filter((e) => e !== id))}
+              >
+                Remove
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {state.phase === "loading" && (
+        <p className="muted-text" role="status">
+          Loading lights…
+        </p>
+      )}
+      {state.phase === "failed" && (
+        <>
+          <p role="alert">{state.message}</p>
+          <div className="update-actions">
+            <button type="button" className="btn" onClick={() => void load()}>
+              Try again
+            </button>
+          </div>
+        </>
+      )}
+      {state.phase === "ready" && available.length === 0 && (
+        <p className="muted-text">No other lights are available to add.</p>
+      )}
+      {state.phase === "ready" && available.length > 0 && (
+        <div className="text-field-row">
+          <label className="visually-hidden" htmlFor={selectId}>
+            Light to add
+          </label>
+          <select id={selectId} className="text-input" value={picked} onChange={(e) => setChoice(e.currentTarget.value)}>
+            {available.map((l) => (
+              <option key={l.id} value={l.id}>
+                {l.name}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            className="btn"
+            disabled={!picked}
+            onClick={() => setHueExtraLights([...extras, picked])}
+          >
+            Add light
+          </button>
         </div>
       )}
     </div>
@@ -451,10 +548,12 @@ export function HueSetup({ light }: { light: LightStatus }) {
         </div>
       )}
 
+      <ExtraLights />
+
       <ConfirmDialog
         open={confirmForget}
         title="Forget this bridge?"
-        message="Glowdrift deletes its pairing with this bridge and stops sending colour to Hue. Your lights keep their current colour. You can pair again at any time."
+        message="Glowdrift deletes its pairing with this bridge and stops sending colour to Hue. Your lights return to how they were before Glowdrift started. You can pair again at any time."
         confirmLabel="Forget bridge"
         onConfirm={() => void forget()}
         onCancel={() => setConfirmForget(false)}
