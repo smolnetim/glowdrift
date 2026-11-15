@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread;
 use std::time::Duration;
 
-use glowdrift_core::{LightsConfig, Rgb};
+use glowdrift_core::{LightsConfig, NormRect, Rgb};
+use glowdrift_lights::hue::{HUE_LIGHT_ID, HueLight};
 use glowdrift_lights::icue::{ICUE_LIGHT_ID, IcueLight};
 use glowdrift_lights::{Light, LightState, LightStatus};
 use tauri::{AppHandle, Manager};
@@ -16,6 +17,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const PAUSED_DETAIL: &str = "Paused";
 
 type StatusEmitter = Box<dyn Fn(&[LightStatus]) + Send + Sync>;
+type ZoneSink = Box<dyn Fn(Vec<NormRect>) + Send + Sync>;
 
 /// The `icue-sdk` folder in the app data directory, where a downloaded SDK library is stored.
 pub fn icue_sdk_dir(app: &AppHandle) -> Option<PathBuf> {
@@ -37,16 +39,28 @@ pub fn icue_dll_dirs(app: &AppHandle) -> Vec<PathBuf> {
     dirs
 }
 
-/// Builds the default set of lights.
-pub fn default_lights(app: &AppHandle) -> Vec<Box<dyn Light>> {
-    vec![Box::new(IcueLight::with_dll_dirs(icue_dll_dirs(app)))]
+/// Builds the default set of lights around the already created Hue light.
+pub fn default_lights(app: &AppHandle, hue: HueLight) -> Vec<Box<dyn Light>> {
+    vec![
+        Box::new(IcueLight::with_dll_dirs(icue_dll_dirs(app))),
+        Box::new(hue),
+    ]
 }
 
 fn is_wanted(id: &str, config: &LightsConfig) -> bool {
     match id {
         ICUE_LIGHT_ID => config.icue.enabled,
+        HUE_LIGHT_ID => config.hue.enabled,
         _ => false,
     }
+}
+
+/// Where a light's zones sit in the combined zone list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Span {
+    generation: u64,
+    offset: usize,
+    len: usize,
 }
 
 struct Slot {
@@ -54,6 +68,8 @@ struct Slot {
     wanted: bool,
     applied: Option<bool>,
     was_connected: bool,
+    /// The light's slice of the zone list; `None` for a light that only uses the whole colour.
+    span: Option<Span>,
 }
 
 impl Slot {
@@ -70,6 +86,48 @@ struct Inner {
     slots: Vec<Slot>,
     paused: bool,
     closed: bool,
+    /// The zones of all active lights, concatenated in slot order.
+    rects: Vec<NormRect>,
+}
+
+/// What changed when the zone layouts were re-read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ZoneChange {
+    /// The combined zone rectangles differ.
+    rects: bool,
+    /// The generation of some light's layout differs.
+    generations: bool,
+}
+
+impl Inner {
+    /// Collects the zone layouts of the active lights and reports what changed.
+    fn refresh_zones(&mut self) -> ZoneChange {
+        let active = !self.paused && !self.closed;
+        let mut rects = Vec::new();
+        let mut generations = false;
+        for slot in &mut self.slots {
+            let layout = (active && slot.wanted)
+                .then(|| slot.light.zone_layout())
+                .flatten();
+            let previous = slot.span.map(|span| span.generation);
+            slot.span = layout.map(|layout| {
+                let span = Span {
+                    generation: layout.generation,
+                    offset: rects.len(),
+                    len: layout.zones.len(),
+                };
+                rects.extend(layout.zones);
+                span
+            });
+            generations |= previous != slot.span.map(|span| span.generation);
+        }
+        let change = ZoneChange {
+            rects: rects != self.rects,
+            generations,
+        };
+        self.rects = rects;
+        change
+    }
 }
 
 /// Shared handle to all lights. Methods never block on device I/O beyond what the
@@ -79,6 +137,7 @@ pub struct LightsManager {
     last_emitted: Mutex<Option<Vec<LightStatus>>>,
     resend: AtomicBool,
     emit: StatusEmitter,
+    zone_sink: Mutex<Option<ZoneSink>>,
     poller_stop: Mutex<Option<Sender<()>>>,
 }
 
@@ -105,6 +164,7 @@ impl LightsManager {
                 light,
                 applied: None,
                 was_connected: false,
+                span: None,
             })
             .collect();
         let manager = Arc::new(Self {
@@ -112,10 +172,12 @@ impl LightsManager {
                 slots,
                 paused: false,
                 closed: false,
+                rects: Vec::new(),
             }),
             last_emitted: Mutex::new(None),
             resend: AtomicBool::new(false),
             emit: Box::new(emit),
+            zone_sink: Mutex::new(None),
             poller_stop: Mutex::new(None),
         });
         {
@@ -124,8 +186,36 @@ impl LightsManager {
             for slot in &mut inner.slots {
                 slot.sync_enabled(paused);
             }
+            inner.refresh_zones();
         }
         manager
+    }
+
+    /// The combined zones of all active lights, in the order of the zone colours accepted by
+    /// [`set_colors`](Self::set_colors).
+    pub fn zone_rects(&self) -> Vec<NormRect> {
+        lock(&self.inner).rects.clone()
+    }
+
+    /// Registers the receiver of zone changes, called with the new combined zones whenever they
+    /// change. The receiver runs under the manager's lock and must not block or call back into
+    /// the manager.
+    pub fn set_zone_sink(&self, sink: impl Fn(Vec<NormRect>) + Send + Sync + 'static) {
+        *lock(&self.zone_sink) = Some(Box::new(sink));
+    }
+
+    /// Re-reads the lights' zone layouts. Tells the zone sink when the combined zones changed.
+    /// When only a layout's generation changed, asks for a resend: colours sent for the old
+    /// generation made the light show the whole colour, and a static picture would not send again.
+    fn refresh_zones(&self, inner: &mut Inner) {
+        let change = inner.refresh_zones();
+        if change.rects {
+            if let Some(sink) = lock(&self.zone_sink).as_ref() {
+                sink(inner.rects.clone());
+            }
+        } else if change.generations {
+            self.resend.store(true, Ordering::Release);
+        }
     }
 
     /// Starts the background status poller (about once per second).
@@ -157,6 +247,7 @@ impl LightsManager {
                 slot.wanted = is_wanted(slot.light.id(), config);
                 slot.sync_enabled(paused);
             }
+            self.refresh_zones(&mut inner);
         }
         self.poll();
     }
@@ -169,6 +260,7 @@ impl LightsManager {
             for slot in &mut inner.slots {
                 slot.sync_enabled(paused);
             }
+            self.refresh_zones(&mut inner);
         }
         self.poll();
     }
@@ -189,12 +281,31 @@ impl LightsManager {
 
     /// Sends a colour to every active light.
     pub fn set_color(&self, color: Rgb) {
+        self.set_colors(color, &[]);
+    }
+
+    /// Sends the whole-region colour and the zone colours (in [`zone_rects`](Self::zone_rects)
+    /// order) to every active light. A light with a zone layout gets its own slice of `zones`;
+    /// every other light gets `whole`. When `zones` does not match the current layout (it was
+    /// computed for an older one) every light gets `whole`.
+    pub fn set_colors(&self, whole: Rgb, zones: &[Rgb]) {
         let mut inner = lock(&self.inner);
         if inner.paused || inner.closed {
             return;
         }
+        let matches = zones.len() == inner.rects.len();
         for slot in inner.slots.iter_mut().filter(|s| s.wanted) {
-            if let Err(e) = slot.light.set_color(color) {
+            let own = slot.span.filter(|_| matches).and_then(|span| {
+                Some((
+                    span.generation,
+                    zones.get(span.offset..span.offset + span.len)?,
+                ))
+            });
+            let sent = match own {
+                Some((generation, own)) => slot.light.set_zone_colors(generation, whole, own),
+                None => slot.light.set_color(whole),
+            };
+            if let Err(e) = sent {
                 log::debug!("light {}: {e}", slot.light.id());
             }
         }
@@ -256,6 +367,7 @@ impl LightsManager {
                 }
                 slot.was_connected = connected;
             }
+            self.refresh_zones(&mut inner);
             Self::collect(&inner)
         };
         let mut last = lock(&self.last_emitted);
@@ -276,6 +388,7 @@ impl LightsManager {
         for slot in &mut inner.slots {
             slot.light.shutdown();
             slot.applied = None;
+            slot.span = None;
         }
         log::info!("lights released");
     }
@@ -285,6 +398,7 @@ impl LightsManager {
 mod tests {
     use super::*;
     use glowdrift_core::IcueConfig;
+    use std::sync::atomic::AtomicU64;
 
     #[derive(Default)]
     struct Shared {
@@ -343,6 +457,7 @@ mod tests {
     fn config(enabled: bool) -> LightsConfig {
         LightsConfig {
             icue: IcueConfig { enabled },
+            ..LightsConfig::default()
         }
     }
 
@@ -471,6 +586,195 @@ mod tests {
             |_| {},
         );
         assert_eq!(manager.fastest_interval(), Some(Duration::from_millis(33)));
+    }
+
+    #[test]
+    fn each_light_follows_its_own_enabled_flag() {
+        let mut lights = config(true);
+        lights.hue.enabled = false;
+        assert!(is_wanted(ICUE_LIGHT_ID, &lights));
+        assert!(!is_wanted(HUE_LIGHT_ID, &lights));
+        lights.hue.enabled = true;
+        assert!(is_wanted(HUE_LIGHT_ID, &lights));
+        assert!(!is_wanted("unknown", &lights));
+    }
+
+    type ZoneCall = (u64, Rgb, Vec<Rgb>);
+
+    /// A Hue-id light with a fixed layout that records what it is sent.
+    struct ZoneFake {
+        zones: Vec<NormRect>,
+        generation: u64,
+        sent: Arc<Mutex<Vec<ZoneCall>>>,
+    }
+
+    impl Light for ZoneFake {
+        fn id(&self) -> &str {
+            HUE_LIGHT_ID
+        }
+        fn status(&self) -> LightStatus {
+            LightStatus {
+                id: HUE_LIGHT_ID.to_owned(),
+                kind: "hue".to_owned(),
+                name: "Zones".to_owned(),
+                enabled: true,
+                state: LightState::Connected,
+                detail: None,
+                device_count: 1,
+                code: None,
+            }
+        }
+        fn min_send_interval(&self) -> Option<Duration> {
+            None
+        }
+        fn set_enabled(&mut self, _: bool) {}
+        fn set_color(&mut self, _: Rgb) -> Result<(), glowdrift_lights::LightError> {
+            Ok(())
+        }
+        fn zone_layout(&self) -> Option<glowdrift_lights::ZoneLayout> {
+            Some(glowdrift_lights::ZoneLayout {
+                generation: self.generation,
+                zones: self.zones.clone(),
+            })
+        }
+        fn set_zone_colors(
+            &mut self,
+            generation: u64,
+            whole: Rgb,
+            zones: &[Rgb],
+        ) -> Result<(), glowdrift_lights::LightError> {
+            lock(&self.sent).push((generation, whole, zones.to_vec()));
+            Ok(())
+        }
+        fn shutdown(&mut self) {}
+    }
+
+    #[test]
+    fn zone_colours_go_to_the_light_with_a_layout_and_the_rest_get_the_whole_colour() {
+        let plain = Arc::new(Mutex::new(Shared::default()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let zones = vec![NormRect::new(0.0, 0.0, 0.5, 1.0), NormRect::full()];
+        let mut lights = config(true);
+        lights.hue.enabled = true;
+        let manager = LightsManager::new(
+            vec![
+                Box::new(Fake(Arc::clone(&plain))),
+                Box::new(ZoneFake {
+                    zones: zones.clone(),
+                    generation: 4,
+                    sent: Arc::clone(&sent),
+                }),
+            ],
+            &lights,
+            |_| {},
+        );
+        assert_eq!(manager.zone_rects(), zones);
+
+        let whole = Rgb::new(9, 9, 9);
+        let colours = [Rgb::new(1, 1, 1), Rgb::new(2, 2, 2)];
+        manager.set_colors(whole, &colours);
+        assert_eq!(lock(&plain).colors, vec![whole]);
+        assert_eq!(*lock(&sent), vec![(4, whole, colours.to_vec())]);
+
+        // Colours for a layout of another size are not applied to this one.
+        manager.set_colors(whole, &colours[..1]);
+        assert_eq!(lock(&sent).len(), 1);
+        assert_eq!(lock(&plain).colors, vec![whole, whole]);
+
+        // A disabled light has no zones.
+        lights.hue.enabled = false;
+        manager.apply_config(&lights);
+        assert_eq!(manager.zone_rects(), Vec::<NormRect>::new());
+    }
+
+    #[test]
+    fn the_zone_sink_hears_about_changes_only() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut lights = config(false);
+        lights.hue.enabled = false;
+        let manager = LightsManager::new(
+            vec![Box::new(ZoneFake {
+                zones: vec![NormRect::full()],
+                generation: 1,
+                sent,
+            })],
+            &lights,
+            |_| {},
+        );
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&heard);
+        manager.set_zone_sink(move |zones| lock(&sink).push(zones));
+        manager.poll();
+        assert!(lock(&heard).is_empty(), "disabled light, no zones");
+
+        lights.hue.enabled = true;
+        manager.apply_config(&lights);
+        manager.poll();
+        assert_eq!(*lock(&heard), vec![vec![NormRect::full()]]);
+
+        manager.set_paused(true);
+        assert_eq!(lock(&heard).len(), 2);
+        assert_eq!(lock(&heard)[1], Vec::<NormRect>::new());
+    }
+
+    /// A Hue-id light whose layout generation the test can change while the zones stay put.
+    struct GenerationFake(Arc<AtomicU64>);
+
+    impl Light for GenerationFake {
+        fn id(&self) -> &str {
+            HUE_LIGHT_ID
+        }
+        fn status(&self) -> LightStatus {
+            LightStatus {
+                id: HUE_LIGHT_ID.to_owned(),
+                kind: "hue".to_owned(),
+                name: "Generation".to_owned(),
+                enabled: true,
+                state: LightState::Connected,
+                detail: None,
+                device_count: 1,
+                code: None,
+            }
+        }
+        fn min_send_interval(&self) -> Option<Duration> {
+            None
+        }
+        fn set_enabled(&mut self, _: bool) {}
+        fn set_color(&mut self, _: Rgb) -> Result<(), glowdrift_lights::LightError> {
+            Ok(())
+        }
+        fn zone_layout(&self) -> Option<glowdrift_lights::ZoneLayout> {
+            Some(glowdrift_lights::ZoneLayout {
+                generation: self.0.load(Ordering::Acquire),
+                zones: vec![NormRect::full()],
+            })
+        }
+        fn shutdown(&mut self) {}
+    }
+
+    #[test]
+    fn a_new_generation_with_the_same_zones_asks_for_a_resend_instead_of_new_zones() {
+        let generation = Arc::new(AtomicU64::new(1));
+        let mut lights = config(false);
+        lights.hue.enabled = true;
+        let manager = LightsManager::new(
+            vec![Box::new(GenerationFake(Arc::clone(&generation)))],
+            &lights,
+            |_| {},
+        );
+        let heard = Arc::new(Mutex::new(0_u32));
+        let counter = Arc::clone(&heard);
+        manager.set_zone_sink(move |_| *lock(&counter) += 1);
+        manager.poll();
+        manager.take_resend();
+
+        manager.poll();
+        assert!(!manager.take_resend(), "nothing changed");
+
+        generation.store(2, Ordering::Release);
+        manager.poll();
+        assert!(manager.take_resend());
+        assert_eq!(*lock(&heard), 0, "the zones did not change");
     }
 
     #[test]

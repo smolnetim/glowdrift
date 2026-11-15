@@ -1,5 +1,5 @@
 import { DEFAULT_CONFIG } from "../lib/defaults";
-import { type Config, getConfig, setConfig } from "../lib/ipc";
+import { type AreaLightZone, type Config, type LightKind, type NormRect, getConfig, setConfig } from "../lib/ipc";
 import { createStore } from "../lib/store";
 
 interface ConfigState {
@@ -53,13 +53,69 @@ export function patchConfig(patch: Partial<Config>): void {
   timer = window.setTimeout(() => void save(), SAVE_DELAY_MS);
 }
 
+/** Turns one light on or off, keeping the rest of that light's settings (such as Hue's bridge and area). */
+export function setLightEnabled(kind: LightKind, enabled: boolean): void {
+  const config = configStore.get().config;
+  if (!config) return;
+  patchConfig({ lights: { ...config.lights, [kind]: { ...config.lights[kind], enabled } } });
+}
+
+function patchHue(change: (hue: Config["lights"]["hue"]) => Partial<Config["lights"]["hue"]>): void {
+  const config = configStore.get().config;
+  if (!config) return;
+  const hue = config.lights.hue;
+  patchConfig({ lights: { ...config.lights, hue: { ...hue, ...change(hue) } } });
+}
+
+/** Sets one Hue light's zone override (a fraction of the monitor); the light then stops following its Hue position. */
+export function setHueZone(lightId: string, rect: NormRect): void {
+  patchHue(({ zones }) => ({ zones: { ...zones, [lightId]: rect } }));
+}
+
+/** Pins each given light's zone to its current Hue position (the override equals `defaultZone`). */
+export function resetHueZones(lights: readonly Pick<AreaLightZone, "id" | "defaultZone">[]): void {
+  patchHue(({ zones }) => ({
+    zones: { ...zones, ...Object.fromEntries(lights.map((light) => [light.id, light.defaultZone])) },
+  }));
+}
+
+export function setHueExtraLights(extraLights: string[]): void {
+  patchHue(() => ({ extraLights }));
+}
+
+/**
+ * Takes the Hue bridge and area chosen by the shell into the local config and leaves every other
+ * local edit, including ones still waiting to be saved, untouched.
+ */
+export function applyHueSelection(stored: Config): void {
+  const state = configStore.get();
+  if (!state.config) {
+    configStore.set({ ...state, config: stored });
+    return;
+  }
+  const { bridgeId, areaId } = stored.lights.hue;
+  version += 1;
+  configStore.set({
+    ...state,
+    config: {
+      ...state.config,
+      lights: { ...state.config.lights, hue: { ...state.config.lights.hue, bridgeId, areaId } },
+    },
+  });
+}
+
 export function flushConfig(): void {
   if (timer === undefined) return;
   window.clearTimeout(timer);
   void save();
 }
 
-/** Restores every setting except onboarding state, which stays complete. */
+/** Restores every setting except onboarding state, which stays complete, and the paired Hue bridge, area and extra lights. */
 export function resetConfig(): void {
-  patchConfig({ ...DEFAULT_CONFIG, onboardingComplete: true });
+  const { bridgeId, areaId, extraLights } = configStore.get().config?.lights.hue ?? DEFAULT_CONFIG.lights.hue;
+  patchConfig({
+    ...DEFAULT_CONFIG,
+    onboardingComplete: true,
+    lights: { ...DEFAULT_CONFIG.lights, hue: { ...DEFAULT_CONFIG.lights.hue, bridgeId, areaId, extraLights } },
+  });
 }

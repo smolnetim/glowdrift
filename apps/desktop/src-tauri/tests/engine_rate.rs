@@ -78,13 +78,14 @@ impl Light for RateLight {
 struct Quiet;
 
 impl EngineEvents for Quiet {
-    fn color(&self, _target: Rgb, _smoothed: Rgb) {}
+    fn color(&self, _target: Rgb, _smoothed: Rgb, _zones: &[Rgb]) {}
     fn status(&self, _status: &EngineStatus) {}
 }
 
 fn lights_config(enabled: bool) -> LightsConfig {
     LightsConfig {
         icue: IcueConfig { enabled },
+        ..LightsConfig::default()
     }
 }
 

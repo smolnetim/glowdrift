@@ -4,6 +4,9 @@ pub mod commands;
 pub mod config_store;
 pub mod engine;
 pub mod frame_source;
+pub mod hue;
+pub mod hue_commands;
+pub mod hue_store;
 pub mod icue_sdk;
 pub mod lights_manager;
 pub mod per_machine;
@@ -25,6 +28,7 @@ use tauri_plugin_log::{RotationStrategy, Target, TargetKind};
 use commands::{AppState, ColorEvent, events};
 use config_store::ConfigStore;
 use engine::{EngineEvents, EngineHandle, EngineStatus};
+use hue::HueState;
 use lights_manager::{LightsManager, default_lights};
 
 /// Argument passed by the autostart entry.
@@ -45,10 +49,11 @@ struct TauriEvents {
 }
 
 impl EngineEvents for TauriEvents {
-    fn color(&self, target: Rgb, smoothed: Rgb) {
+    fn color(&self, target: Rgb, smoothed: Rgb, zones: &[Rgb]) {
         let payload = ColorEvent {
             target: target.to_hex(),
             smoothed: smoothed.to_hex(),
+            zones: zones.to_vec(),
         };
         let _ = self.app.emit(events::COLOR, payload);
     }
@@ -106,10 +111,15 @@ fn initialise(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let store = ConfigStore::new(app.path().app_config_dir()?);
     let config = store.load();
 
+    let (hue_light, hue) = HueState::start(app.path().app_data_dir()?, &config.lights.hue);
     let emit_handle = handle.clone();
-    let lights = LightsManager::new(default_lights(&handle), &config.lights, move |statuses| {
-        let _ = emit_handle.emit(events::LIGHTS_STATUS, statuses);
-    });
+    let lights = LightsManager::new(
+        default_lights(&handle, hue_light),
+        &config.lights,
+        move |statuses| {
+            let _ = emit_handle.emit(events::LIGHTS_STATUS, statuses);
+        },
+    );
     lights.start_poller();
 
     let pause_item = tray::build(&handle)?;
@@ -131,6 +141,7 @@ fn initialise(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         store,
         engine,
         lights,
+        hue,
         pending_update: Mutex::new(None),
         show_on_load: AtomicBool::new(!start_hidden),
         quitting: AtomicBool::new(false),
@@ -211,6 +222,16 @@ pub fn run() {
             commands::install_icue_sdk,
             commands::frontend_ready,
             commands::stage_update,
+            hue_commands::hue_discover,
+            hue_commands::hue_probe,
+            hue_commands::hue_pair,
+            hue_commands::hue_bridge,
+            hue_commands::hue_list_areas,
+            hue_commands::hue_select_area,
+            hue_commands::hue_forget,
+            hue_commands::hue_area_lights,
+            hue_commands::hue_refresh_area_lights,
+            hue_commands::hue_list_lights,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Glowdrift");

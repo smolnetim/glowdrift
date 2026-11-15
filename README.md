@@ -14,7 +14,7 @@ Early development, pre-1.0. Everything here is subject to change.
 | Average and dominant colour, exponential smoothing, brightness and saturation | In development |
 | Corsair iCUE light (official iCUE SDK) | In development |
 | System tray, start minimised, auto-update | In development |
-| Philips Hue light | Planned |
+| Philips Hue light (local bridge API) | In development |
 | Virtual-display fallback for apps that can only sample a screen | Planned |
 
 See [docs/integrations.md](docs/integrations.md) for what each lighting route does and what is implemented.
@@ -63,7 +63,8 @@ Details are in [docs/architecture.md](docs/architecture.md).
 
 - **Corsair iCUE**: controlled directly through the official iCUE SDK. No virtual display is needed.
   iCUE must be installed and running.
-- **Philips Hue** (planned): through the Hue bridge's local API.
+- **Philips Hue**: through the Hue bridge's local API. Pair once by pressing the bridge's link button; no Hue
+  account is used.
 - **Virtual display** (planned, optional): a display that other screen-sampling apps can be pointed at, for
   lights that cannot be controlled any other way.
 
@@ -73,9 +74,11 @@ Details are in [docs/architecture.md](docs/architecture.md).
   record, store, or upload screenshots.
 - The window can show a thumbnail of a monitor so you can choose a region. That thumbnail is generated locally and
   only passed to the app's own window.
-- There is no telemetry. Glowdrift makes two kinds of network request: the update check and download against
-  GitHub Releases (which you can disable), and, only when you press the button on the Lights page, the download
-  of Corsair's iCUE SDK library from Corsair's GitHub release, which is verified before use.
+- There is no telemetry. Glowdrift makes these network requests: the update check and download against GitHub
+  Releases (which you can disable); only when you press the button on the Lights page, the download of Corsair's
+  iCUE SDK library from Corsair's GitHub release, which is verified before use; and, if you use Philips Hue,
+  requests to your Hue bridge on the local network. Searching for a bridge asks Signify's discovery service
+  only when the local search finds none.
 - The configuration is a small JSON file in the app's config directory.
 
 ## Build from source
@@ -110,7 +113,7 @@ is set, because the bundle config enables them. See [CONTRIBUTING.md](CONTRIBUTI
 ```
 crates/glowdrift-core/      Colour maths, reduction, smoothing, config schema and validation (platform independent)
 crates/glowdrift-capture/   Windows monitor enumeration and DXGI Desktop Duplication capture
-crates/glowdrift-lights/   Light trait and lights (iCUE now; Hue and virtual display later)
+crates/glowdrift-lights/   Light trait and lights (iCUE and Hue; virtual display later)
 apps/desktop/               Tauri v2 app: React + TypeScript frontend (src/) and Rust shell (src-tauri/)
 docs/                       Architecture, update policy, release process, integrations
 scripts/                    Version bump and release helper scripts

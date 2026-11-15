@@ -665,3 +665,81 @@
   color: var(--text-muted);
   transform: translateY(-50%);
 }
+
+/* Hue setup */
+
+.hue-flow {
+  gap: 14px;
+}
+
+.hue-step {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.hue-step + .hue-step {
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.hue-address {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.hue-waiting {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.hue-countdown {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.hue-countdown .progress {
+  flex: 1;
+  max-width: 260px;
+}
+
+.hue-area-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.text-field {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.text-field-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.text-input {
+  flex: 1;
+  min-width: 160px;
+  padding: 7px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.text-input:focus-visible {
+  border-color: var(--accent);
+  outline: none;
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.text-input[aria-invalid="true"] {
+  border-color: var(--danger);
+}

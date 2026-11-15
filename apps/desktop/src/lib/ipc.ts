@@ -33,7 +33,18 @@ export interface Config {
   brightness: number;
   /** 0..=2 */
   saturation: number;
-  lights: { icue: { enabled: boolean } };
+  lights: {
+    icue: { enabled: boolean };
+    hue: {
+      enabled: boolean;
+      bridgeId: string | null;
+      areaId: string | null;
+      /** Hue light id -> zone override, as fractions of the monitor. */
+      zones: Record<string, NormRect>;
+      /** Ids of single bridge lights driven in addition to the area. */
+      extraLights: string[];
+    };
+  };
   startMinimized: boolean;
   autoUpdate: boolean;
 }
@@ -64,11 +75,11 @@ export interface EngineStatus {
   smoothed: HexColor;
 }
 
-export type LightKind = "icue";
+export type LightKind = "icue" | "hue";
 export type LightState = "connected" | "connecting" | "unavailable" | "error" | "disabled";
 
 /** Machine-readable cause behind a light state; `detail` is for display only. */
-export type LightCode = "libraryMissing";
+export type LightCode = "libraryMissing" | "notPaired" | "noArea";
 
 export interface LightStatus {
   id: string;
@@ -82,6 +93,64 @@ export interface LightStatus {
   code?: LightCode | null;
 }
 
+/** A Hue bridge found on the network. */
+export interface BridgeCandidate {
+  id: string;
+  address: string;
+  name: string | null;
+}
+
+/** The paired Hue bridge; carries no secrets. */
+export interface HueBridge {
+  id: string;
+  address: string;
+  name: string | null;
+}
+
+export type HueAreaKind = "entertainment";
+
+/** An entertainment area; its lights receive the colour. */
+export interface HueArea {
+  id: string;
+  kind: HueAreaKind;
+  name: string;
+  lightCount: number;
+}
+
+/** Hue entertainment coordinates, each -1..1: x left to right, y back to front, z floor to ceiling. */
+export interface LightPosition {
+  x: number;
+  y: number;
+  z: number;
+}
+
+/** A light on the bridge that is not necessarily part of the chosen area. */
+export interface BridgeLight {
+  id: string;
+  name: string;
+}
+
+/** A Hue light that receives its own screen zone. */
+export interface AreaLightZone {
+  id: string;
+  name: string;
+  /** Entertainment area position; null for extra lights. */
+  position: LightPosition | null;
+  /** Effective zone (the override, or the default), as fractions of the monitor. */
+  zone: NormRect;
+  /** The zone from the light's current Hue position, whether or not it is overridden. */
+  defaultZone: NormRect;
+  /** True when `lights.hue.zones` overrides the default. */
+  custom: boolean;
+  source: "entertainment" | "extra";
+}
+
+export interface Rgb {
+  r: number;
+  g: number;
+  b: number;
+}
+
 export interface AppInfo {
   version: string;
   name: string;
@@ -90,6 +159,8 @@ export interface AppInfo {
 export interface ColorEvent {
   target: HexColor;
   smoothed: HexColor;
+  /** Smoothed colour per Hue light, in the order of `hueAreaLights`. */
+  zones?: Rgb[];
 }
 
 export interface UpdaterReadyEvent {
@@ -136,6 +207,38 @@ export const updateNeedsElevation = () =>
  */
 export const installIcueSdk = () =>
   call<LightStatus[]>("install_icue_sdk", undefined, (m) => m.installIcueSdk());
+/** Looks for Hue bridges on the network (mDNS, then the Hue discovery service); takes about 4 s. */
+export const hueDiscover = () => call<BridgeCandidate[]>("hue_discover", undefined, (m) => m.hueDiscover());
+/** Reads a manually entered bridge address. Rejects with a user-presentable message. */
+export const hueProbe = (address: string) =>
+  call<BridgeCandidate>("hue_probe", { address }, (m) => m.hueProbe(address));
+/**
+ * Pairs with the bridge at `address`: the user must press the bridge's link button while this runs
+ * (it waits up to 30 s). Rejects with a user-presentable message, including on timeout.
+ */
+export const huePair = (address: string) =>
+  call<HueBridge>("hue_pair", { address }, (m) => m.huePair(address));
+/** The paired bridge, or null when not paired. */
+export const hueBridge = () => call<HueBridge | null>("hue_bridge", undefined, (m) => m.hueBridge());
+/** Entertainment areas of the paired bridge. */
+export const hueListAreas = () => call<HueArea[]>("hue_list_areas", undefined, (m) => m.hueListAreas());
+/** The lights of the paired bridge that are not in the chosen area, colour-capable lights first. */
+export const hueListLights = () => call<BridgeLight[]>("hue_list_lights", undefined, (m) => m.hueListLights());
+/**
+ * The lights receiving their own zone (entertainment area first, then extra lights) with their effective
+ * zones. Empty until the area is resolved. No bridge request is made.
+ */
+export const hueAreaLights = () => call<AreaLightZone[]>("hue_area_lights", undefined, (m) => m.hueAreaLights());
+/**
+ * Re-reads the light positions from the bridge and resolves with the fresh list (like `hueAreaLights`).
+ * Takes up to ~5 s; rejects with a user-presentable message, for example when not paired.
+ */
+export const hueRefreshAreaLights = () =>
+  call<AreaLightZone[]>("hue_refresh_area_lights", undefined, (m) => m.hueRefreshAreaLights());
+export const hueSelectArea = (areaId: string) =>
+  call<Config>("hue_select_area", { areaId }, (m) => m.hueSelectArea(areaId));
+/** Deletes the stored bridge credentials and clears the bridge and area from the config. */
+export const hueForget = () => call<Config>("hue_forget", undefined, (m) => m.hueForget());
 /** Tells the shell the first screen is rendered so it can show the window. */
 export const frontendReady = () => call<void>("frontend_ready", undefined, () => Promise.resolve());
 /** Downloads and verifies an available update and stages it; resolves its version, or null when none. */

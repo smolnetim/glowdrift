@@ -1,74 +1,57 @@
 /* Live colour surfaces: all colour comes from CSS variables updated by script. */
 
-.hero {
-  position: relative;
-  padding: 28px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  background: var(--surface);
-  isolation: isolate;
+.section-title {
+  font-size: 15px;
 }
 
-.hero-glow {
-  position: absolute;
-  inset: -40px;
-  z-index: -1;
-  border-radius: 48px;
-  background: radial-gradient(closest-side, color-mix(in srgb, var(--live) 70%, transparent), transparent);
-  filter: blur(40px);
-  opacity: 0.55;
-  pointer-events: none;
-}
-
-.hero-swatches {
+.tile-grid {
   display: grid;
-  grid-template-columns: minmax(0, 2.2fr) minmax(0, 1fr);
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
   gap: 16px;
 }
 
-.color-chip {
+.light-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+}
+
+.tile-swatch {
   display: flex;
   flex-direction: column;
   justify-content: space-between;
   gap: 12px;
-  min-height: 220px;
-  padding: 16px 18px;
+  min-height: 140px;
+  padding: 12px 14px;
   border: 1px solid var(--border-strong);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius);
+  background: transparent;
   text-align: left;
 }
 
-.color-chip--smoothed {
-  background: var(--live);
-  color: var(--live-ink);
-}
-
-.color-chip--target {
-  background: var(--live-target);
-  color: var(--live-target-ink);
-}
-
-.color-chip-label {
-  font-weight: 600;
-}
-
-.color-chip-value {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.color-chip--large .mono {
-  font-size: 28px;
+.tile-swatch .mono {
+  font-size: 22px;
   letter-spacing: 0.02em;
 }
 
-.color-chip--small .mono {
-  font-size: 18px;
+.tile-swatch--empty {
+  align-items: flex-start;
+  border-style: dashed;
 }
 
-.color-chip-copy {
+.light-tile--paused .tile-swatch {
+  opacity: 0.5;
+}
+
+.tile-name {
+  font-weight: 600;
+}
+
+.tile-copy {
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -76,7 +59,7 @@
   opacity: 0.85;
 }
 
-.color-chip:focus-visible {
+.tile-swatch:focus-visible {
   outline-offset: 3px;
 }
 

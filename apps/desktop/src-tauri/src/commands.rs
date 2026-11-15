@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use glowdrift_capture::{Frame, MonitorInfo};
-use glowdrift_core::Config;
+use glowdrift_core::{Config, Rgb};
 use glowdrift_lights::icue::ICUE_LIGHT_ID;
 use glowdrift_lights::{LightCode, LightStatus};
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,7 @@ use tauri::{AppHandle, State};
 use crate::config_store::ConfigStore;
 pub use crate::engine::EngineStatus;
 use crate::engine::{EngineHandle, describe_capture_error};
+use crate::hue::HueState;
 use crate::icue_sdk;
 use crate::lights_manager::{self, LightsManager};
 use crate::per_machine;
@@ -51,6 +52,9 @@ pub struct AppInfo {
 pub struct ColorEvent {
     pub target: String,
     pub smoothed: String,
+    /// Smoothed colour of each light zone as `{ r, g, b }`, in layout order; empty without zones.
+    #[serde(default)]
+    pub zones: Vec<Rgb>,
 }
 
 /// Event names emitted by the shell.
@@ -67,6 +71,7 @@ pub struct AppState {
     pub store: ConfigStore,
     pub engine: EngineHandle,
     pub lights: Arc<LightsManager>,
+    pub hue: HueState,
     pub pending_update: Mutex<Option<PendingUpdate>>,
     /// True until the main window has been shown for the first time (and when it must be).
     pub show_on_load: AtomicBool,
@@ -97,6 +102,10 @@ impl AppState {
         self.engine.set_running(!running);
     }
 
+    pub fn hue_config(&self) -> glowdrift_core::config::HueConfig {
+        lock(&self.config).lights.hue.clone()
+    }
+
     pub fn auto_update_enabled(&self) -> bool {
         lock(&self.config).auto_update
     }
@@ -111,17 +120,39 @@ pub fn get_config(state: State<'_, AppState>) -> Config {
     lock(&state.config).clone()
 }
 
-#[tauri::command]
-pub async fn set_config(config: Config, state: State<'_, AppState>) -> Result<Config, String> {
-    let config = config.validated();
+/// Applies `change` to the stored configuration, validates it, hands it to the engine and the
+/// Hue light, and persists it. Returns the resulting configuration.
+pub(crate) fn update_config(
+    state: &AppState,
+    change: impl FnOnce(&mut Config),
+) -> Result<Config, String> {
     let mut stored = lock(&state.config);
+    let mut config = stored.clone();
+    change(&mut config);
+    let config = config.validated();
     *stored = config.clone();
+    state.hue.sync(&config.lights.hue);
     state.engine.apply_config(config.clone());
     state
         .store
         .save(&config)
         .map_err(|e| format!("Settings were applied but could not be saved: {e}"))?;
     Ok(config)
+}
+
+/// Replaces `stored` with `config`, except that the Hue bridge and area stay as stored: only the
+/// Hue commands change them, so a copy of the configuration sent from the UI cannot undo them.
+fn replace_config(stored: &mut Config, config: Config) {
+    let bridge_id = stored.lights.hue.bridge_id.take();
+    let area_id = stored.lights.hue.area_id.take();
+    *stored = config;
+    stored.lights.hue.bridge_id = bridge_id;
+    stored.lights.hue.area_id = area_id;
+}
+
+#[tauri::command]
+pub async fn set_config(config: Config, state: State<'_, AppState>) -> Result<Config, String> {
+    update_config(&state, |stored| replace_config(stored, config))
 }
 
 #[tauri::command]
@@ -277,6 +308,63 @@ pub async fn stage_update(app: AppHandle) -> Result<Option<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn color_event_carries_the_zone_colours() {
+        let event = ColorEvent {
+            target: "#000000".to_owned(),
+            smoothed: "#010203".to_owned(),
+            zones: vec![Rgb::new(255, 0, 0), Rgb::new(0, 0, 255)],
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            json["zones"],
+            serde_json::json!([{ "r": 255, "g": 0, "b": 0 }, { "r": 0, "g": 0, "b": 255 }])
+        );
+        let old: ColorEvent =
+            serde_json::from_str(r##"{"target":"#000000","smoothed":"#000000"}"##).unwrap();
+        assert_eq!(old.zones, Vec::<Rgb>::new());
+    }
+
+    #[test]
+    fn set_config_keeps_the_stored_hue_selection() {
+        let mut stored = Config::default();
+        stored.lights.hue.bridge_id = Some("bridge".to_owned());
+        stored.lights.hue.area_id = Some("area".to_owned());
+        let mut sent = Config::default();
+        sent.lights.hue.enabled = true;
+        sent.lights.hue.area_id = Some("stale".to_owned());
+        sent.brightness = 0.5;
+        replace_config(&mut stored, sent);
+        assert!(stored.lights.hue.enabled);
+        assert_eq!(stored.brightness, 0.5);
+        assert_eq!(stored.lights.hue.bridge_id.as_deref(), Some("bridge"));
+        assert_eq!(stored.lights.hue.area_id.as_deref(), Some("area"));
+    }
+
+    #[test]
+    fn set_config_keeps_the_zones_and_extra_lights_of_the_incoming_config() {
+        let mut stored = Config::default();
+        stored.lights.hue.bridge_id = Some("bridge".to_owned());
+        stored
+            .lights
+            .hue
+            .zones
+            .insert("old".to_owned(), glowdrift_core::NormRect::full());
+        stored.lights.hue.extra_lights = vec!["old".to_owned()];
+        let mut sent = Config::default();
+        let zone = glowdrift_core::NormRect::new(0.1, 0.2, 0.3, 0.4);
+        sent.lights.hue.zones.insert("new".to_owned(), zone);
+        sent.lights.hue.extra_lights = vec!["new".to_owned()];
+        replace_config(&mut stored, sent);
+        assert_eq!(
+            stored.lights.hue.zones.keys().collect::<Vec<_>>(),
+            vec!["new"]
+        );
+        assert_eq!(stored.lights.hue.zones["new"], zone);
+        assert_eq!(stored.lights.hue.extra_lights, vec!["new"]);
+        assert_eq!(stored.lights.hue.bridge_id.as_deref(), Some("bridge"));
+    }
 
     fn frame(width: u32, height: u32, stride: usize, data: Vec<u8>) -> Frame {
         Frame {

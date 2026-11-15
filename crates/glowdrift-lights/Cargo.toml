@@ -1,6 +1,6 @@
 [package]
 name = "glowdrift-lights"
-description = "Ambient lights for Glowdrift (iCUE now; Hue and virtual display later)."
+description = "Ambient lights for Glowdrift (iCUE and Philips Hue; virtual display later)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,9 +14,17 @@ glowdrift-core = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true, features = ["blocking", "json"] }
+rustls = { workspace = true, features = ["std", "tls12"] }
+sha2 = { workspace = true }
+mdns-sd = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 libloading = { workspace = true }
+
+[dev-dependencies]
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
 
 [lints]
 workspace = true
