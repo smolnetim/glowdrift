@@ -1,5 +1,5 @@
 import type { CSSProperties } from "react";
-import type { LightState } from "./ipc";
+import type { LightState, Rgb } from "./ipc";
 
 export const clamp = (value: number, min: number, max: number): number =>
   Math.min(max, Math.max(min, value));
@@ -25,12 +25,6 @@ export const LIGHT_STATE_LABEL: Record<LightState, string> = {
 /** Typed helper for passing CSS custom properties through the `style` prop. */
 export function cssVars(vars: Record<`--${string}`, string | number>): CSSProperties {
   return vars as CSSProperties;
-}
-
-export interface Rgb {
-  r: number;
-  g: number;
-  b: number;
 }
 
 export function parseHex(hex: string): Rgb | null {

@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import type { ColorEvent } from "./ipc";
+import type { ColorEvent, Rgb } from "./ipc";
 import { clamp, luminance } from "./format";
 
 /**
@@ -8,12 +8,15 @@ import { clamp, luminance } from "./format";
  */
 type Listener = (color: ColorEvent) => void;
 
+/** The hex colours of the live event. */
+export type LiveColorKind = "target" | "smoothed";
+
 const INK_LIGHT = "#ffffff";
 const INK_DARK = "#111114";
 /** Luminance at which black and white text have equal contrast. */
 const INK_THRESHOLD = 0.179;
 
-let current: ColorEvent = { target: "#000000", smoothed: "#000000" };
+let current: ColorEvent = { target: "#000000", smoothed: "#000000", zones: [] };
 let frame = 0;
 const listeners = new Set<Listener>();
 
@@ -32,9 +35,16 @@ function flush(): void {
   for (const listener of listeners) listener(current);
 }
 
+const sameZones = (a: readonly Rgb[], b: readonly Rgb[]): boolean =>
+  a === b || (a.length === b.length && a.every((c, i) => c.r === b[i]?.r && c.g === b[i]?.g && c.b === b[i]?.b));
+
+/** An event without `zones` (such as an engine status) leaves the last known zone colours in place. */
 export function pushLiveColor(next: ColorEvent): void {
-  if (next.target === current.target && next.smoothed === current.smoothed) return;
-  current = next;
+  const zones = next.zones ?? current.zones ?? [];
+  if (next.target === current.target && next.smoothed === current.smoothed && sameZones(zones, current.zones ?? [])) {
+    return;
+  }
+  current = { target: next.target, smoothed: next.smoothed, zones };
   if (!frame) frame = requestAnimationFrame(flush);
 }
 
@@ -50,7 +60,7 @@ export function subscribeLiveColor(listener: Listener): () => void {
 }
 
 /** Writes the live hex string into the returned ref's element without re-rendering. */
-export function useLiveHexRef(kind: keyof ColorEvent) {
+export function useLiveHexRef(kind: LiveColorKind) {
   const ref = useRef<HTMLSpanElement>(null);
   useEffect(
     () =>
@@ -61,3 +71,6 @@ export function useLiveHexRef(kind: keyof ColorEvent) {
   );
   return ref;
 }
+
+/** CSS colour for a live zone swatch. */
+export const rgbCss = (c: Rgb): string => `rgb(${c.r} ${c.g} ${c.b})`;

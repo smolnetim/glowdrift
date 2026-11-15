@@ -1,13 +1,16 @@
+import { useState } from "react";
+import { useAreaLights } from "../hooks/useAreaLights";
 import { useMonitors } from "../hooks/useMonitors";
 import { useThumbnail } from "../hooks/useThumbnail";
 import { useConfig } from "../hooks/useConfig";
 import type { MonitorInfo, NormRect } from "../lib/ipc";
 import { REGION_PRESETS, clampRegion, sameRegion } from "../lib/region";
-import { patchConfig } from "../state/config";
+import { patchConfig, setHueZone } from "../state/config";
 import { ChoiceGroup } from "./controls";
 import { Icon } from "./Icon";
+import { LightZones } from "./LightZones";
 import { PercentField } from "./PercentField";
-import { RegionEditor } from "./RegionEditor";
+import { type EditorBox, REGION_BOX_ID, RegionEditor } from "./RegionEditor";
 
 const FALLBACK_ASPECT = 16 / 9;
 /** Thumbnails smaller than this are placeholders, not a usable picture. */
@@ -28,9 +31,14 @@ function MonitorPicker({ monitors, selectedId }: { monitors: MonitorInfo[]; sele
   );
 }
 
-/** Display picker plus region editor, shared by setup and the Capture page. */
-export function ScreenRegionPicker() {
+/**
+ * Display picker plus the preview editor, shared by setup and the Capture page. With `withZones`, the
+ * preview also carries one box per Hue light.
+ */
+export function ScreenRegionPicker({ withZones = false }: { withZones?: boolean }) {
   const config = useConfig();
+  const areaLights = useAreaLights();
+  const [selection, setSelection] = useState(REGION_BOX_ID);
   const { monitors, loading: monitorsLoading, failed: monitorsFailed, refresh: refreshMonitors } = useMonitors();
   const { thumbnail, loading, failed, refresh: refreshThumbnail } = useThumbnail(config.monitorId);
 
@@ -47,6 +55,21 @@ export function ScreenRegionPicker() {
 
   const setRegion = (region: NormRect) => patchConfig({ region });
   const { region } = config;
+  const hueZones = config.lights.hue.zones;
+  const zoneLights = withZones ? areaLights : [];
+
+  const boxes: EditorBox[] = [
+    { id: REGION_BOX_ID, label: "iCUE", rect: region },
+    ...zoneLights.map((light, colorIndex) => ({
+      id: light.id,
+      label: light.name,
+      rect: hueZones[light.id] ?? light.zone,
+      colorIndex,
+    })),
+  ];
+  const multi = boxes.length > 1;
+  const selectedId = boxes.some((b) => b.id === selection) ? selection : REGION_BOX_ID;
+  const changeBox = (id: string, rect: NormRect) => (id === REGION_BOX_ID ? setRegion(rect) : setHueZone(id, rect));
 
   const pixels = (fraction: number, total: number | undefined): string =>
     total ? ` (${Math.round(fraction * total)} px)` : "";
@@ -85,19 +108,33 @@ export function ScreenRegionPicker() {
           </button>
         </div>
         <RegionEditor
-          region={region}
+          boxes={boxes}
+          selectedId={selectedId}
           imageUrl={thumbnailUsable ? thumbnail.dataUrl : null}
           aspectRatio={aspectRatio}
           busy={loading}
-          onChange={setRegion}
+          onSelect={setSelection}
+          onChange={changeBox}
         />
         {failed && <p className="muted-text">Could not capture a preview of this display. You can still set the region.</p>}
         <p className="region-summary" aria-live="polite">
-          Watching {Math.round(region.width * 100)}%{pixels(region.width, selected?.width)} wide by{" "}
+          {multi ? "iCUE watches" : "Watching"} {Math.round(region.width * 100)}%{pixels(region.width, selected?.width)} wide by{" "}
           {Math.round(region.height * 100)}%{pixels(region.height, selected?.height)} tall.
         </p>
       </div>
 
+      {withZones && (
+        <LightZones
+          lights={zoneLights}
+          zones={hueZones}
+          hueEnabled={config.lights.hue.enabled}
+          hasArea={config.lights.hue.areaId !== null || config.lights.hue.extraLights.length > 0}
+          selectedId={selectedId}
+          onSelect={setSelection}
+        />
+      )}
+
+      {multi && <div className="section-label">iCUE region</div>}
       <div className="preset-row" role="group" aria-label="Region presets">
         {REGION_PRESETS.map((preset) => (
           <button
