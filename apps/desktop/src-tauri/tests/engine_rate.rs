@@ -78,7 +78,7 @@ impl Light for RateLight {
 struct Quiet;
 
 impl EngineEvents for Quiet {
-    fn color(&self, _target: Rgb, _smoothed: Rgb) {}
+    fn color(&self, _target: Rgb, _smoothed: Rgb, _zones: &[Rgb]) {}
     fn status(&self, _status: &EngineStatus) {}
 }
 
