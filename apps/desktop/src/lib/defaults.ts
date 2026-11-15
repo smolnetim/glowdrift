@@ -12,7 +12,7 @@ export const DEFAULT_CONFIG: Config = {
   saturation: 1,
   lights: {
     icue: { enabled: true },
-    hue: { enabled: false, bridgeId: null, areaId: null },
+    hue: { enabled: false, bridgeId: null, areaId: null, zones: {}, extraLights: [] },
   },
   startMinimized: true,
   autoUpdate: true,

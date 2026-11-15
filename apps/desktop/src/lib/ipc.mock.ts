@@ -84,6 +84,10 @@ function validated(next: Config): Config {
         ...next.lights.hue,
         bridgeId: next.lights.hue.bridgeId?.trim() || null,
         areaId: next.lights.hue.areaId?.trim() || null,
+        zones: next.lights.hue.zones ?? {},
+        extraLights: [
+          ...new Set((next.lights.hue.extraLights ?? []).map((id) => id.trim()).filter(Boolean)),
+        ],
       },
     },
   };

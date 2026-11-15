@@ -322,6 +322,30 @@ mod tests {
         assert_eq!(stored.lights.hue.area_id.as_deref(), Some("area"));
     }
 
+    #[test]
+    fn set_config_keeps_the_zones_and_extra_lights_of_the_incoming_config() {
+        let mut stored = Config::default();
+        stored.lights.hue.bridge_id = Some("bridge".to_owned());
+        stored
+            .lights
+            .hue
+            .zones
+            .insert("old".to_owned(), glowdrift_core::NormRect::full());
+        stored.lights.hue.extra_lights = vec!["old".to_owned()];
+        let mut sent = Config::default();
+        let zone = glowdrift_core::NormRect::new(0.1, 0.2, 0.3, 0.4);
+        sent.lights.hue.zones.insert("new".to_owned(), zone);
+        sent.lights.hue.extra_lights = vec!["new".to_owned()];
+        replace_config(&mut stored, sent);
+        assert_eq!(
+            stored.lights.hue.zones.keys().collect::<Vec<_>>(),
+            vec!["new"]
+        );
+        assert_eq!(stored.lights.hue.zones["new"], zone);
+        assert_eq!(stored.lights.hue.extra_lights, vec!["new"]);
+        assert_eq!(stored.lights.hue.bridge_id.as_deref(), Some("bridge"));
+    }
+
     fn frame(width: u32, height: u32, stride: usize, data: Vec<u8>) -> Frame {
         Frame {
             data,

@@ -35,7 +35,15 @@ export interface Config {
   saturation: number;
   lights: {
     icue: { enabled: boolean };
-    hue: { enabled: boolean; bridgeId: string | null; areaId: string | null };
+    hue: {
+      enabled: boolean;
+      bridgeId: string | null;
+      areaId: string | null;
+      /** Hue light id -> zone override, as fractions of the monitor. */
+      zones: Record<string, NormRect>;
+      /** Ids of single bridge lights driven in addition to the area. */
+      extraLights: string[];
+    };
   };
   startMinimized: boolean;
   autoUpdate: boolean;
