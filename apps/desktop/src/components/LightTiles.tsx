@@ -42,8 +42,10 @@ function LiveTile({ name, colorIndex, paused, children }: LiveTileProps) {
   useEffect(() => () => window.clearTimeout(timer.current), []);
 
   const copy = () => {
+    const text = hex.current?.textContent;
+    if (!text?.startsWith("#")) return;
     navigator.clipboard
-      .writeText(hex.current?.textContent ?? "")
+      .writeText(text)
       .then(() => {
         setCopied(true);
         window.clearTimeout(timer.current);
@@ -82,8 +84,12 @@ function IdleTile({ name, status, children }: { name: string; status?: LightStat
   );
 }
 
+/** The shell reports a wanted light as disabled while the engine is paused; a light the user turned off is not enabled. */
+const isPaused = (status: LightStatus): boolean => status.state === "disabled" && status.enabled;
+
 const idleText = (status: LightStatus | undefined, fallback: string): string => {
   if (!status) return "Checking…";
+  if (isPaused(status)) return status.detail ?? "Paused";
   if (status.state === "disabled") return "Turned off. Turn it on on the Lights page.";
   if (status.state === "connecting") return "Connecting…";
   return status.detail ?? fallback;
@@ -97,10 +103,11 @@ export function LightTiles() {
   const icue = lights.find((l) => l.kind === "icue");
   const hue = lights.find((l) => l.kind === "hue");
   const paused = !engine.running;
+  const shows = (status: LightStatus): boolean => status.state === "connected" || (paused && isPaused(status));
 
   return (
     <ul className="tile-grid" aria-label="Colour sent to each light">
-      {icue?.state === "connected" ? (
+      {icue && shows(icue) ? (
         <LiveTile name={icue.name} paused={paused}>
           Whole region · target <LiveHex kind="target" />
         </LiveTile>
@@ -109,7 +116,7 @@ export function LightTiles() {
           {idleText(icue, "Not connected.")}
         </IdleTile>
       )}
-      {hue?.state === "connected" && areaLights.length > 0 ? (
+      {hue && shows(hue) && areaLights.length > 0 ? (
         areaLights.map((light, index) => (
           <LiveTile key={light.id} name={light.name} colorIndex={index} paused={paused}>
             Philips Hue · own zone
@@ -117,7 +124,7 @@ export function LightTiles() {
         ))
       ) : (
         <IdleTile name={hue?.name ?? "Philips Hue"} status={hue}>
-          {hue?.state === "connected" ? "Waiting for its lights…" : idleText(hue, "Not connected.")}
+          {hue?.state === "connected" && !paused ? "Waiting for its lights…" : idleText(hue, "Not connected.")}
         </IdleTile>
       )}
     </ul>
