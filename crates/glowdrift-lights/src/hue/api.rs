@@ -588,7 +588,7 @@ mod tests {
     #[test]
     fn bridge_ids_are_uppercased() {
         assert_eq!(
-            normalize_bridge_id(" ecb5faFFfe30688b "),
+            normalize_bridge_id(" aabbccFFfe112233 "),
             "AABBCCFFFE112233"
         );
     }
