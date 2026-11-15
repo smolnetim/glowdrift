@@ -255,8 +255,8 @@ impl HueHandle {
     }
 
     /// [`HueHandle::refresh`], then waits until the worker has handled it or `timeout` has
-    /// passed; returns whether it was handled (`false` also when the worker has stopped). Blocks the calling thread, so call it from a
-    /// blocking thread, not from an async runtime thread.
+    /// passed; returns whether it was handled (`false` also when the worker has stopped). Blocks
+    /// the calling thread, so call it from a blocking thread, not from an async runtime thread.
     pub fn refresh_and_wait(&self, timeout: Duration) -> bool {
         let Some(ticket) = self.request_refresh() else {
             return false;
