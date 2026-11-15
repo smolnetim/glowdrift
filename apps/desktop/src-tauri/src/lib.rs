@@ -49,10 +49,11 @@ struct TauriEvents {
 }
 
 impl EngineEvents for TauriEvents {
-    fn color(&self, target: Rgb, smoothed: Rgb) {
+    fn color(&self, target: Rgb, smoothed: Rgb, zones: &[Rgb]) {
         let payload = ColorEvent {
             target: target.to_hex(),
             smoothed: smoothed.to_hex(),
+            zones: zones.iter().map(|zone| zone.to_hex()).collect(),
         };
         let _ = self.app.emit(events::COLOR, payload);
     }
@@ -228,6 +229,8 @@ pub fn run() {
             hue_commands::hue_list_areas,
             hue_commands::hue_select_area,
             hue_commands::hue_forget,
+            hue_commands::hue_area_lights,
+            hue_commands::hue_list_lights,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Glowdrift");

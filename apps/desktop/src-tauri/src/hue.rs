@@ -1,14 +1,16 @@
 //! Hue bridge credentials and the target of the Hue light.
 //!
 //! The credentials live in the encrypted [`hue_store`] file; the configuration only records
-//! which bridge and area are selected. [`HueState`] reconciles the two and points the
-//! [`HueHandle`] of the running light at the result.
+//! which bridge, area, extra lights and zone overrides are selected. [`HueState`] reconciles the
+//! credentials and points the [`HueHandle`] of the running light at the result.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use glowdrift_core::NormRect;
 use glowdrift_core::config::HueConfig;
-use glowdrift_lights::hue::{BridgeCredentials, HueError, HueHandle, HueLight};
+use glowdrift_lights::hue::{AreaLightZone, BridgeCredentials, HueError, HueHandle, HueLight};
 use serde::{Deserialize, Serialize};
 
 use crate::hue_store;
@@ -132,6 +134,8 @@ pub type Target = (Option<BridgeCredentials>, Option<String>);
 struct Inner {
     stored: Option<StoredBridge>,
     applied: Target,
+    applied_zones: BTreeMap<String, NormRect>,
+    applied_extra: Vec<String>,
 }
 
 /// The Hue light's handle, the credential store location and the bridge read from it.
@@ -157,12 +161,16 @@ impl HueState {
             log::info!("the selected Hue bridge has no matching stored credentials; not paired");
         }
         let (light, handle) = HueLight::new(target.0.clone(), target.1.clone());
+        handle.set_zone_overrides(config.zones.clone());
+        handle.set_extra_lights(config.extra_lights.clone());
         let state = Self {
             handle,
             dir,
             inner: Mutex::new(Inner {
                 stored,
                 applied: target,
+                applied_zones: config.zones.clone(),
+                applied_extra: config.extra_lights.clone(),
             }),
         };
         (light, state)
@@ -196,7 +204,8 @@ impl HueState {
         Ok(())
     }
 
-    /// Points the light at the bridge and area `config` selects, unless it already is.
+    /// Points the light at the bridge and area `config` selects and hands it the zone overrides
+    /// and extra lights, each only when it differs from what the light already has.
     pub fn sync(&self, config: &HueConfig) {
         let mut inner = self.inner();
         let target = target_for(inner.stored.clone(), config);
@@ -204,6 +213,20 @@ impl HueState {
             self.handle.set_target(target.0.clone(), target.1.clone());
             inner.applied = target;
         }
+        if inner.applied_zones != config.zones {
+            self.handle.set_zone_overrides(config.zones.clone());
+            inner.applied_zones.clone_from(&config.zones);
+        }
+        if inner.applied_extra != config.extra_lights {
+            self.handle.set_extra_lights(config.extra_lights.clone());
+            inner.applied_extra.clone_from(&config.extra_lights);
+        }
+    }
+
+    /// The lights the Hue light drives with the zone each samples; empty until the area is
+    /// resolved. Performs no I/O.
+    pub fn area_lights(&self) -> Vec<AreaLightZone> {
+        self.handle.area_lights().unwrap_or_default()
     }
 }
 
@@ -222,6 +245,21 @@ mod tests {
             },
             name: Some("Hue".to_owned()),
         }
+    }
+
+    #[test]
+    fn area_lights_are_empty_until_the_area_is_resolved() {
+        let dir = std::env::temp_dir().join("glowdrift-test-no-hue-store");
+        let config = HueConfig::default();
+        let (_light, state) = HueState::start(dir, &config);
+        assert_eq!(state.area_lights(), Vec::new());
+        let changed = HueConfig {
+            extra_lights: vec!["a".to_owned()],
+            ..config
+        };
+        state.sync(&changed);
+        state.sync(&changed);
+        assert_eq!(state.inner().applied_extra, vec!["a".to_owned()]);
     }
 
     #[test]

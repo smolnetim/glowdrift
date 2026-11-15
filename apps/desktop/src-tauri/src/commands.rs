@@ -52,6 +52,9 @@ pub struct AppInfo {
 pub struct ColorEvent {
     pub target: String,
     pub smoothed: String,
+    /// Smoothed colour of each light zone as `#rrggbb`, in layout order; empty without zones.
+    #[serde(default)]
+    pub zones: Vec<String>,
 }
 
 /// Event names emitted by the shell.
@@ -305,6 +308,20 @@ pub async fn stage_update(app: AppHandle) -> Result<Option<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn color_event_carries_the_zone_colours() {
+        let event = ColorEvent {
+            target: "#000000".to_owned(),
+            smoothed: "#010203".to_owned(),
+            zones: vec!["#ff0000".to_owned(), "#0000ff".to_owned()],
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["zones"], serde_json::json!(["#ff0000", "#0000ff"]));
+        let old: ColorEvent =
+            serde_json::from_str(r##"{"target":"#000000","smoothed":"#000000"}"##).unwrap();
+        assert_eq!(old.zones, Vec::<String>::new());
+    }
 
     #[test]
     fn set_config_keeps_the_stored_hue_selection() {
