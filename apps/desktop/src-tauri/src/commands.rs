@@ -137,9 +137,19 @@ pub(crate) fn update_config(
     Ok(config)
 }
 
+/// Replaces `stored` with `config`, except that the Hue bridge and area stay as stored: only the
+/// Hue commands change them, so a copy of the configuration sent from the UI cannot undo them.
+fn replace_config(stored: &mut Config, config: Config) {
+    let bridge_id = stored.lights.hue.bridge_id.take();
+    let area_id = stored.lights.hue.area_id.take();
+    *stored = config;
+    stored.lights.hue.bridge_id = bridge_id;
+    stored.lights.hue.area_id = area_id;
+}
+
 #[tauri::command]
 pub async fn set_config(config: Config, state: State<'_, AppState>) -> Result<Config, String> {
-    update_config(&state, |stored| *stored = config)
+    update_config(&state, |stored| replace_config(stored, config))
 }
 
 #[tauri::command]
@@ -295,6 +305,22 @@ pub async fn stage_update(app: AppHandle) -> Result<Option<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_config_keeps_the_stored_hue_selection() {
+        let mut stored = Config::default();
+        stored.lights.hue.bridge_id = Some("bridge".to_owned());
+        stored.lights.hue.area_id = Some("area".to_owned());
+        let mut sent = Config::default();
+        sent.lights.hue.enabled = true;
+        sent.lights.hue.area_id = Some("stale".to_owned());
+        sent.brightness = 0.5;
+        replace_config(&mut stored, sent);
+        assert!(stored.lights.hue.enabled);
+        assert_eq!(stored.brightness, 0.5);
+        assert_eq!(stored.lights.hue.bridge_id.as_deref(), Some("bridge"));
+        assert_eq!(stored.lights.hue.area_id.as_deref(), Some("area"));
+    }
 
     fn frame(width: u32, height: u32, stride: usize, data: Vec<u8>) -> Frame {
         Frame {

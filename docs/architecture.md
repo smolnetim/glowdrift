@@ -134,8 +134,8 @@ both load.
 | `saturation` | number | 1.0 | 0 to 2 |
 | `lights.icue.enabled` | bool | true | |
 | `lights.hue.enabled` | bool | false | |
-| `lights.hue.bridgeId` | string or null | null | Identifier of the paired Hue bridge; empty or whitespace-only is treated as null. A value of the wrong type takes the default. Bridge credentials are not stored here. |
-| `lights.hue.areaId` | string or null | null | Selected Hue room, zone or entertainment area; normalised like `bridgeId`. |
+| `lights.hue.bridgeId` | string or null | null | Identifier of the paired Hue bridge; empty or whitespace-only is treated as null. A value of the wrong type takes the default. Bridge credentials are not stored here. Only the Hue commands change it; `set_config` keeps the stored value. |
+| `lights.hue.areaId` | string or null | null | Selected Hue room, zone or entertainment area; normalised and protected from `set_config` like `bridgeId`. |
 | `startMinimized` | bool | true | |
 | `autoUpdate` | bool | true | |
 
