@@ -1,5 +1,5 @@
 import { DEFAULT_CONFIG } from "../lib/defaults";
-import { type Config, getConfig, setConfig } from "../lib/ipc";
+import { type Config, type LightKind, getConfig, setConfig } from "../lib/ipc";
 import { createStore } from "../lib/store";
 
 interface ConfigState {
@@ -53,13 +53,46 @@ export function patchConfig(patch: Partial<Config>): void {
   timer = window.setTimeout(() => void save(), SAVE_DELAY_MS);
 }
 
+/** Turns one light on or off, keeping the rest of that light's settings (such as Hue's bridge and area). */
+export function setLightEnabled(kind: LightKind, enabled: boolean): void {
+  const config = configStore.get().config;
+  if (!config) return;
+  patchConfig({ lights: { ...config.lights, [kind]: { ...config.lights[kind], enabled } } });
+}
+
+/**
+ * Takes the Hue bridge and area chosen by the shell into the local config and leaves every other
+ * local edit, including ones still waiting to be saved, untouched.
+ */
+export function applyHueSelection(stored: Config): void {
+  const state = configStore.get();
+  if (!state.config) {
+    configStore.set({ ...state, config: stored });
+    return;
+  }
+  const { bridgeId, areaId } = stored.lights.hue;
+  version += 1;
+  configStore.set({
+    ...state,
+    config: {
+      ...state.config,
+      lights: { ...state.config.lights, hue: { ...state.config.lights.hue, bridgeId, areaId } },
+    },
+  });
+}
+
 export function flushConfig(): void {
   if (timer === undefined) return;
   window.clearTimeout(timer);
   void save();
 }
 
-/** Restores every setting except onboarding state, which stays complete. */
+/** Restores every setting except onboarding state, which stays complete, and the paired Hue bridge and area. */
 export function resetConfig(): void {
-  patchConfig({ ...DEFAULT_CONFIG, onboardingComplete: true });
+  const { bridgeId, areaId } = configStore.get().config?.lights.hue ?? DEFAULT_CONFIG.lights.hue;
+  patchConfig({
+    ...DEFAULT_CONFIG,
+    onboardingComplete: true,
+    lights: { ...DEFAULT_CONFIG.lights, hue: { ...DEFAULT_CONFIG.lights.hue, bridgeId, areaId } },
+  });
 }

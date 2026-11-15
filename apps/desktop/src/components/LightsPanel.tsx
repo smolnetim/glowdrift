@@ -3,9 +3,10 @@ import { useConfig } from "../hooks/useConfig";
 import { LIGHT_STATE_LABEL } from "../lib/format";
 import type { LightStatus } from "../lib/ipc";
 import { useStore } from "../lib/store";
-import { patchConfig } from "../state/config";
+import { setLightEnabled } from "../state/config";
 import { downloadIcueLibrary, lightsStore } from "../state/lights";
 import { ToggleRow } from "./controls";
+import { HueSetup } from "./HueSetup";
 import { Icon } from "./Icon";
 
 export function StateBadge({ light }: { light: LightStatus }) {
@@ -78,9 +79,11 @@ function LibraryDownload({ missing }: { missing: boolean }) {
 
 function LightCard({ light }: { light: LightStatus }) {
   const config = useConfig();
-  const enabled = light.kind === "icue" ? config.lights.icue.enabled : light.enabled;
+  const enabled = config.lights[light.kind].enabled;
   const libraryMissing = light.kind === "icue" && light.code === "libraryMissing";
   const needsHelp = light.kind === "icue" && light.state !== "connected" && !libraryMissing;
+  // Hue's setup flow explains its coded states, and "Connected" adds nothing next to the badge.
+  const showDetail = light.kind === "icue" || (light.state !== "connected" && !light.code);
 
   return (
     <article className="card light-card" aria-label={light.name}>
@@ -100,14 +103,15 @@ function LightCard({ light }: { light: LightStatus }) {
           </div>
         </div>
       </div>
-      {light.detail && <p className="light-detail">{light.detail}</p>}
+      {light.detail && showDetail && <p className="light-detail">{light.detail}</p>}
       <ToggleRow
         title="Send colour to this light"
         checked={enabled}
-        onChange={(next) => patchConfig({ lights: { ...config.lights, [light.kind]: { enabled: next } } })}
+        onChange={(next) => setLightEnabled(light.kind, next)}
       />
       {light.kind === "icue" && <LibraryDownload missing={libraryMissing} />}
       {needsHelp && light.state !== "connecting" && <IcueSetupHelp disabled={!enabled} />}
+      {light.kind === "hue" && <HueSetup light={light} />}
     </article>
   );
 }
@@ -136,7 +140,7 @@ export function LightsPanel() {
       )}
       <ul className="notes">
         <li>No virtual display or driver is installed. Glowdrift talks to iCUE through its official SDK.</li>
-        <li>Philips Hue support is planned for a later version.</li>
+        <li>Philips Hue is controlled through your bridge on the local network; pairing needs one press of its link button.</li>
       </ul>
     </div>
   );
