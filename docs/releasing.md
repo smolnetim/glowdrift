@@ -155,7 +155,8 @@ Options:
   `timestampUrl` in the config, and import the certificate on the runner before the build. Check the current
   rules for private-key storage on hardware tokens or HSMs before buying.
 
-See [Tauri's Windows signing guide](https://v2.tauri.app/distribute/sign/windows/) for the exact configuration.
+See [Tauri's Windows signing guide](https://v2.tauri.app/distribute/sign/windows/) for the exact configuration, and
+[code-signing.md](code-signing.md) for costs, eligibility and setup steps of each option.
 
 ## Release checklist
 
