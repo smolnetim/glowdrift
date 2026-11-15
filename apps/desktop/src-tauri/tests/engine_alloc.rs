@@ -6,6 +6,9 @@
 //! a global allocator. Set `ALLOC_TRACE=1` to print backtraces of the first allocations of the
 //! measured window.
 //!
+//! A second light with a zone layout covers the per-zone path: the grab over the bounding
+//! rectangle, the zone reduction, one smoother per zone and the per-zone send.
+//!
 //! Delivering the preview event to the frontend is not covered: the event sink here is a counter,
 //! and serialising the payload for Tauri allocates outside the engine's control.
 
@@ -17,12 +20,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use glowdrift_capture::CaptureError;
-use glowdrift_core::{Config, FrameView, LightsConfig, NormRect, ReduceMode, Rgb};
+use glowdrift_core::{Config, FrameView, HueConfig, LightsConfig, NormRect, ReduceMode, Rgb};
 use glowdrift_desktop_lib::engine::{Engine, EngineCommand, EngineEvents, EngineStatus};
 use glowdrift_desktop_lib::frame_source::{FrameSource, OpenSource};
 use glowdrift_desktop_lib::lights_manager::LightsManager;
+use glowdrift_lights::hue::HUE_LIGHT_ID;
 use glowdrift_lights::icue::ICUE_LIGHT_ID;
-use glowdrift_lights::{Light, LightError, LightState, LightStatus};
+use glowdrift_lights::{Light, LightError, LightState, LightStatus, ZoneLayout};
 
 thread_local! {
     static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
@@ -153,6 +157,55 @@ impl Light for CountingLight {
     fn shutdown(&mut self) {}
 }
 
+/// A light with a zone layout that counts the zone colours it receives and checks their number.
+struct ZoneLight {
+    zones: Vec<NormRect>,
+    sends: Arc<AtomicU32>,
+}
+
+impl Light for ZoneLight {
+    fn id(&self) -> &str {
+        HUE_LIGHT_ID
+    }
+    fn status(&self) -> LightStatus {
+        LightStatus {
+            id: HUE_LIGHT_ID.to_owned(),
+            kind: "hue".to_owned(),
+            name: "Zones".to_owned(),
+            enabled: true,
+            state: LightState::Connected,
+            detail: None,
+            device_count: 1,
+            code: None,
+        }
+    }
+    fn set_enabled(&mut self, _enabled: bool) {}
+    fn min_send_interval(&self) -> Option<Duration> {
+        None
+    }
+    fn set_color(&mut self, _color: Rgb) -> Result<(), LightError> {
+        Ok(())
+    }
+    fn zone_layout(&self) -> Option<ZoneLayout> {
+        Some(ZoneLayout {
+            generation: 3,
+            zones: self.zones.clone(),
+        })
+    }
+    fn set_zone_colors(
+        &mut self,
+        generation: u64,
+        _whole: Rgb,
+        zones: &[Rgb],
+    ) -> Result<(), LightError> {
+        assert_eq!(generation, 3);
+        assert_eq!(zones.len(), self.zones.len());
+        self.sends.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+    fn shutdown(&mut self) {}
+}
+
 #[derive(Default)]
 struct Sink {
     previews: Arc<AtomicU32>,
@@ -160,7 +213,7 @@ struct Sink {
 }
 
 impl EngineEvents for Sink {
-    fn color(&self, _target: Rgb, _smoothed: Rgb) {
+    fn color(&self, _target: Rgb, _smoothed: Rgb, _zones: &[Rgb]) {
         self.previews.fetch_add(1, Ordering::Relaxed);
     }
     fn status(&self, _status: &EngineStatus) {
@@ -171,6 +224,7 @@ impl EngineEvents for Sink {
 struct Run {
     delivered: u32,
     sends: u32,
+    zone_sends: u32,
     previews: u32,
     allocations: u64,
 }
@@ -180,19 +234,34 @@ const WARMUP_STEPS: u32 = 240;
 const MEASURED_STEPS: u32 = 600;
 
 /// Warms up, then counts the allocations of `MEASURED_STEPS` further passes.
-fn run(mode: ReduceMode, preview: bool) -> Run {
-    let config = Config {
+fn run(mode: ReduceMode, preview: bool, zones: bool) -> Run {
+    let mut lights_config = LightsConfig::default();
+    let mut config = Config {
         mode,
         capture_fps: 20,
+        region: NormRect::new(0.1, 0.2, 0.7, 0.6),
         ..Config::default()
     };
     let delivered = Arc::new(AtomicU32::new(0));
     let sends = Arc::new(AtomicU32::new(0));
-    let lights = LightsManager::new(
-        vec![Box::new(CountingLight(Arc::clone(&sends)))],
-        &LightsConfig::default(),
-        |_| {},
-    );
+    let zone_sends = Arc::new(AtomicU32::new(0));
+    let mut light_set: Vec<Box<dyn Light>> = vec![Box::new(CountingLight(Arc::clone(&sends)))];
+    if zones {
+        lights_config.hue = HueConfig {
+            enabled: true,
+            ..HueConfig::default()
+        };
+        light_set.push(Box::new(ZoneLight {
+            zones: vec![
+                NormRect::new(0.0, 0.0, 0.5, 1.0),
+                NormRect::new(0.5, 0.0, 0.5, 1.0),
+                NormRect::new(0.3, 0.3, 0.4, 0.4),
+            ],
+            sends: Arc::clone(&zone_sends),
+        }));
+    }
+    config.lights = lights_config.clone();
+    let lights = LightsManager::new(light_set, &lights_config, |_| {});
     let open: OpenSource = {
         let delivered = Arc::clone(&delivered);
         Box::new(move |_, _| {
@@ -222,6 +291,7 @@ fn run(mode: ReduceMode, preview: bool) -> Run {
     }
     let delivered_before = delivered.load(Ordering::Relaxed);
     let sends_before = sends.load(Ordering::Relaxed);
+    let zone_sends_before = zone_sends.load(Ordering::Relaxed);
     let previews_before = previews.load(Ordering::Relaxed);
 
     let trace = std::env::var_os("ALLOC_TRACE").is_some();
@@ -236,16 +306,22 @@ fn run(mode: ReduceMode, preview: bool) -> Run {
     Run {
         delivered: delivered.load(Ordering::Relaxed) - delivered_before,
         sends: sends.load(Ordering::Relaxed) - sends_before,
+        zone_sends: zone_sends.load(Ordering::Relaxed) - zone_sends_before,
         previews: previews.load(Ordering::Relaxed) - previews_before,
         allocations,
     }
 }
 
-fn assert_steady_state_is_allocation_free(mode: ReduceMode, preview: bool) {
-    let run = run(mode, preview);
+fn assert_steady_state_is_allocation_free(mode: ReduceMode, preview: bool, zones: bool) {
+    let run = run(mode, preview, zones);
     // The path under test actually ran.
     assert!(run.delivered >= 100, "only {} frames", run.delivered);
     assert!(run.sends >= 300, "only {} sends", run.sends);
+    if zones {
+        assert!(run.zone_sends >= 300, "only {} zone sends", run.zone_sends);
+    } else {
+        assert_eq!(run.zone_sends, 0);
+    }
     if preview {
         assert!(run.previews >= 100, "only {} previews", run.previews);
     } else {
@@ -260,15 +336,30 @@ fn assert_steady_state_is_allocation_free(mode: ReduceMode, preview: bool) {
 
 #[test]
 fn average_mode_does_not_allocate_per_frame() {
-    assert_steady_state_is_allocation_free(ReduceMode::Average, false);
+    assert_steady_state_is_allocation_free(ReduceMode::Average, false, false);
 }
 
 #[test]
 fn average_mode_with_preview_does_not_allocate_per_frame() {
-    assert_steady_state_is_allocation_free(ReduceMode::Average, true);
+    assert_steady_state_is_allocation_free(ReduceMode::Average, true, false);
 }
 
 #[test]
 fn dominant_mode_does_not_allocate_per_frame() {
-    assert_steady_state_is_allocation_free(ReduceMode::Dominant, false);
+    assert_steady_state_is_allocation_free(ReduceMode::Dominant, false, false);
+}
+
+#[test]
+fn average_mode_with_zones_does_not_allocate_per_frame() {
+    assert_steady_state_is_allocation_free(ReduceMode::Average, false, true);
+}
+
+#[test]
+fn average_mode_with_zones_and_preview_does_not_allocate_per_frame() {
+    assert_steady_state_is_allocation_free(ReduceMode::Average, true, true);
+}
+
+#[test]
+fn dominant_mode_with_zones_does_not_allocate_per_frame() {
+    assert_steady_state_is_allocation_free(ReduceMode::Dominant, false, true);
 }

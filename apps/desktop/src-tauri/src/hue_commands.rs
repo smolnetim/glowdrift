@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use glowdrift_core::Config;
 use glowdrift_lights::hue::{
-    self, BridgeCandidate, BridgeCredentials, HueArea, HueError, PairOutcome,
+    self, AreaLightZone, BridgeCandidate, BridgeCredentials, BridgeLight, HueArea, HueError,
+    PairOutcome,
 };
 use tauri::State;
 
@@ -108,6 +109,24 @@ pub async fn hue_list_areas(state: State<'_, AppState>) -> Result<Vec<HueArea>, 
         .ok_or_else(|| NOT_PAIRED.to_owned())?
         .credentials;
     blocking(move || hue::list_areas(&credentials).map_err(|e| hue_state::describe(&e))).await
+}
+
+/// The lights of the paired bridge that can be added as extra lights.
+#[tauri::command]
+pub async fn hue_list_lights(state: State<'_, AppState>) -> Result<Vec<BridgeLight>, String> {
+    let credentials = state
+        .hue
+        .bridge(&state.hue_config())
+        .ok_or_else(|| NOT_PAIRED.to_owned())?
+        .credentials;
+    blocking(move || hue::list_lights(&credentials).map_err(|e| hue_state::describe(&e))).await
+}
+
+/// The lights the Hue light drives with the zone each samples; empty until the area is
+/// resolved. Performs no I/O.
+#[tauri::command]
+pub fn hue_area_lights(state: State<'_, AppState>) -> Vec<AreaLightZone> {
+    state.hue.area_lights()
 }
 
 #[tauri::command]

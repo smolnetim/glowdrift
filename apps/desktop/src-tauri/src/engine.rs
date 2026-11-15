@@ -4,6 +4,13 @@
 //! capture rate: the fastest rate the active lights or the preview can use, never above
 //! [`MIN_TICK_INTERVAL`]. It stops once the smoothed colour has reached the target colour, and does
 //! not run at all while nothing consumes the colour.
+//!
+//! Lights that want per-zone colours announce their zones through the lights manager, which hands
+//! the combined list to the engine as [`EngineCommand::SetZones`]. Each frame is then grabbed over
+//! the smallest rectangle containing the capture region and every zone, and the whole-region
+//! colour and each zone are reduced from that one frame. Every zone has its own adjusted target,
+//! [`Smoother`] and change detection, under the same rules as the whole-region colour. Without
+//! zones the grab is exactly the capture region.
 
 use std::io;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -12,7 +19,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use glowdrift_capture::CaptureError;
-use glowdrift_core::{ColorAdjust, Config, LinearRgb, Rgb, Smoother, reduce};
+use glowdrift_core::{
+    ColorAdjust, Config, LinearRgb, NormRect, Rgb, Smoother, bounding_rect, reduce, reduce_zones,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::frame_source::{FrameSource, OpenSource, open_desktop};
@@ -64,8 +73,9 @@ impl Default for EngineStatus {
 
 /// Receiver of engine notifications. Implementations must not block.
 pub trait EngineEvents: Send + 'static {
-    /// Throttled colour preview, only called while previews are enabled.
-    fn color(&self, target: Rgb, smoothed: Rgb);
+    /// Throttled colour preview, only called while previews are enabled. `zones` are the smoothed
+    /// zone colours in layout order, empty while there are no zones.
+    fn color(&self, target: Rgb, smoothed: Rgb, zones: &[Rgb]);
     /// Called when the running flag, the error, or the rounded measured capture rate changes.
     fn status(&self, status: &EngineStatus);
 }
@@ -76,6 +86,8 @@ pub enum EngineCommand {
     ApplyConfig(Box<Config>),
     SetRunning(bool),
     SetPreviewEnabled(bool),
+    /// Replaces the per-light zones (fractions of the monitor), in layout order.
+    SetZones(Vec<NormRect>),
     Shutdown,
 }
 
@@ -267,6 +279,10 @@ impl EngineHandle {
             running: true,
             ..EngineStatus::default()
         }));
+        let zone_tx = tx.clone();
+        lights.set_zone_sink(move |zones| {
+            let _ = zone_tx.send(EngineCommand::SetZones(zones));
+        });
         let engine = Engine::new(
             rx,
             Arc::clone(&status),
@@ -360,6 +376,26 @@ pub struct Engine<E: EngineEvents> {
     smoothed_rgb: Rgb,
     settled: bool,
 
+    /// Per-light zones, fractions of the monitor.
+    zones: Vec<NormRect>,
+    /// The region followed by the zones: the rectangles reduced from each frame. Empty without
+    /// zones.
+    rects: Vec<NormRect>,
+    /// The part of the monitor each grab covers.
+    grab_rect: NormRect,
+    /// Reduced colours of the last frame, the whole region first. Empty without zones or before
+    /// the first frame after the zones changed.
+    reduced: Vec<LinearRgb>,
+    zone_smoothers: Vec<Smoother>,
+    zone_targets: Vec<LinearRgb>,
+    zone_target_rgb: Vec<Rgb>,
+    zone_smoothed_rgb: Vec<Rgb>,
+    /// The zone targets have been computed from a frame since the zones last changed.
+    zone_targets_set: bool,
+    /// The smoothed zone colours are valid, so they may be sent and previewed.
+    zones_ready: bool,
+    last_sent_zones: Vec<Rgb>,
+
     last_tick: Instant,
     next_tick: Instant,
     next_capture: Instant,
@@ -391,7 +427,9 @@ impl<E: EngineEvents> Engine<E> {
         let now = Instant::now();
         lights.apply_config(&config.lights);
         let tick_interval = smoothing_interval(lights.fastest_interval(), false);
-        Self {
+        let zones = lights.zone_rects();
+        let grab_rect = config.region;
+        let mut engine = Self {
             rx,
             shared,
             lights,
@@ -411,6 +449,17 @@ impl<E: EngineEvents> Engine<E> {
             target_rgb: Rgb::BLACK,
             smoothed_rgb: Rgb::BLACK,
             settled: true,
+            zones: Vec::new(),
+            rects: Vec::new(),
+            grab_rect,
+            reduced: Vec::new(),
+            zone_smoothers: Vec::new(),
+            zone_targets: Vec::new(),
+            zone_target_rgb: Vec::new(),
+            zone_smoothed_rgb: Vec::new(),
+            zone_targets_set: false,
+            zones_ready: true,
+            last_sent_zones: Vec::new(),
             last_tick: now,
             next_tick: now,
             next_capture: now,
@@ -420,7 +469,9 @@ impl<E: EngineEvents> Engine<E> {
             reported: None,
             error_shown: false,
             timing: Timing::new(),
-        }
+        };
+        engine.set_zones(zones, now);
+        engine
     }
 
     fn run(mut self) {
@@ -472,6 +523,7 @@ impl<E: EngineEvents> Engine<E> {
                     self.refresh_tick_interval();
                 }
             }
+            EngineCommand::SetZones(zones) => self.set_zones(zones, now),
             EngineCommand::Shutdown => return false,
         }
         true
@@ -483,7 +535,7 @@ impl<E: EngineEvents> Engine<E> {
         let resend = self.lights.take_resend();
         self.timing.record(Stage::Resend, mark);
         if resend {
-            self.last_sent = None;
+            self.forget_sent();
             if self.has_target {
                 self.send_current();
             }
@@ -505,7 +557,12 @@ impl<E: EngineEvents> Engine<E> {
         if self.preview {
             let mark = Timing::start();
             if self.throttle.poll(now) {
-                self.events.color(self.target_rgb, self.smoothed_rgb);
+                let zones = if self.zones_ready {
+                    &self.zone_smoothed_rgb[..]
+                } else {
+                    &[]
+                };
+                self.events.color(self.target_rgb, self.smoothed_rgb, zones);
                 self.timing.record(Stage::Preview, mark);
             }
         }
@@ -555,7 +612,7 @@ impl<E: EngineEvents> Engine<E> {
             return;
         };
         let mark = Timing::start_cpu();
-        let grabbed = capturer.grab(self.config.region, GRAB_TIMEOUT);
+        let grabbed = capturer.grab(self.grab_rect, GRAB_TIMEOUT);
         self.timing.record(Stage::Grab, mark);
         match grabbed {
             Ok(Some(frame)) => {
@@ -563,7 +620,18 @@ impl<E: EngineEvents> Engine<E> {
                 self.fps.record_frame();
                 self.backoff.reset();
                 let mark = Timing::start_cpu();
-                self.last_reduced = reduce(&frame, self.config.mode);
+                if self.zones.is_empty() {
+                    self.last_reduced = reduce(&frame, self.config.mode);
+                } else {
+                    reduce_zones(
+                        &frame,
+                        self.grab_rect,
+                        self.config.mode,
+                        &self.rects,
+                        &mut self.reduced,
+                    );
+                    self.last_reduced = self.reduced.first().copied().unwrap_or(LinearRgb::BLACK);
+                }
                 self.timing.record(Stage::Reduce, mark);
                 self.note_grab_timings();
                 self.set_error(None);
@@ -622,12 +690,30 @@ impl<E: EngineEvents> Engine<E> {
         let adjusted = adjust.apply(self.last_reduced);
         self.target = adjusted;
         let rgb = adjusted.to_srgb();
+        let mut changed = !self.has_target || rgb != self.target_rgb;
+        self.target_rgb = rgb;
+        if !self.zones.is_empty() && self.reduced.len() == self.zones.len() + 1 {
+            changed |= !self.zone_targets_set;
+            self.zone_targets_set = true;
+            for ((target, target_rgb), raw) in self
+                .zone_targets
+                .iter_mut()
+                .zip(&mut self.zone_target_rgb)
+                .zip(&self.reduced[1..])
+            {
+                *target = adjust.apply(*raw);
+                let rgb = target.to_srgb();
+                if rgb != *target_rgb {
+                    *target_rgb = rgb;
+                    changed = true;
+                }
+            }
+        }
         self.timing.record(Stage::Target, mark);
-        if self.has_target && rgb == self.target_rgb {
+        if !changed {
             return;
         }
         self.has_target = true;
-        self.target_rgb = rgb;
         match self.tick_interval {
             Some(interval) => {
                 if self.settled {
@@ -651,15 +737,35 @@ impl<E: EngineEvents> Engine<E> {
         let time_constant = Duration::from_millis(u64::from(self.config.smoothing_ms));
         let smoothed = self.smoother.update(self.target, dt, time_constant);
         let rgb = smoothed.to_srgb();
+        let mut changed = rgb != self.smoothed_rgb;
+        self.smoothed_rgb = rgb;
+        if self.zone_targets_set {
+            for ((smoother, target), out) in self
+                .zone_smoothers
+                .iter_mut()
+                .zip(&self.zone_targets)
+                .zip(&mut self.zone_smoothed_rgb)
+            {
+                let rgb = smoother.update(*target, dt, time_constant).to_srgb();
+                if rgb != *out {
+                    *out = rgb;
+                    changed = true;
+                }
+            }
+            if !self.zones_ready {
+                self.zones_ready = true;
+                changed = true;
+            }
+        }
         self.timing.record(Stage::Tick, mark);
-        if rgb != self.smoothed_rgb {
-            self.smoothed_rgb = rgb;
+        if changed {
             self.publish_colors();
         }
-        if self.last_sent != Some(rgb) {
+        if self.needs_send() {
             self.send_current();
         }
-        self.settled = is_settled(rgb, self.target_rgb);
+        self.settled =
+            is_settled(rgb, self.target_rgb) && self.zone_smoothed_rgb == self.zone_target_rgb;
     }
 
     /// Recomputes the smoothing rate after the lights or the preview changed. When nothing
@@ -673,21 +779,98 @@ impl<E: EngineEvents> Engine<E> {
         }
     }
 
-    /// Puts the smoother and the smoothed colour on the target colour and stops ticking.
+    /// Puts the smoothers and the smoothed colours on their targets and stops ticking.
     fn jump_to_target(&mut self) {
         let time_constant = Duration::from_millis(u64::from(self.config.smoothing_ms));
         self.smoother.reset();
         self.smoother
             .update(self.target, Duration::ZERO, time_constant);
         self.smoothed_rgb = self.target_rgb;
+        if self.zone_targets_set {
+            for (smoother, target) in self.zone_smoothers.iter_mut().zip(&self.zone_targets) {
+                smoother.reset();
+                smoother.update(*target, Duration::ZERO, time_constant);
+            }
+            self.zone_smoothed_rgb
+                .copy_from_slice(&self.zone_target_rgb);
+            self.zones_ready = true;
+        }
         self.settled = true;
+    }
+
+    /// The smoothed zone colours that may be sent: none until they have been computed for the
+    /// current zones.
+    fn sendable_zones(&self) -> &[Rgb] {
+        if self.zones_ready {
+            &self.zone_smoothed_rgb
+        } else {
+            &[]
+        }
+    }
+
+    fn needs_send(&self) -> bool {
+        self.last_sent != Some(self.smoothed_rgb) || self.last_sent_zones != self.sendable_zones()
+    }
+
+    /// Makes the next send go out even if the colours did not change.
+    fn forget_sent(&mut self) {
+        self.last_sent = None;
+        self.last_sent_zones.clear();
     }
 
     fn send_current(&mut self) {
         let mark = Timing::start();
-        self.lights.set_color(self.smoothed_rgb);
+        let zones = if self.zones_ready {
+            &self.zone_smoothed_rgb[..]
+        } else {
+            &[]
+        };
+        self.lights.set_colors(self.smoothed_rgb, zones);
         self.last_sent = Some(self.smoothed_rgb);
+        self.last_sent_zones.clear();
+        self.last_sent_zones.extend_from_slice(zones);
         self.timing.record(Stage::Send, mark);
+    }
+
+    /// Replaces the zones. The next frame is grabbed afresh so every colour is recomputed even
+    /// on a static desktop.
+    fn set_zones(&mut self, zones: Vec<NormRect>, now: Instant) {
+        if zones == self.zones {
+            return;
+        }
+        let count = zones.len();
+        self.zones = zones;
+        self.rebuild_rects();
+        self.reduced.clear();
+        self.reduced.reserve(count + 1);
+        self.zone_smoothers.clear();
+        self.zone_smoothers.resize_with(count, Smoother::new);
+        self.zone_targets.clear();
+        self.zone_targets.resize(count, LinearRgb::BLACK);
+        self.zone_target_rgb.clear();
+        self.zone_target_rgb.resize(count, Rgb::BLACK);
+        self.zone_smoothed_rgb.clear();
+        self.zone_smoothed_rgb.resize(count, Rgb::BLACK);
+        self.last_sent_zones.clear();
+        self.last_sent_zones.reserve(count);
+        self.zone_targets_set = false;
+        self.zones_ready = count == 0;
+        self.capturer = None;
+        self.retry_at = None;
+        self.backoff.reset();
+        self.next_capture = now;
+    }
+
+    /// Recomputes the rectangles reduced from each frame and the rectangle grabbed.
+    fn rebuild_rects(&mut self) {
+        self.rects.clear();
+        if self.zones.is_empty() {
+            self.grab_rect = self.config.region;
+            return;
+        }
+        self.rects.push(self.config.region);
+        self.rects.extend_from_slice(&self.zones);
+        self.grab_rect = bounding_rect(&self.rects);
     }
 
     fn publish_colors(&mut self) {
@@ -705,6 +888,9 @@ impl<E: EngineEvents> Engine<E> {
 
     fn apply_config(&mut self, new: Config, now: Instant) {
         let old = std::mem::replace(&mut self.config, new);
+        if old.region != self.config.region {
+            self.rebuild_rects();
+        }
         let config = &self.config;
         if old.monitor_id != config.monitor_id || old.region != config.region {
             // A fresh duplication session delivers the current frame even on a static desktop.
@@ -720,7 +906,7 @@ impl<E: EngineEvents> Engine<E> {
             old.brightness != config.brightness || old.saturation != config.saturation;
         if lights_changed {
             self.lights.apply_config(&config.lights);
-            self.last_sent = None;
+            self.forget_sent();
             if self.has_target {
                 self.send_current();
             }
@@ -743,7 +929,13 @@ impl<E: EngineEvents> Engine<E> {
         self.has_target = false;
         self.smoother.reset();
         self.settled = true;
-        self.last_sent = None;
+        self.forget_sent();
+        self.zones_ready = self.zones.is_empty();
+        self.zone_targets_set = false;
+        self.reduced.clear();
+        for smoother in &mut self.zone_smoothers {
+            smoother.reset();
+        }
         self.next_capture = now;
         self.throttle.clear();
         {
@@ -910,7 +1102,7 @@ mod tests {
     struct Recorder(Arc<Mutex<Vec<EngineStatus>>>);
 
     impl EngineEvents for Recorder {
-        fn color(&self, _target: Rgb, _smoothed: Rgb) {}
+        fn color(&self, _target: Rgb, _smoothed: Rgb, _zones: &[Rgb]) {}
         fn status(&self, status: &EngineStatus) {
             lock(&self.0).push(status.clone());
         }
