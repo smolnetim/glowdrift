@@ -2,6 +2,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod hue;
 pub mod icue;
 pub mod null;
 
@@ -41,6 +42,10 @@ pub enum LightState {
 pub enum LightCode {
     /// The light's runtime library is not installed in any searched location.
     LibraryMissing,
+    /// The Hue light has no paired bridge.
+    NotPaired,
+    /// The Hue light has no usable area selected.
+    NoArea,
 }
 
 /// Snapshot of a light for the UI.
@@ -48,7 +53,7 @@ pub enum LightCode {
 #[serde(rename_all = "camelCase")]
 pub struct LightStatus {
     pub id: String,
-    /// Light family, e.g. `"icue"`.
+    /// Light family, e.g. `"icue"` or `"hue"`.
     pub kind: String,
     pub name: String,
     pub enabled: bool,
