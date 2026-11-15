@@ -15,6 +15,7 @@ use tauri::{AppHandle, State};
 use crate::config_store::ConfigStore;
 pub use crate::engine::EngineStatus;
 use crate::engine::{EngineHandle, describe_capture_error};
+use crate::hue::HueState;
 use crate::icue_sdk;
 use crate::lights_manager::{self, LightsManager};
 use crate::per_machine;
@@ -67,6 +68,7 @@ pub struct AppState {
     pub store: ConfigStore,
     pub engine: EngineHandle,
     pub lights: Arc<LightsManager>,
+    pub hue: HueState,
     pub pending_update: Mutex<Option<PendingUpdate>>,
     /// True until the main window has been shown for the first time (and when it must be).
     pub show_on_load: AtomicBool,
@@ -97,6 +99,10 @@ impl AppState {
         self.engine.set_running(!running);
     }
 
+    pub fn hue_config(&self) -> glowdrift_core::config::HueConfig {
+        lock(&self.config).lights.hue.clone()
+    }
+
     pub fn auto_update_enabled(&self) -> bool {
         lock(&self.config).auto_update
     }
@@ -111,17 +117,29 @@ pub fn get_config(state: State<'_, AppState>) -> Config {
     lock(&state.config).clone()
 }
 
-#[tauri::command]
-pub async fn set_config(config: Config, state: State<'_, AppState>) -> Result<Config, String> {
-    let config = config.validated();
+/// Applies `change` to the stored configuration, validates it, hands it to the engine and the
+/// Hue light, and persists it. Returns the resulting configuration.
+pub(crate) fn update_config(
+    state: &AppState,
+    change: impl FnOnce(&mut Config),
+) -> Result<Config, String> {
     let mut stored = lock(&state.config);
+    let mut config = stored.clone();
+    change(&mut config);
+    let config = config.validated();
     *stored = config.clone();
+    state.hue.sync(&config.lights.hue);
     state.engine.apply_config(config.clone());
     state
         .store
         .save(&config)
         .map_err(|e| format!("Settings were applied but could not be saved: {e}"))?;
     Ok(config)
+}
+
+#[tauri::command]
+pub async fn set_config(config: Config, state: State<'_, AppState>) -> Result<Config, String> {
+    update_config(&state, |stored| *stored = config)
 }
 
 #[tauri::command]

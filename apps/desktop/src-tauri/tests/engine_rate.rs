@@ -85,6 +85,7 @@ impl EngineEvents for Quiet {
 fn lights_config(enabled: bool) -> LightsConfig {
     LightsConfig {
         icue: IcueConfig { enabled },
+        ..LightsConfig::default()
     }
 }
 
