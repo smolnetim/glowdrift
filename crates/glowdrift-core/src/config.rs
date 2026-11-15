@@ -56,11 +56,59 @@ impl Default for IcueConfig {
     }
 }
 
+/// Deserialises `T`, yielding `T::default()` for a value of any other type.
+fn lenient<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Lenient<T> {
+        Known(T),
+        Unknown(IgnoredAny),
+    }
+    Ok(match Lenient::<T>::deserialize(deserializer)? {
+        Lenient::Known(value) => value,
+        Lenient::Unknown(_) => T::default(),
+    })
+}
+
+/// Settings for the Philips Hue light. Bridge credentials are not part of the config; they
+/// live in the encrypted credential store.
+///
+/// A field holding a value of the wrong type takes its default.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct HueConfig {
+    #[serde(deserialize_with = "lenient")]
+    pub enabled: bool,
+    /// Identifier of the paired bridge, `None` when none is selected.
+    #[serde(deserialize_with = "lenient")]
+    pub bridge_id: Option<String>,
+    /// Identifier of the room, zone or entertainment area to drive, `None` when none is selected.
+    #[serde(deserialize_with = "lenient")]
+    pub area_id: Option<String>,
+}
+
+impl HueConfig {
+    /// Maps empty or whitespace-only identifiers to `None` and trims the rest.
+    fn validated(mut self) -> Self {
+        fn clean(id: Option<String>) -> Option<String> {
+            id.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
+        }
+        self.bridge_id = clean(self.bridge_id);
+        self.area_id = clean(self.area_id);
+        self
+    }
+}
+
 /// Per-light settings.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct LightsConfig {
     pub icue: IcueConfig,
+    pub hue: HueConfig,
 }
 
 /// Application configuration.
@@ -126,6 +174,7 @@ impl Config {
         if this.monitor_id.as_deref().is_some_and(str::is_empty) {
             this.monitor_id = None;
         }
+        this.lights.hue = this.lights.hue.validated();
         this
     }
 }
@@ -228,6 +277,11 @@ mod tests {
             saturation: 1.5,
             lights: LightsConfig {
                 icue: IcueConfig { enabled: false },
+                hue: HueConfig {
+                    enabled: true,
+                    bridge_id: Some("bridge-1".into()),
+                    area_id: Some("area-1".into()),
+                },
             },
             start_minimized: false,
             auto_update: false,
@@ -305,5 +359,63 @@ mod tests {
         .validated();
         let back: Config = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert_eq!(back, c);
+    }
+
+    #[test]
+    fn config_without_hue_loads_with_hue_defaults() {
+        let c: Config = serde_json::from_str(
+            r#"{"schemaVersion":1,"captureFps":30,"lights":{"icue":{"enabled":false}}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.lights.hue, HueConfig::default());
+        assert!(!c.lights.hue.enabled);
+        assert_eq!(c.lights.hue.bridge_id, None);
+        assert_eq!(c.lights.hue.area_id, None);
+        assert!(!c.lights.icue.enabled);
+    }
+
+    #[test]
+    fn hue_serialises_camel_case() {
+        let v = serde_json::to_value(Config::default()).unwrap();
+        assert_eq!(v["lights"]["hue"]["enabled"], false);
+        assert_eq!(v["lights"]["hue"]["bridgeId"], serde_json::Value::Null);
+        assert_eq!(v["lights"]["hue"]["areaId"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn hue_reads_camel_case_and_ignores_unknown_fields() {
+        let c: Config = serde_json::from_str(
+            r#"{"lights":{"hue":{"enabled":true,"bridgeId":"b","areaId":"a","future":[1]}}}"#,
+        )
+        .unwrap();
+        assert!(c.lights.hue.enabled);
+        assert_eq!(c.lights.hue.bridge_id.as_deref(), Some("b"));
+        assert_eq!(c.lights.hue.area_id.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn hue_fields_of_the_wrong_type_take_defaults() {
+        let c: Config = serde_json::from_str(
+            r#"{"capture_fps":1,"lights":{"hue":{"enabled":"yes","bridgeId":7,"areaId":{"a":1}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.lights.hue, HueConfig::default());
+        let c: Config =
+            serde_json::from_str(r#"{"lights":{"hue":{"enabled":true,"bridgeId":null}}}"#).unwrap();
+        assert!(c.lights.hue.enabled);
+        assert_eq!(c.lights.hue.bridge_id, None);
+    }
+
+    #[test]
+    fn validated_normalises_hue_identifiers() {
+        let mut c = Config::default();
+        c.lights.hue.bridge_id = Some("   ".into());
+        c.lights.hue.area_id = Some("  area-1 ".into());
+        let c = c.validated();
+        assert_eq!(c.lights.hue.bridge_id, None);
+        assert_eq!(c.lights.hue.area_id.as_deref(), Some("area-1"));
+        let mut c = Config::default();
+        c.lights.hue.bridge_id = Some(String::new());
+        assert_eq!(c.validated().lights.hue.bridge_id, None);
     }
 }

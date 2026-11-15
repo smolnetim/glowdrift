@@ -58,6 +58,14 @@ function validated(next: Config): Config {
     smoothingMs: Math.round(clamp(next.smoothingMs, 0, SMOOTHING_MS_MAX)),
     brightness: clamp(next.brightness, 0, 1),
     saturation: clamp(next.saturation, 0, SATURATION_MAX),
+    lights: {
+      ...next.lights,
+      hue: {
+        ...next.lights.hue,
+        bridgeId: next.lights.hue.bridgeId?.trim() || null,
+        areaId: next.lights.hue.areaId?.trim() || null,
+      },
+    },
   };
 }
 

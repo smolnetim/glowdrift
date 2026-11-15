@@ -33,7 +33,10 @@ export interface Config {
   brightness: number;
   /** 0..=2 */
   saturation: number;
-  lights: { icue: { enabled: boolean } };
+  lights: {
+    icue: { enabled: boolean };
+    hue: { enabled: boolean; bridgeId: string | null; areaId: string | null };
+  };
   startMinimized: boolean;
   autoUpdate: boolean;
 }
