@@ -32,6 +32,11 @@
 //! own colour; a colour computed for another generation is replaced by the whole-region colour
 //! on every light.
 //!
+//! [`HueHandle::refresh`] re-reads the bridge inventory over the open connection, so moved
+//! lights, renamed lights and changed area members show up without reconnecting; kept light
+//! states and colours stay, and the generation changes only if a light or an effective zone
+//! did.
+//!
 //! # Restore
 //!
 //! Just before the first colour is sent to a light, its state (on/off, brightness, colour or

@@ -3,7 +3,7 @@
 //!
 //! The worker publishes the lights it drives. From those, the zone overrides and the default
 //! zones, [`Shared`] keeps the effective layout, whose generation changes whenever the lights
-//! or a zone do.
+//! or an effective zone do.
 
 use std::collections::BTreeMap;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -40,6 +40,17 @@ struct Shared {
     resolved: Mutex<Resolved>,
     /// The effective layout. Always locked before `zone_overrides` and `resolved`.
     layout: Mutex<Layout>,
+    refresh: Mutex<Refresh>,
+    refreshed: Condvar,
+}
+
+/// Refresh tickets: the newest requested and the newest the worker has handled.
+#[derive(Default)]
+struct Refresh {
+    requested: u64,
+    completed: u64,
+    /// The worker has stopped; nothing will be handled any more.
+    closed: bool,
 }
 
 #[derive(Default)]
@@ -87,6 +98,7 @@ fn effective_zones(
                 name: light.name.clone(),
                 position: light.position,
                 zone: custom.unwrap_or(default),
+                default_zone: default,
                 custom: custom.is_some(),
                 source: light.source,
             }
@@ -96,9 +108,10 @@ fn effective_zones(
 
 impl Shared {
     /// Rebuilds the layout from the current overrides and resolved lights; bumps the
-    /// generation when the lights were resolved again or the lights or any zone differ from
-    /// before. Colours addressed to an earlier epoch are shown as the whole colour by the
-    /// worker, so the new generation is what makes the engine send per-light colours again.
+    /// generation when the lights were resolved again or the light ids or any effective zone
+    /// differ from before. Names, positions and default zones alone do not bump it. Colours
+    /// addressed to an earlier epoch are shown as the whole colour by the worker, so the new
+    /// generation is what makes the engine send per-light colours again.
     fn refresh_layout(&self) {
         let mut layout = lock(&self.layout);
         let overrides = lock(&self.zone_overrides).clone();
@@ -114,10 +127,25 @@ impl Shared {
         };
         let resolved_again = layout.epoch != epoch;
         layout.epoch = epoch;
-        if resolved_again || layout.lights != lights {
+        let zones = |lights: &Option<Vec<AreaLightZone>>| {
+            lights.as_ref().map(|lights| {
+                lights
+                    .iter()
+                    .map(|l| (l.id.clone(), l.zone))
+                    .collect::<Vec<_>>()
+            })
+        };
+        if resolved_again || zones(&layout.lights) != zones(&lights) {
             layout.generation += 1;
-            layout.lights = lights;
         }
+        layout.lights = lights;
+    }
+
+    /// Records the newest refresh ticket the worker has handled and wakes the waiters.
+    fn complete_refresh(&self, ticket: u64) {
+        let mut refresh = lock(&self.refresh);
+        refresh.completed = refresh.completed.max(ticket);
+        self.refreshed.notify_all();
     }
 
     fn publish_resolved(&self, epoch: u64, lights: Option<Vec<TargetInfo>>) {
@@ -172,6 +200,9 @@ pub struct AreaLightZone {
     /// The effective zone, as a fraction of the monitor: the override when there is one,
     /// otherwise the default for the light's position.
     pub zone: NormRect,
+    /// The zone of the light's current Hue position (the centred box for extra lights),
+    /// whether or not there is an override.
+    pub default_zone: NormRect,
     /// True when `zone` is an override.
     pub custom: bool,
     pub source: ZoneSource,
@@ -212,6 +243,54 @@ impl HueHandle {
     pub fn set_extra_lights(&self, ids: Vec<String>) {
         lock(&self.shared.extra_lights).clone_from(&ids);
         self.shared.update(|inbox| inbox.extras = Some(ids));
+    }
+
+    /// Asks the worker to read the bridge inventory again now: positions, lights and names. The
+    /// connection, the kept light states and the colours sent stay; the layout generation
+    /// changes only if a light or an effective zone did. A request made while another is
+    /// outstanding joins it, and the worker reads the inventory at most once per two seconds.
+    /// Never blocks; see [`HueHandle::refresh_and_wait`] to wait for the result.
+    pub fn refresh(&self) {
+        self.request_refresh();
+    }
+
+    /// [`HueHandle::refresh`], then waits until the worker has handled it or `timeout` has
+    /// passed; returns whether it was handled (`false` also when the worker has stopped). Blocks the calling thread, so call it from a
+    /// blocking thread, not from an async runtime thread.
+    pub fn refresh_and_wait(&self, timeout: Duration) -> bool {
+        let Some(ticket) = self.request_refresh() else {
+            return false;
+        };
+        let deadline = Instant::now() + timeout;
+        let mut refresh = lock(&self.shared.refresh);
+        while refresh.completed < ticket {
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            refresh = self
+                .shared
+                .refreshed
+                .wait_timeout(refresh, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        true
+    }
+
+    /// The ticket of the outstanding refresh, or of a new one that is queued for the worker;
+    /// `None` when the worker has stopped.
+    fn request_refresh(&self) -> Option<u64> {
+        let mut refresh = lock(&self.shared.refresh);
+        if refresh.closed {
+            return None;
+        }
+        if refresh.requested > refresh.completed {
+            return Some(refresh.requested);
+        }
+        refresh.requested += 1;
+        let ticket = refresh.requested;
+        self.shared.update(|inbox| inbox.refresh = Some(ticket));
+        Some(ticket)
     }
 
     /// The lights currently driven with the zone each one samples: the area's lights in channel
@@ -261,6 +340,8 @@ impl HueLight {
             }),
             resolved: Mutex::new(Resolved::default()),
             layout: Mutex::new(Layout::default()),
+            refresh: Mutex::new(Refresh::default()),
+            refreshed: Condvar::new(),
         });
         let (done_tx, done) = mpsc::channel();
         let worker_shared = Arc::clone(&shared);
@@ -421,7 +502,8 @@ fn run_worker(shared: &Arc<Shared>, timing: Timing, done: &Sender<()>) {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut worker = Worker::new(timing);
         let mut deadline: Option<Instant> = None;
-        let mut published_epoch = 0;
+        let mut published_revision = 0;
+        let mut published_refresh = 0;
         loop {
             let batch = wait_for_work(shared, deadline);
             let stop = worker.apply(batch);
@@ -429,10 +511,14 @@ fn run_worker(shared: &Arc<Shared>, timing: Timing, done: &Sender<()>) {
                 deadline = worker.step(Instant::now());
             }
             *lock(&shared.status) = worker.status().clone();
-            let (epoch, lights) = worker.resolved();
-            if epoch != published_epoch {
-                published_epoch = epoch;
+            let (epoch, revision, lights) = worker.resolved();
+            if revision != published_revision {
+                published_revision = revision;
                 shared.publish_resolved(epoch, lights.map(<[TargetInfo]>::to_vec));
+            }
+            if worker.refreshed() != published_refresh {
+                published_refresh = worker.refreshed();
+                shared.complete_refresh(published_refresh);
             }
             if stop {
                 break;
@@ -445,6 +531,12 @@ fn run_worker(shared: &Arc<Shared>, timing: Timing, done: &Sender<()>) {
             LightState::Error,
             Some("The Hue worker stopped unexpectedly"),
         );
+    }
+    {
+        let mut refresh = lock(&shared.refresh);
+        refresh.closed = true;
+        refresh.completed = refresh.requested;
+        shared.refreshed.notify_all();
     }
     let _ = done.send(());
 }
@@ -524,6 +616,7 @@ mod tests {
                 z: 0.5,
             }),
             zone: NormRect::full(),
+            default_zone: NormRect::new(0.4, 0.0, 0.2, 1.0),
             custom: false,
             source: ZoneSource::Extra,
         };
@@ -532,6 +625,7 @@ mod tests {
         assert_eq!(v["custom"], false);
         assert_eq!(v["position"]["z"], 0.5);
         assert_eq!(v["zone"]["width"], 1.0);
+        assert!((v["defaultZone"]["width"].as_f64().unwrap() - 0.2).abs() < 1e-6);
         assert_eq!(
             serde_json::to_value(ZoneSource::Entertainment).unwrap(),
             "entertainment"

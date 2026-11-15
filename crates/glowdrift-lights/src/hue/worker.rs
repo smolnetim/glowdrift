@@ -14,6 +14,15 @@
 //! empty or the worker shuts down, and for lights that leave the target when the target or the
 //! extra lights change. A session survives connection losses and reconnects, so the kept
 //! states are never overwritten with the app's own output, and each state is restored once.
+//!
+//! # Refreshing
+//!
+//! A refresh request carries a ticket. While a session is open the worker re-reads the bridge
+//! inventory over it, at most once per [`Timing::refresh_gap`], and keeps the connection and
+//! the kept states; lights that left the target are restored. Without a session the next
+//! connect reads the inventory anyway. The newest ticket handled is reported by
+//! [`Worker::refreshed`]; tickets that arrive while the gap has not passed wait for it
+//! together.
 
 use std::time::{Duration, Instant};
 
@@ -45,6 +54,8 @@ pub(crate) struct Timing {
     pub put_gap: Duration,
     pub backoff_initial: Duration,
     pub backoff_max: Duration,
+    /// Minimum gap between two reads of the bridge inventory.
+    pub refresh_gap: Duration,
 }
 
 impl Default for Timing {
@@ -53,6 +64,7 @@ impl Default for Timing {
             put_gap: PUT_GAP,
             backoff_initial: Duration::from_secs(1),
             backoff_max: Duration::from_secs(30),
+            refresh_gap: Duration::from_secs(2),
         }
     }
 }
@@ -113,6 +125,8 @@ pub(crate) struct Inbox {
     pub extras: Option<Vec<String>>,
     pub enabled: Option<bool>,
     pub retry: bool,
+    /// Newest refresh ticket.
+    pub refresh: Option<u64>,
     pub shutdown: bool,
 }
 
@@ -123,6 +137,7 @@ impl Inbox {
             || self.extras.is_some()
             || self.enabled.is_some()
             || self.retry
+            || self.refresh.is_some()
             || self.shutdown
     }
 }
@@ -321,8 +336,19 @@ pub(crate) struct Worker {
     held: Option<Held>,
     /// The lights of the last successful resolve; `None` while the target is empty or changed.
     resolved: Option<Vec<TargetInfo>>,
-    /// Counts changes of `resolved`.
+    /// Counts changes of the order of the ids in `resolved`, which decide what a per-light
+    /// colour list addresses.
     epoch: u64,
+    /// Counts changes of `resolved`.
+    revision: u64,
+    /// Newest refresh ticket not yet handled.
+    refresh_pending: Option<u64>,
+    /// Newest refresh ticket handled.
+    refresh_done: u64,
+    /// When the pending refresh may run, if the gap has not passed.
+    refresh_wait: Option<Instant>,
+    /// When the inventory was last read.
+    last_inventory: Option<Instant>,
     sticky: Option<Sticky>,
     retry_at: Option<Instant>,
     backoff: Backoff,
@@ -354,6 +380,11 @@ impl Worker {
             held: None,
             resolved: None,
             epoch: 0,
+            revision: 0,
+            refresh_pending: None,
+            refresh_done: 0,
+            refresh_wait: None,
+            last_inventory: None,
             sticky: None,
             retry_at: None,
             backoff: Backoff::new(timing.backoff_initial, timing.backoff_max),
@@ -367,17 +398,32 @@ impl Worker {
         &self.status
     }
 
-    /// The lights driven by the last successful resolve, with a counter that changes whenever
-    /// they do.
-    pub fn resolved(&self) -> (u64, Option<&[TargetInfo]>) {
-        (self.epoch, self.resolved.as_deref())
+    /// The lights driven by the last successful resolve with two counters: the epoch changes
+    /// when the lights or their order do, the revision whenever anything about them does.
+    pub fn resolved(&self) -> (u64, u64, Option<&[TargetInfo]>) {
+        (self.epoch, self.revision, self.resolved.as_deref())
+    }
+
+    /// The newest refresh ticket that has been handled.
+    pub fn refreshed(&self) -> u64 {
+        self.refresh_done
     }
 
     fn set_resolved(&mut self, resolved: Option<Vec<TargetInfo>>) {
-        if resolved != self.resolved {
-            self.resolved = resolved;
+        if resolved == self.resolved {
+            return;
+        }
+        let same_order = match (&self.resolved, &resolved) {
+            (Some(old), Some(new)) => {
+                old.len() == new.len() && old.iter().zip(new).all(|(a, b)| a.id == b.id)
+            }
+            _ => false,
+        };
+        if !same_order {
             self.epoch += 1;
         }
+        self.revision += 1;
+        self.resolved = resolved;
     }
 
     /// Applies queued inputs. Returns `true` on shutdown.
@@ -386,6 +432,10 @@ impl Worker {
             self.session = None;
             self.end_send_session(SHUTDOWN_RESTORE_BUDGET);
             self.status = Status::new(LightState::Disabled, None);
+            self.refresh_done = self
+                .refresh_done
+                .max(inbox.refresh.or(self.refresh_pending).unwrap_or(0));
+            self.refresh_pending = None;
             return true;
         }
         if let Some(enabled) = inbox.enabled
@@ -417,6 +467,9 @@ impl Worker {
         }
         if inbox.retry && self.session.is_none() {
             self.reset_connection();
+        }
+        if let Some(ticket) = inbox.refresh {
+            self.refresh_pending = Some(self.refresh_pending.map_or(ticket, |t| t.max(ticket)));
         }
         if let Some(color) = inbox.color {
             self.colors = Some(color);
@@ -469,6 +522,18 @@ impl Worker {
     /// Performs at most one network action; returns when to step again, `None` to sleep until
     /// the next input.
     pub fn step(&mut self, now: Instant) -> Option<Instant> {
+        self.refresh_wait = None;
+        let next = self.step_inner(now);
+        if let Some(at) = self.refresh_wait {
+            return Some(next.map_or(at, |next| next.min(at)));
+        }
+        if let Some(ticket) = self.refresh_pending.take() {
+            self.refresh_done = self.refresh_done.max(ticket);
+        }
+        next
+    }
+
+    fn step_inner(&mut self, now: Instant) -> Option<Instant> {
         if !self.enabled {
             self.session = None;
             self.end_send_session(STOP_RESTORE_BUDGET);
@@ -507,12 +572,21 @@ impl Worker {
             }
             return self.connect(now);
         }
+        if self.refresh_pending.is_some() {
+            match self.last_inventory {
+                Some(last) if last + self.timing.refresh_gap > now => {
+                    self.refresh_wait = Some(last + self.timing.refresh_gap);
+                }
+                _ => return self.refresh_inventory(now),
+            }
+        }
         self.send_next(now)
     }
 
     fn connect(&mut self, now: Instant) -> Option<Instant> {
         let creds = self.target.creds.clone()?;
         let area = self.target.area_id.clone();
+        self.last_inventory = Some(now);
         match open_session(&creds, area.as_deref(), &self.extras, self.timing.put_gap) {
             Ok(mut session) => {
                 if self.outage_logged {
@@ -550,19 +624,8 @@ impl Worker {
         {
             self.end_send_session(STOP_RESTORE_BUDGET);
         }
-        if let Some(held) = &mut self.held {
-            let (kept, departed): (Vec<_>, Vec<_>) = std::mem::take(&mut held.snapshots)
-                .into_iter()
-                .partition(|(id, _)| session.members.iter().any(|m| m.info.id == *id));
-            held.snapshots = kept;
-            if !departed.is_empty() {
-                restore_lights(
-                    &session.bridge,
-                    departed,
-                    self.timing.put_gap,
-                    STOP_RESTORE_BUDGET,
-                );
-            }
+        self.restore_departed(&session.bridge, &session.members);
+        if let Some(held) = &self.held {
             for member in &mut session.members {
                 if held.snapshots.iter().any(|(id, _)| *id == member.info.id) {
                     member.snap = SnapState::Taken;
@@ -575,6 +638,77 @@ impl Worker {
                 session.pacer.touch_one(index);
             }
         }
+    }
+
+    /// Puts back the held lights that are not among `members` and stops holding them.
+    fn restore_departed(&mut self, bridge: &Bridge, members: &[Member]) {
+        let Some(held) = &mut self.held else {
+            return;
+        };
+        let (kept, departed): (Vec<_>, Vec<_>) = std::mem::take(&mut held.snapshots)
+            .into_iter()
+            .partition(|(id, _)| members.iter().any(|m| m.info.id == *id));
+        held.snapshots = kept;
+        if !departed.is_empty() {
+            restore_lights(bridge, departed, self.timing.put_gap, STOP_RESTORE_BUDGET);
+        }
+    }
+
+    /// Reads the inventory over the open session and applies it: lights, names, positions and
+    /// gamuts change in place, lights that left the target are restored and the connection,
+    /// the kept states and the colours already sent stay.
+    fn refresh_inventory(&mut self, now: Instant) -> Option<Instant> {
+        self.last_inventory = Some(now);
+        let mut session = self.session.take()?;
+        let inventory = match Inventory::fetch(&session.bridge) {
+            Ok(inventory) => inventory,
+            Err(
+                err @ (HueError::Network(_)
+                | HueError::Unauthorized
+                | HueError::CertificateMismatch),
+            ) => return self.connection_failed(&err, now),
+            Err(err) => {
+                log::warn!("could not refresh the Hue lights: {err}");
+                self.session = Some(session);
+                return Some(now);
+            }
+        };
+        let mut members = resolve_members(
+            &inventory,
+            self.target.area_id.as_deref(),
+            &self.extras,
+            false,
+        );
+        if members.is_empty() {
+            self.on_connect_error(&HueError::AreaNotFound, now);
+            return self.retry_at;
+        }
+        for member in &mut members {
+            if let Some(old) = session.members.iter().find(|o| o.info.id == member.info.id) {
+                member.snap = old.snap;
+                member.want = old.want;
+                if old.info == member.info {
+                    member.last = old.last;
+                }
+            }
+        }
+        self.restore_departed(&session.bridge, &members);
+        let same_order = members.len() == session.members.len()
+            && members
+                .iter()
+                .zip(&session.members)
+                .all(|(a, b)| a.info.id == b.info.id);
+        session.members = members;
+        if !same_order {
+            session.pacer.set_lights(session.members.len());
+        }
+        self.set_resolved(Some(
+            session.members.iter().map(Member::target_info).collect(),
+        ));
+        self.status.device_count = u32::try_from(session.members.len()).unwrap_or(u32::MAX);
+        self.session = Some(session);
+        self.refresh_wants();
+        Some(now)
     }
 
     fn on_connect_error(&mut self, err: &HueError, now: Instant) {
@@ -762,27 +896,15 @@ fn restore_lights(
     }
 }
 
-/// Connects and resolves the lights to drive: the entertainment area (when one is chosen and
-/// found) followed by the extra lights. Extra lights the bridge does not know are logged and
-/// skipped; having no light at all is [`HueError::AreaNotFound`].
-fn open_session(
-    creds: &BridgeCredentials,
+/// The lights to drive: the entertainment area (when one is chosen and found) followed by the
+/// extra lights. Extra lights the bridge does not know are skipped, and logged when
+/// `log_missing` is set.
+fn resolve_members(
+    inventory: &Inventory,
     area_id: Option<&str>,
     extras: &[String],
-    put_gap: Duration,
-) -> Result<Session, HueError> {
-    if creds.cert_sha256.is_empty() || creds.app_key.is_empty() {
-        return Err(HueError::InvalidCredentials(
-            "missing app key or certificate pin".to_owned(),
-        ));
-    }
-    let bridge = Bridge::new(
-        &creds.address,
-        Some(&creds.cert_sha256),
-        Some(&creds.app_key),
-        REQUEST_TIMEOUT,
-    )?;
-    let inventory = Inventory::fetch(&bridge)?;
+    log_missing: bool,
+) -> Vec<Member> {
     let mut members: Vec<Member> = Vec::new();
     let new_member = |info: LightInfo, source, position| Member {
         info,
@@ -801,7 +923,10 @@ fn open_session(
                     }),
                 );
             }
-            _ => log::warn!("the selected Hue area was not found or has no lights"),
+            _ if log_missing => {
+                log::warn!("the selected Hue area was not found or has no lights");
+            }
+            _ => {}
         }
     }
     for id in extras {
@@ -810,9 +935,36 @@ fn open_session(
         }
         match inventory.light(id) {
             Some(info) => members.push(new_member(info, ZoneSource::Extra, None)),
-            None => log::warn!("Hue light {id} was not found on the bridge; skipping it"),
+            None if log_missing => {
+                log::warn!("Hue light {id} was not found on the bridge; skipping it");
+            }
+            None => {}
         }
     }
+    members
+}
+
+/// Connects and resolves the lights to drive; having no light at all is
+/// [`HueError::AreaNotFound`].
+fn open_session(
+    creds: &BridgeCredentials,
+    area_id: Option<&str>,
+    extras: &[String],
+    put_gap: Duration,
+) -> Result<Session, HueError> {
+    if creds.cert_sha256.is_empty() || creds.app_key.is_empty() {
+        return Err(HueError::InvalidCredentials(
+            "missing app key or certificate pin".to_owned(),
+        ));
+    }
+    let bridge = Bridge::new(
+        &creds.address,
+        Some(&creds.cert_sha256),
+        Some(&creds.app_key),
+        REQUEST_TIMEOUT,
+    )?;
+    let inventory = Inventory::fetch(&bridge)?;
+    let members = resolve_members(&inventory, area_id, extras, true);
     if members.is_empty() {
         return Err(HueError::AreaNotFound);
     }

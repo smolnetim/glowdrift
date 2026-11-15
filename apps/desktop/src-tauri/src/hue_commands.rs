@@ -17,6 +17,7 @@ use crate::hue::{self as hue_state, HueBridge, StoredBridge};
 const DISCOVER_TIMEOUT: Duration = Duration::from_secs(4);
 const PAIR_INTERVAL: Duration = Duration::from_secs(2);
 const PAIR_TIMEOUT: Duration = Duration::from_secs(30);
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 const NOT_PAIRED: &str = "No Hue bridge is paired.";
 const LINK_BUTTON_TIMEOUT: &str = "The link button was not pressed in time.";
 
@@ -133,6 +134,27 @@ pub async fn hue_list_lights(state: State<'_, AppState>) -> Result<Vec<BridgeLig
 #[tauri::command]
 pub fn hue_area_lights(state: State<'_, AppState>) -> Vec<AreaLightZone> {
     state.hue.area_lights()
+}
+
+/// Makes the Hue light read the bridge inventory again, waits until it has (at most about 5
+/// seconds), and returns the lights as [`hue_area_lights`] does. Rejects when no bridge is
+/// paired. The light reads the bridge on its own thread, at most once per two seconds; calls
+/// made meanwhile share that read.
+#[tauri::command]
+pub async fn hue_refresh_area_lights(
+    state: State<'_, AppState>,
+) -> Result<Vec<AreaLightZone>, String> {
+    if state.hue.bridge(&state.hue_config()).is_none() {
+        return Err(NOT_PAIRED.to_owned());
+    }
+    let handle = state.hue.handle();
+    blocking(move || {
+        if !handle.refresh_and_wait(REFRESH_TIMEOUT) {
+            log::debug!("the Hue light did not finish refreshing in time");
+        }
+        Ok(handle.area_lights().unwrap_or_default())
+    })
+    .await
 }
 
 #[tauri::command]
