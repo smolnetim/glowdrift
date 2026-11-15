@@ -1,12 +1,10 @@
-import { ColorChip } from "../components/LiveColor";
 import { Icon } from "../components/Icon";
+import { LightTiles } from "../components/LightTiles";
 import { Banner, Card, Page } from "../components/layout";
-import { StateBadge } from "../components/LightsPanel";
 import { formatFps } from "../lib/format";
 import { useStore } from "../lib/store";
 import { configStore } from "../state/config";
 import { engineStore, toggleEngine } from "../state/engine";
-import { lightsStore } from "../state/lights";
 
 function EngineCard() {
   const { status, commandFailed } = useStore(engineStore);
@@ -35,46 +33,20 @@ function EngineCard() {
   );
 }
 
-function LightSummary() {
-  const lights = useStore(lightsStore);
-  return (
-    <Card title="Lights">
-      {lights.length === 0 ? (
-        <p className="muted-text">No lights detected yet. Open the Lights page to set one up.</p>
-      ) : (
-        <ul className="chip-list">
-          {lights.map((light) => (
-            <li key={light.id} className="chip">
-              <span>{light.name}</span>
-              <StateBadge light={light} />
-            </li>
-          ))}
-        </ul>
-      )}
-    </Card>
-  );
-}
-
 export function Dashboard() {
   const { status } = useStore(engineStore);
   return (
-    <Page title="Dashboard" description="What Glowdrift sees on your screen, and the calm colour it sends to your lights.">
+    <Page title="Dashboard" description="The calm colour Glowdrift sends to each of your lights, live.">
       {status.lastError && (
         <Banner tone="danger" title="Something went wrong">
           {status.lastError}
         </Banner>
       )}
-      <section className="hero" aria-label="Live colour preview">
-        <div className="hero-glow" aria-hidden="true" />
-        <div className="hero-swatches">
-          <ColorChip kind="smoothed" size="large" label="Smoothed colour sent to lights" />
-          <ColorChip kind="target" size="small" label="Target colour from screen" />
-        </div>
+      <section className="stack-tight" aria-label="Light output">
+        <h2 className="section-title">Lights</h2>
+        <LightTiles />
       </section>
-      <div className="grid-2">
-        <EngineCard />
-        <LightSummary />
-      </div>
+      <EngineCard />
     </Page>
   );
 }

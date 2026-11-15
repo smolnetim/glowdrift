@@ -15,7 +15,7 @@ export function Settings() {
   const [confirmingReset, setConfirmingReset] = useState(false);
 
   return (
-    <Page title="Settings" description="Tune how the light behaves and how Glowdrift starts.">
+    <Page title="Settings" description="Tune how your lights behave and how Glowdrift starts.">
       <Card title="Colour">
         <div className="stack">
           <div className="stack-tight">

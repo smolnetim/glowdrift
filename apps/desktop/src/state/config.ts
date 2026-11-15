@@ -1,5 +1,5 @@
 import { DEFAULT_CONFIG } from "../lib/defaults";
-import { type Config, type LightKind, type NormRect, getConfig, setConfig } from "../lib/ipc";
+import { type AreaLightZone, type Config, type LightKind, type NormRect, getConfig, setConfig } from "../lib/ipc";
 import { createStore } from "../lib/store";
 
 interface ConfigState {
@@ -67,17 +67,16 @@ function patchHue(change: (hue: Config["lights"]["hue"]) => Partial<Config["ligh
   patchConfig({ lights: { ...config.lights, hue: { ...hue, ...change(hue) } } });
 }
 
-/** Sets one Hue light's zone override (a fraction of the monitor), or removes it with `null`. */
-export function setHueZone(lightId: string, rect: NormRect | null): void {
-  patchHue(({ zones }) => {
-    const { [lightId]: _removed, ...rest } = zones;
-    return { zones: rect ? { ...rest, [lightId]: rect } : rest };
-  });
+/** Sets one Hue light's zone override (a fraction of the monitor); the light then stops following its Hue position. */
+export function setHueZone(lightId: string, rect: NormRect): void {
+  patchHue(({ zones }) => ({ zones: { ...zones, [lightId]: rect } }));
 }
 
-/** Removes every Hue zone override. */
-export function clearHueZones(): void {
-  patchHue(() => ({ zones: {} }));
+/** Pins each given light's zone to its current Hue position (the override equals `defaultZone`). */
+export function resetHueZones(lights: readonly Pick<AreaLightZone, "id" | "defaultZone">[]): void {
+  patchHue(({ zones }) => ({
+    zones: { ...zones, ...Object.fromEntries(lights.map((light) => [light.id, light.defaultZone])) },
+  }));
 }
 
 export function setHueExtraLights(extraLights: string[]): void {

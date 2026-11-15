@@ -57,16 +57,28 @@ interface RegionEditorProps {
   imageUrl: string | null;
   aspectRatio: number;
   busy: boolean;
+  /** Accessible name of the capture region box. */
+  regionLabel?: string;
   onSelect: (id: string) => void;
   onChange: (id: string, rect: NormRect) => void;
 }
 
 /** Preview of the whole monitor with draggable, resizable boxes; the selected box is raised. */
-export function RegionEditor({ boxes, selectedId, imageUrl, aspectRatio, busy, onSelect, onChange }: RegionEditorProps) {
+export function RegionEditor({
+  boxes,
+  selectedId,
+  imageUrl,
+  aspectRatio,
+  busy,
+  regionLabel = "Capture region",
+  onSelect,
+  onChange,
+}: RegionEditorProps) {
   const stage = useRef<HTMLDivElement>(null);
   const drag = useRef<Drag | null>(null);
   const hintId = useId();
-  const multi = boxes.length > 1;
+  /** True when the preview carries zone boxes; the lone capture region is edited without labels. */
+  const zoned = boxes.some((b) => b.id !== REGION_BOX_ID);
 
   const rectOf = (id: string): NormRect | undefined => boxes.find((b) => b.id === id)?.rect;
   const region = rectOf(REGION_BOX_ID);
@@ -146,7 +158,7 @@ export function RegionEditor({ boxes, selectedId, imageUrl, aspectRatio, busy, o
         >
           <div className="region-clip" aria-hidden="true">
             {imageUrl && <img className="region-image" src={imageUrl} alt="" draggable={false} />}
-            {!multi && region && (
+            {!zoned && region && (
               <div
                 className="region-dim"
                 style={cssVars({ "--x": region.x, "--y": region.y, "--w": region.width, "--h": region.height })}
@@ -164,7 +176,7 @@ export function RegionEditor({ boxes, selectedId, imageUrl, aspectRatio, busy, o
                 className={`region-rect${isRegion ? "" : " region-rect--zone"}${selected ? " is-selected" : ""}`}
                 role="group"
                 tabIndex={0}
-                aria-label={isRegion ? (multi ? "iCUE capture region" : "Capture region") : `Zone for ${box.label}`}
+                aria-label={isRegion ? regionLabel : `Zone for ${box.label}`}
                 aria-describedby={hintId}
                 style={cssVars({
                   "--x": box.rect.x,
@@ -175,7 +187,7 @@ export function RegionEditor({ boxes, selectedId, imageUrl, aspectRatio, busy, o
                 onFocus={() => onSelect(box.id)}
                 onKeyDown={(e) => onKeyDown(e, box)}
               >
-                {multi && (
+                {zoned && (
                   <span className="box-label">
                     <LiveSwatch colorIndex={box.colorIndex} />
                     <span className="box-name">{box.label}</span>
@@ -191,7 +203,7 @@ export function RegionEditor({ boxes, selectedId, imageUrl, aspectRatio, busy, o
         </div>
       </div>
       <p className="region-hint" id={hintId}>
-        {multi
+        {zoned
           ? "Drag a box to move it and drag the handles of the selected box to resize it. With a box focused, arrow keys move it and Shift with arrow keys resizes it. "
           : "Drag the frame to move it, drag its handles to resize, or drag on the picture to draw a new one. With the frame focused, arrow keys move it and Shift with arrow keys resizes it. "}
         Smallest size is {Math.round(REGION_MIN_SIZE * 100)}%.

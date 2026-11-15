@@ -138,6 +138,8 @@ export interface AreaLightZone {
   position: LightPosition | null;
   /** Effective zone (the override, or the default), as fractions of the monitor. */
   zone: NormRect;
+  /** The zone from the light's current Hue position, whether or not it is overridden. */
+  defaultZone: NormRect;
   /** True when `lights.hue.zones` overrides the default. */
   custom: boolean;
   source: "entertainment" | "extra";
@@ -227,6 +229,12 @@ export const hueListLights = () => call<BridgeLight[]>("hue_list_lights", undefi
  * zones. Empty until the area is resolved. No bridge request is made.
  */
 export const hueAreaLights = () => call<AreaLightZone[]>("hue_area_lights", undefined, (m) => m.hueAreaLights());
+/**
+ * Re-reads the light positions from the bridge and resolves with the fresh list (like `hueAreaLights`).
+ * Takes up to ~5 s; rejects with a user-presentable message, for example when not paired.
+ */
+export const hueRefreshAreaLights = () =>
+  call<AreaLightZone[]>("hue_refresh_area_lights", undefined, (m) => m.hueRefreshAreaLights());
 export const hueSelectArea = (areaId: string) =>
   call<Config>("hue_select_area", { areaId }, (m) => m.hueSelectArea(areaId));
 /** Deletes the stored bridge credentials and clears the bridge and area from the config. */

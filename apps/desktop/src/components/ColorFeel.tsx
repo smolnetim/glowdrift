@@ -9,7 +9,7 @@ const MODE_OPTIONS = [
   {
     value: "average",
     title: "Average",
-    description: "Blends every pixel in the region into one soft wash of colour.",
+    description: "Blends every pixel of a watched area into one soft wash of colour.",
   },
   {
     value: "dominant",
@@ -36,7 +36,7 @@ export function SmoothingControl() {
   return (
     <SliderField
       label="Smoothing"
-      description="How slowly the light follows your screen. Higher values fade more gently."
+      description="How slowly your lights follow your screen. Higher values fade more gently."
       value={smoothingToSlider(config.smoothingMs)}
       min={0}
       max={SMOOTHING_SLIDER_MAX}
