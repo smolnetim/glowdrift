@@ -391,7 +391,8 @@ pub(crate) mod fixtures {
        "color":{"xy":{"x":0.3,"y":0.3},"gamut_type":"B"}},
       {"id":"light-c","owner":{"rid":"dev-c","rtype":"device"},"on":{"on":true},
        "dimming":{"brightness":50.0}}]}"#;
-    pub const PAIR_OK: &str = r#"[{"success":{"username":"app-key-123","clientkey":"test-client-key"}}]"#;
+    pub const PAIR_OK: &str =
+        r#"[{"success":{"username":"app-key-123","clientkey":"test-client-key"}}]"#;
     pub const PAIR_LINK_BUTTON: &str =
         r#"[{"error":{"type":101,"address":"","description":"link button not pressed"}}]"#;
     pub const CONFIG: &str = r#"{"name":"Philips hue","apiversion":"1.78.0","bridgeid":"AABBCCFFFE112233","modelid":"BSB002"}"#;
