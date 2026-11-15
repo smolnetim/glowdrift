@@ -112,7 +112,8 @@ pub fn load_stored(dir: &Path) -> Option<StoredBridge> {
         Ok(stored) => Some(stored),
         Err(e) => {
             log::warn!(
-                "the stored Hue credentials are invalid; treating the bridge as not paired: {e}"
+                "the stored Hue credentials are invalid ({:?}); treating the bridge as not paired",
+                e.classify()
             );
             None
         }
