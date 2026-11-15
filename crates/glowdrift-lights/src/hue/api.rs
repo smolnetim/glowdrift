@@ -429,6 +429,20 @@ impl Inventory {
         )
     }
 
+    /// [`Inventory::bridge_lights`] without the lights of the entertainment area `area_id`; an
+    /// unknown area leaves the list whole.
+    pub fn bridge_lights_outside(&self, area_id: &str) -> Vec<BridgeLight> {
+        let inside: Vec<String> = self
+            .area_lights(area_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(info, _)| info.id)
+            .collect();
+        let mut lights = self.bridge_lights();
+        lights.retain(|l| !inside.contains(&l.id));
+        lights
+    }
+
     /// All lights of the bridge: colour-capable lights first, each group sorted by name.
     pub fn bridge_lights(&self) -> Vec<BridgeLight> {
         let mut lights: Vec<LightInfo> = self.lights.iter().map(|l| self.info_of(l)).collect();

@@ -1,5 +1,4 @@
 import { type FormEvent, useEffect, useId, useRef, useState } from "react";
-import { useAreaLights } from "../hooks/useAreaLights";
 import { useConfig } from "../hooks/useConfig";
 import {
   type BridgeCandidate,
@@ -323,8 +322,8 @@ function AreaPicker({
 /** Single bridge lights driven in addition to the area, each with its own zone. */
 function ExtraLights() {
   const config = useConfig();
-  const areaLights = useAreaLights();
   const extras = config.lights.hue.extraLights;
+  const areaId = config.lights.hue.areaId;
   const [lights, setLights] = useState<BridgeLight[]>([]);
   const [state, setState] = useState<AreasState>({ phase: "loading" });
   const [choice, setChoice] = useState("");
@@ -340,12 +339,12 @@ function ExtraLights() {
     }
   }
 
+  // The shell leaves out the lights of the chosen area, so the list is read again when the area changes.
   useEffect(() => {
     void load();
-  }, []);
+  }, [areaId]);
 
-  const inArea = new Set(areaLights.filter((l) => l.source === "entertainment").map((l) => l.id));
-  const available = lights.filter((l) => !inArea.has(l.id) && !extras.includes(l.id));
+  const available = lights.filter((l) => !extras.includes(l.id));
   const nameOf = (id: string) => lights.find((l) => l.id === id)?.name ?? "Unknown light";
   const picked = available.some((l) => l.id === choice) ? choice : (available[0]?.id ?? "");
 

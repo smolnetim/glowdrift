@@ -111,15 +111,21 @@ pub async fn hue_list_areas(state: State<'_, AppState>) -> Result<Vec<HueArea>, 
     blocking(move || hue::list_areas(&credentials).map_err(|e| hue_state::describe(&e))).await
 }
 
-/// The lights of the paired bridge that can be added as extra lights.
+/// The lights of the paired bridge that can be added as extra lights: every light except those of
+/// the selected entertainment area.
 #[tauri::command]
 pub async fn hue_list_lights(state: State<'_, AppState>) -> Result<Vec<BridgeLight>, String> {
+    let config = state.hue_config();
     let credentials = state
         .hue
-        .bridge(&state.hue_config())
+        .bridge(&config)
         .ok_or_else(|| NOT_PAIRED.to_owned())?
         .credentials;
-    blocking(move || hue::list_lights(&credentials).map_err(|e| hue_state::describe(&e))).await
+    let area_id = config.area_id;
+    blocking(move || {
+        hue::list_lights(&credentials, area_id.as_deref()).map_err(|e| hue_state::describe(&e))
+    })
+    .await
 }
 
 /// The lights the Hue light drives with the zone each samples; empty until the area is

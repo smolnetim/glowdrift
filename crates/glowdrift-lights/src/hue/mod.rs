@@ -230,10 +230,17 @@ pub fn list_areas(creds: &BridgeCredentials) -> Result<Vec<HueArea>, HueError> {
 }
 
 /// Lists the lights of a paired bridge that can be added as extra lights: colour-capable
-/// lights first, each group sorted by name.
-pub fn list_lights(creds: &BridgeCredentials) -> Result<Vec<BridgeLight>, HueError> {
+/// lights first, each group sorted by name. With `area_id`, the lights of that entertainment
+/// area are left out, since the area already drives them.
+pub fn list_lights(
+    creds: &BridgeCredentials,
+    area_id: Option<&str>,
+) -> Result<Vec<BridgeLight>, HueError> {
     let bridge = pinned_bridge(creds)?;
-    Ok(Inventory::fetch_lights(&bridge)?.bridge_lights())
+    Ok(match area_id {
+        Some(area_id) => Inventory::fetch(&bridge)?.bridge_lights_outside(area_id),
+        None => Inventory::fetch_lights(&bridge)?.bridge_lights(),
+    })
 }
 
 fn pinned_bridge(creds: &BridgeCredentials) -> Result<Bridge, HueError> {

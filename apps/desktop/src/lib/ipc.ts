@@ -107,7 +107,7 @@ export interface HueBridge {
   name: string | null;
 }
 
-export type HueAreaKind = "room" | "zone" | "entertainment";
+export type HueAreaKind = "entertainment";
 
 /** An entertainment area; its lights receive the colour. */
 export interface HueArea {
@@ -220,7 +220,7 @@ export const huePair = (address: string) =>
 export const hueBridge = () => call<HueBridge | null>("hue_bridge", undefined, (m) => m.hueBridge());
 /** Entertainment areas of the paired bridge. */
 export const hueListAreas = () => call<HueArea[]>("hue_list_areas", undefined, (m) => m.hueListAreas());
-/** Every light on the paired bridge, colour-capable lights first. */
+/** The lights of the paired bridge that are not in the chosen area, colour-capable lights first. */
 export const hueListLights = () => call<BridgeLight[]>("hue_list_lights", undefined, (m) => m.hueListLights());
 /**
  * The lights receiving their own zone (entertainment area first, then extra lights) with their effective

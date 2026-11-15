@@ -318,7 +318,9 @@ export async function hueListAreas(): Promise<HueArea[]> {
 export async function hueListLights(): Promise<BridgeLight[]> {
   await delay(400);
   if (!hueBridgeState) throw "Not paired with a Hue bridge.";
-  return BRIDGE_LIGHTS;
+  const areaId = config.lights.hue.areaId;
+  const inArea = new Set((areaId ? AREA_MEMBERS[areaId] : undefined)?.map((m) => m.id));
+  return BRIDGE_LIGHTS.filter((l) => !inArea.has(l.id));
 }
 
 export const hueAreaLights = async (): Promise<AreaLightZone[]> => areaLights();

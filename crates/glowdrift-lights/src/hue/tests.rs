@@ -723,7 +723,7 @@ fn restored_ids(mock: &Mock) -> Vec<String> {
 #[test]
 fn only_the_lights_of_the_bridge_are_listed_colour_lights_first() {
     let mock = Mock::start();
-    let lights = list_lights(&mock.creds()).unwrap();
+    let lights = list_lights(&mock.creds(), None).unwrap();
     let listed: Vec<_> = lights
         .iter()
         .map(|l| (l.id.as_str(), l.name.as_str()))
@@ -744,9 +744,20 @@ fn only_the_lights_of_the_bridge_are_listed_colour_lights_first() {
     let mut creds = mock.creds();
     creds.cert_sha256 = "0".repeat(64);
     assert!(matches!(
-        list_lights(&creds),
+        list_lights(&creds, None),
         Err(HueError::CertificateMismatch)
     ));
+}
+
+#[test]
+fn lights_of_the_chosen_area_are_not_offered_as_extra_lights() {
+    let mock = Mock::start();
+    let creds = mock.creds();
+    let outside = list_lights(&creds, Some("ent-2")).unwrap();
+    let listed: Vec<_> = outside.iter().map(|l| l.id.as_str()).collect();
+    assert_eq!(listed, vec!["light-b"]);
+    let unknown = list_lights(&creds, Some("nope")).unwrap();
+    assert_eq!(unknown.len(), 3);
 }
 
 #[test]

@@ -125,7 +125,7 @@ fn main() {
                 .map_err(|e| e.to_string())
         }),
         ("lights", _) => credentials().and_then(|creds| {
-            list_lights(&creds)
+            list_lights(&creds, None)
                 .map(|lights| {
                     for light in lights {
                         println!("{} {:?}", light.id, light.name);
