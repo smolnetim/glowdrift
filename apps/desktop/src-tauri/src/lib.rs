@@ -230,6 +230,7 @@ pub fn run() {
             hue_commands::hue_select_area,
             hue_commands::hue_forget,
             hue_commands::hue_area_lights,
+            hue_commands::hue_refresh_area_lights,
             hue_commands::hue_list_lights,
         ])
         .build(tauri::generate_context!())

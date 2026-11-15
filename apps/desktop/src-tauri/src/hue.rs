@@ -229,6 +229,11 @@ impl HueState {
     pub fn area_lights(&self) -> Vec<AreaLightZone> {
         self.handle.area_lights().unwrap_or_default()
     }
+
+    /// A handle to the running light, for work that must move to a blocking thread.
+    pub fn handle(&self) -> HueHandle {
+        self.handle.clone()
+    }
 }
 
 #[cfg(test)]
