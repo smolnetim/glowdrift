@@ -22,16 +22,16 @@ How it works in Glowdrift:
 - The SDK is a native library (`iCUESDK.x64_2019.dll`) that Glowdrift loads at run time. It looks in the
   executable's folder, its `resources` subfolder, the app's bundled resource folder and an `icue-sdk` folder in the
   app data directory (`%APPDATA%\gg.t1m.glowdrift\icue-sdk`). `PATH` and the working directory are never
-  searched. If the library or iCUE itself is missing, the output reports `unavailable` and the rest of the app keeps
+  searched. If the library or iCUE itself is missing, the light reports `unavailable` and the rest of the app keeps
   working.
-- The output connects, enumerates devices, and applies the current colour to the devices' lighting. The status
+- The light connects, enumerates devices, and applies the current colour to the devices' lighting. The status
   panel shows the state (`connected`, `connecting`, `unavailable`, `error`, `disabled`), a detail message and the
   number of devices found.
 - A device that fails to report its LEDs or to accept a colour is skipped and logged while the other devices keep
   working. The status detail names the skipped devices, and they are tried again on a later enumeration with a
   growing delay (1 s up to 30 s).
 - Colours are sent only when they change.
-- Disabling the output, or pausing the engine, stops Glowdrift sending colours and shuts the output down.
+- Disabling the light, or pausing the engine, stops Glowdrift sending colours and shuts the light down.
 
 Trade-offs:
 
@@ -57,7 +57,7 @@ The download is pinned to release `v4.0.84` of `CorsairOfficial/cue-sdk` (`iCUES
   member names are never used as file paths.
 - The library is written to `icue-sdk` in the app data directory through a temporary file and a rename. A file that
   already has the expected checksum is left alone.
-- The iCUE output then retries loading at once; no restart is needed.
+- The iCUE light then retries loading at once; no restart is needed.
 - Nothing is downloaded until the user presses the button.
 
 Changing the pinned version means updating the URL and both checksums in `apps/desktop/src-tauri/src/icue_sdk.rs`.
@@ -110,20 +110,20 @@ Trade-offs compared with direct control:
 - More moving parts, driver installation, and added latency from the other app's own sampling and processing.
 - The other app's own effects (its own smoothing, saturation and brightness) apply on top of Glowdrift's.
 
-## Adding another output
+## Adding another light
 
-Outputs implement the `Output` trait in `crates/glowdrift-outputs`:
+Lights implement the `Light` trait in `crates/glowdrift-lights`:
 
 ```rust
-pub trait Output: Send {
+pub trait Light: Send {
     fn id(&self) -> &str;
-    fn status(&self) -> OutputStatus;
+    fn status(&self) -> LightStatus;
     fn set_enabled(&mut self, enabled: bool);
-    fn set_color(&mut self, color: Rgb) -> Result<(), OutputError>;
+    fn set_color(&mut self, color: Rgb) -> Result<(), LightError>;
     fn shutdown(&mut self);
 }
 ```
 
 `set_color` receives the smoothed sRGB colour, and only when it changed. `status` is polled about once a second.
-New outputs also need an entry in the configuration schema (`outputs`) and the IPC `OutputStatus.kind` type; see
+New lights also need an entry in the configuration schema (`lights`) and the IPC `LightStatus.kind` type; see
 [architecture.md](architecture.md).

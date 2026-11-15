@@ -3,9 +3,11 @@
 pub mod commands;
 pub mod config_store;
 pub mod engine;
+pub mod frame_source;
 pub mod icue_sdk;
-pub mod outputs_manager;
+pub mod lights_manager;
 pub mod per_machine;
+mod timing;
 pub mod tray;
 pub mod updater;
 pub mod window;
@@ -23,7 +25,7 @@ use tauri_plugin_log::{RotationStrategy, Target, TargetKind};
 use commands::{AppState, ColorEvent, events};
 use config_store::ConfigStore;
 use engine::{EngineEvents, EngineHandle, EngineStatus};
-use outputs_manager::{OutputsManager, default_outputs};
+use lights_manager::{LightsManager, default_lights};
 
 /// Argument passed by the autostart entry.
 const MINIMIZED_ARG: &str = "--minimized";
@@ -43,9 +45,9 @@ struct TauriEvents {
 }
 
 impl EngineEvents for TauriEvents {
-    fn color(&self, raw: Rgb, smoothed: Rgb) {
+    fn color(&self, target: Rgb, smoothed: Rgb) {
         let payload = ColorEvent {
-            raw: raw.to_hex(),
+            target: target.to_hex(),
             smoothed: smoothed.to_hex(),
         };
         let _ = self.app.emit(events::COLOR, payload);
@@ -105,15 +107,15 @@ fn initialise(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let config = store.load();
 
     let emit_handle = handle.clone();
-    let outputs = OutputsManager::new(default_outputs(&handle), &config.outputs, move |statuses| {
-        let _ = emit_handle.emit(events::OUTPUTS_STATUS, statuses);
+    let lights = LightsManager::new(default_lights(&handle), &config.lights, move |statuses| {
+        let _ = emit_handle.emit(events::LIGHTS_STATUS, statuses);
     });
-    outputs.start_poller();
+    lights.start_poller();
 
     let pause_item = tray::build(&handle)?;
     let engine = EngineHandle::spawn(
         config.clone(),
-        Arc::clone(&outputs),
+        Arc::clone(&lights),
         TauriEvents {
             app: handle.clone(),
             pause_item,
@@ -128,7 +130,7 @@ fn initialise(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         config: Mutex::new(config),
         store,
         engine,
-        outputs,
+        lights,
         pending_update: Mutex::new(None),
         show_on_load: AtomicBool::new(!start_hidden),
         quitting: AtomicBool::new(false),
@@ -202,7 +204,7 @@ pub fn run() {
             commands::get_monitor_thumbnail,
             commands::get_engine_status,
             commands::set_engine_running,
-            commands::list_outputs,
+            commands::list_lights,
             commands::get_app_info,
             commands::install_pending_update,
             commands::update_needs_elevation,

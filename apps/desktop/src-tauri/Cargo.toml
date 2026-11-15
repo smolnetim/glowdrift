@@ -9,6 +9,10 @@ rust-version.workspace = true
 authors.workspace = true
 publish = false
 
+[features]
+# Logs per-stage engine-loop timings and thread CPU time; see docs/profiling.md.
+engine-timing = ["glowdrift-capture/cpu-timing"]
+
 [lib]
 name = "glowdrift_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -19,7 +23,7 @@ tauri-build = { workspace = true }
 [dependencies]
 glowdrift-core = { workspace = true }
 glowdrift-capture = { workspace = true }
-glowdrift-outputs = { workspace = true }
+glowdrift-lights = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
@@ -36,6 +40,7 @@ zip = { version = "9.5.1", default-features = false, features = ["deflate-flate2
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }

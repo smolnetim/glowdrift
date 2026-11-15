@@ -1,4 +1,4 @@
-//! Reduction of a frame to a single colour, and output colour adjustment.
+//! Reduction of a frame to a single colour, and brightness and saturation adjustment.
 //!
 //! # Average
 //!
@@ -22,6 +22,7 @@
 //! 4. The result is the weighted linear-light mean of the winning bin and its neighbours,
 //!    not the bin centre.
 
+use std::cell::RefCell;
 use std::sync::OnceLock;
 
 use crate::color::{LinearRgb, srgb_lut};
@@ -109,11 +110,64 @@ fn axis_triple(idx: usize, axis: usize) -> [Option<usize>; 3] {
     [Some(idx), neighbour(idx, axis, -1), neighbour(idx, axis, 1)]
 }
 
+/// Working memory of `dominant`, allocated once per thread and reused by every call.
+struct Scratch {
+    counts: Box<[u32; BINS]>,
+    sums: Box<[[f32; 3]; BINS]>,
+    /// Two score buffers the box filter alternates between.
+    scores: [Box<[f32; BINS]>; 2],
+}
+
+/// A zero-filled array allocated directly on the heap (never built on the stack).
+fn boxed_array<T: Copy + Default>() -> Box<[T; BINS]> {
+    vec![T::default(); BINS]
+        .into_boxed_slice()
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("length is BINS"))
+}
+
+impl Scratch {
+    fn new() -> Self {
+        Self {
+            counts: boxed_array(),
+            sums: boxed_array(),
+            scores: [boxed_array(), boxed_array()],
+        }
+    }
+}
+
+thread_local! {
+    static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::new());
+}
+
+/// One pass of the separable 3x3x3 box filter along `axis`: `dst[i]` is `src[i]` plus its
+/// in-range neighbours along that axis.
+fn box_filter_axis(src: &[f32; BINS], dst: &mut [f32; BINS], axis: usize) {
+    for (idx, out) in dst.iter_mut().enumerate() {
+        let mut total = src[idx];
+        for step in [-1, 1] {
+            if let Some(n) = neighbour(idx, axis, step) {
+                total += src[n];
+            }
+        }
+        *out = total;
+    }
+}
+
 fn dominant(frame: &FrameView) -> LinearRgb {
+    SCRATCH.with_borrow_mut(|scratch| dominant_with(frame, scratch))
+}
+
+fn dominant_with(frame: &FrameView, scratch: &mut Scratch) -> LinearRgb {
     let lut = srgb_lut();
     let weights = bin_weights();
-    let mut counts = [0_u32; BINS];
-    let mut sums = vec![[0.0_f32; 3]; BINS];
+    let Scratch {
+        counts,
+        sums,
+        scores: [scores_a, scores_b],
+    } = scratch;
+    counts.fill(0);
+    sums.fill([0.0; 3]);
 
     for y in 0..frame.height {
         let Some(row) = frame.row(y) else {
@@ -132,25 +186,16 @@ fn dominant(frame: &FrameView) -> LinearRgb {
         }
     }
 
-    let mut scores = [0.0_f32; BINS];
-    for (score, (&count, &weight)) in scores.iter_mut().zip(counts.iter().zip(weights)) {
+    for (score, (&count, &weight)) in scores_a.iter_mut().zip(counts.iter().zip(weights)) {
         *score = count as f32 * weight;
     }
-    for axis in 0..3 {
-        let src = scores;
-        for (idx, score) in scores.iter_mut().enumerate() {
-            let mut total = src[idx];
-            for step in [-1, 1] {
-                if let Some(n) = neighbour(idx, axis, step) {
-                    total += src[n];
-                }
-            }
-            *score = total;
-        }
-    }
+    // Three passes ping-pong a -> b -> a -> b, so the filtered scores end up in `scores_b`.
+    box_filter_axis(scores_a, scores_b, 0);
+    box_filter_axis(scores_b, scores_a, 1);
+    box_filter_axis(scores_a, scores_b, 2);
 
     let mut best: Option<(usize, f32)> = None;
-    for (idx, (&count, &score)) in counts.iter().zip(scores.iter()).enumerate() {
+    for (idx, (&count, &score)) in counts.iter().zip(scores_b.iter()).enumerate() {
         if count > 0 && best.is_none_or(|(_, top)| score > top) {
             best = Some((idx, score));
         }
@@ -185,7 +230,7 @@ fn dominant(frame: &FrameView) -> LinearRgb {
     )
 }
 
-/// Output gain and saturation applied after smoothing.
+/// Brightness gain and saturation applied to a reduced colour to give the target colour.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ColorAdjust {
     /// Linear gain, `0.0..=1.0`.
@@ -494,6 +539,73 @@ mod tests {
         let (la, lb) = (a.to_linear().r, b.to_linear().r);
         assert!(out.r > la && out.r < lb, "{out:?}");
         assert!(out.b < 0.01, "{out:?}");
+    }
+
+    /// Deterministic frames used to pin `dominant`'s exact output.
+    fn pinned_frame(case: usize) -> (u32, u32, Vec<u8>) {
+        let mut rng = Lcg(1000 + case as u64);
+        let (w, h) = [(240, 135), (240, 135), (128, 72), (37, 23)][case];
+        let (data, _) = buffer(w, h, 0, |x, y| match case {
+            // Smooth gradient with noise.
+            0 => Rgb::new(
+                (x * 255 / w) as u8,
+                (y * 255 / h) as u8,
+                rng.byte() / 4 + 100,
+            ),
+            // Three colour regions plus noise.
+            1 => {
+                let base = match x * 3 / w {
+                    0 => [220_i32, 40, 30],
+                    1 => [30, 200, 90],
+                    _ => [40, 60, 210],
+                };
+                let mut j = |v: i32| (v + i32::from(rng.byte() % 9) - 4).clamp(0, 255) as u8;
+                Rgb::new(j(base[0]), j(base[1]), j(base[2]))
+            }
+            // Fully random.
+            2 => Rgb::new(rng.byte(), rng.byte(), rng.byte()),
+            // Dark scene with a few bright pixels.
+            _ => {
+                if (x + y) % 11 == 0 {
+                    Rgb::new(250, 240, 10)
+                } else {
+                    Rgb::new(rng.byte() % 20, rng.byte() % 20, rng.byte() % 20)
+                }
+            }
+        });
+        (w, h, data)
+    }
+
+    fn reduce_pinned(case: usize) -> LinearRgb {
+        let (w, h, data) = pinned_frame(case);
+        reduce(
+            &FrameView::new(&data, w, h, w as usize * 4),
+            ReduceMode::Dominant,
+        )
+    }
+
+    #[test]
+    fn dominant_output_is_pinned() {
+        const EXPECTED: [[u32; 3]; 4] = [
+            [1_062_101_972, 1_009_652_154, 1_048_591_826],
+            [1_060_583_719, 1_018_055_630, 1_012_165_730],
+            [1_060_190_068, 1_009_416_175, 1_062_269_363],
+            [1_064_614_572, 1_063_195_125, 994_503_536],
+        ];
+        for (case, expected) in EXPECTED.iter().enumerate() {
+            let out = reduce_pinned(case);
+            let bits = [out.r.to_bits(), out.g.to_bits(), out.b.to_bits()];
+            assert_eq!(&bits, expected, "case {case}: {out:?}");
+        }
+    }
+
+    #[test]
+    fn dominant_is_stable_across_repeated_calls() {
+        // Reused scratch must not leak state between calls on different frames.
+        let first: Vec<_> = (0..4).map(reduce_pinned).collect();
+        for case in [3, 0, 2, 1, 0, 3] {
+            assert_eq!(reduce_pinned(case), first[case], "case {case}");
+        }
     }
 
     #[test]

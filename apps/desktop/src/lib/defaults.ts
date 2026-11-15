@@ -10,7 +10,7 @@ export const DEFAULT_CONFIG: Config = {
   smoothingMs: 500,
   brightness: 1,
   saturation: 1,
-  outputs: { icue: { enabled: true } },
+  lights: { icue: { enabled: true } },
   startMinimized: true,
   autoUpdate: true,
 };

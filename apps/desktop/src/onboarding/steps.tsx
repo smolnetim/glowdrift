@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { ModeChoice, SmoothingControl } from "../components/ColorFeel";
 import { Icon, type IconName } from "../components/Icon";
 import { LiveSwatch } from "../components/LiveColor";
-import { OutputsPanel } from "../components/Outputs";
+import { LightsPanel } from "../components/LightsPanel";
 import { ScreenRegionPicker } from "../components/ScreenRegionPicker";
 import { AutoUpdateToggle, StartMinimisedToggle, StartWithWindowsToggle } from "../components/StartupToggles";
 
@@ -64,7 +64,7 @@ export const STEPS: readonly Step[] = [
     id: "lights",
     title: "Connect your lights",
     summary: "Glowdrift looks for supported lights on this PC.",
-    body: <OutputsPanel />,
+    body: <LightsPanel />,
   },
   {
     id: "feel",

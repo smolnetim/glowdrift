@@ -4,7 +4,7 @@
   initial-value: #000000;
 }
 
-@property --live-raw {
+@property --live-target {
   syntax: "<color>";
   inherits: true;
   initial-value: #000000;
@@ -39,15 +39,15 @@
 
   /* Live colour, mirrored from engine events by script. */
   --live: #000000;
-  --live-raw: #000000;
+  --live-target: #000000;
   --live-ink: #ffffff;
-  --live-raw-ink: #ffffff;
+  --live-target-ink: #ffffff;
   --live-strength: 0;
   --live-accent: color-mix(in srgb, var(--live) calc(var(--live-strength) * 100%), var(--accent));
 
   transition:
     --live 160ms linear,
-    --live-raw 160ms linear;
+    --live-target 160ms linear;
 }
 
 @media (prefers-color-scheme: light) {

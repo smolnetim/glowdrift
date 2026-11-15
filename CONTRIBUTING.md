@@ -14,7 +14,7 @@ Windows 11 only.
 ## Layout
 
 `crates/glowdrift-core` is platform independent and holds the colour maths, reduction, smoothing and config
-schema. `crates/glowdrift-capture` and `crates/glowdrift-outputs` are the Windows-facing crates. `apps/desktop` is
+schema. `crates/glowdrift-capture` and `crates/glowdrift-lights` are the Windows-facing crates. `apps/desktop` is
 the Tauri v2 app (`src/` is React and TypeScript, `src-tauri/` is the Rust shell). See
 [docs/architecture.md](docs/architecture.md).
 

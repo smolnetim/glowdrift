@@ -53,16 +53,16 @@ The single colour the lights should show right now: the colour reduced from the 
 _Avoid_: Raw colour, source colour, input colour
 
 **Smoothed colour**:
-The colour that eases toward the Target colour over time and is what the Outputs actually receive.
+The colour that eases toward the Target colour over time and is what the Lights actually receive.
 _Avoid_: Output colour, current colour
 
-**Output**:
+**Light**:
 A lighting device or service that receives the Smoothed colour.
-_Avoid_: Sink, device
+_Avoid_: Output, sink, device
 
-**Output rate**:
-How often the Smoothed colour is advanced and sent to the Outputs, independent of the Capture rate.
-_Avoid_: Tick rate, update rate
+**Smoothing rate**:
+How often the Smoothed colour is advanced and sent to the Lights, independent of the Capture rate. It is the fastest maximum rate declared by the enabled Lights, raised to the preview rate while the preview is on, and zero when neither consumes the colour.
+_Avoid_: Output rate, tick rate, update rate
 
 **Settled**:
 The state in which the Smoothed colour has reached the Target colour, so the engine stops advancing it until the Target colour changes again.

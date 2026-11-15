@@ -1,12 +1,12 @@
 import { ColorChip } from "../components/LiveColor";
 import { Icon } from "../components/Icon";
 import { Banner, Card, Page } from "../components/layout";
-import { StateBadge } from "../components/Outputs";
+import { StateBadge } from "../components/LightsPanel";
 import { formatFps } from "../lib/format";
 import { useStore } from "../lib/store";
 import { configStore } from "../state/config";
 import { engineStore, toggleEngine } from "../state/engine";
-import { outputsStore } from "../state/outputs";
+import { lightsStore } from "../state/lights";
 
 function EngineCard() {
   const { status, commandFailed } = useStore(engineStore);
@@ -35,18 +35,18 @@ function EngineCard() {
   );
 }
 
-function OutputSummary() {
-  const outputs = useStore(outputsStore);
+function LightSummary() {
+  const lights = useStore(lightsStore);
   return (
     <Card title="Lights">
-      {outputs.length === 0 ? (
+      {lights.length === 0 ? (
         <p className="muted-text">No lights detected yet. Open the Lights page to set one up.</p>
       ) : (
         <ul className="chip-list">
-          {outputs.map((output) => (
-            <li key={output.id} className="chip">
-              <span>{output.name}</span>
-              <StateBadge output={output} />
+          {lights.map((light) => (
+            <li key={light.id} className="chip">
+              <span>{light.name}</span>
+              <StateBadge light={light} />
             </li>
           ))}
         </ul>
@@ -68,12 +68,12 @@ export function Dashboard() {
         <div className="hero-glow" aria-hidden="true" />
         <div className="hero-swatches">
           <ColorChip kind="smoothed" size="large" label="Smoothed colour sent to lights" />
-          <ColorChip kind="raw" size="small" label="Raw colour from screen" />
+          <ColorChip kind="target" size="small" label="Target colour from screen" />
         </div>
       </section>
       <div className="grid-2">
         <EngineCard />
-        <OutputSummary />
+        <LightSummary />
       </div>
     </Page>
   );

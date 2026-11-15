@@ -10,6 +10,7 @@ mod imp {
     use std::ffi::{c_char, c_int, c_void};
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicI32, Ordering};
     use std::sync::{Arc, Mutex, PoisonError};
 
     use glowdrift_core::Rgb;
@@ -109,6 +110,8 @@ mod imp {
     const EVENT_DEVICE_CONNECTION_STATUS_CHANGED: c_int = 1;
 
     type SessionHandler = unsafe extern "C" fn(*mut c_void, *const CorsairSessionStateChanged);
+    /// `CorsairAsyncCallback`.
+    type AsyncHandler = unsafe extern "C" fn(*mut c_void, c_int);
     type EventHandler = unsafe extern "C" fn(*mut c_void, *const CorsairEvent);
 
     /// Resolved exports. The function pointers are valid while `_lib` is loaded; `_lib` is
@@ -132,6 +135,9 @@ mod imp {
         subscribe_for_events: unsafe extern "C" fn(EventHandler, *mut c_void) -> c_int,
         unsubscribe_from_events: unsafe extern "C" fn() -> c_int,
         set_led_colors: unsafe extern "C" fn(*const c_char, c_int, *const CorsairLedColor) -> c_int,
+        set_led_colors_buffer:
+            unsafe extern "C" fn(*const c_char, c_int, *const CorsairLedColor) -> c_int,
+        flush_led_colors_buffer: unsafe extern "C" fn(AsyncHandler, *mut c_void) -> c_int,
         get_led_colors: unsafe extern "C" fn(*const c_char, c_int, *mut CorsairLedColor) -> c_int,
         set_layer_priority: unsafe extern "C" fn(u32) -> c_int,
         release_control: unsafe extern "C" fn(*const c_char) -> c_int,
@@ -141,6 +147,9 @@ mod imp {
     /// Shared target of the SDK callbacks.
     struct CallbackCtx {
         sink: Mutex<Option<EventSink>>,
+        /// Raw error code of the last buffer flush that failed after it was accepted; 0 when
+        /// none is pending.
+        flush_error: AtomicI32,
     }
 
     impl CallbackCtx {
@@ -189,6 +198,18 @@ mod imp {
                 && event.id == EVENT_DEVICE_CONNECTION_STATUS_CHANGED
             {
                 ctx.emit(SdkEvent::DevicesChanged);
+            }
+        }));
+    }
+
+    /// `CorsairAsyncCallback` of `CorsairSetLedColorsFlushBufferAsync`.
+    unsafe extern "C" fn on_flush_done(context: *mut c_void, error: c_int) {
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            if error != 0 {
+                // SAFETY: same contract as `on_session_state`.
+                if let Some(ctx) = unsafe { context.cast::<CallbackCtx>().as_ref() } {
+                    ctx.flush_error.store(error, Ordering::Release);
+                }
             }
         }));
     }
@@ -311,6 +332,8 @@ mod imp {
                 subscribe_for_events: export!(lib, "CorsairSubscribeForEvents"),
                 unsubscribe_from_events: export!(lib, "CorsairUnsubscribeFromEvents"),
                 set_led_colors: export!(lib, "CorsairSetLedColors"),
+                set_led_colors_buffer: export!(lib, "CorsairSetLedColorsBuffer"),
+                flush_led_colors_buffer: export!(lib, "CorsairSetLedColorsFlushBufferAsync"),
                 get_led_colors: export!(lib, "CorsairGetLedColors"),
                 set_layer_priority: export!(lib, "CorsairSetLayerPriority"),
                 release_control: export!(lib, "CorsairReleaseControl"),
@@ -349,11 +372,26 @@ mod imp {
                 dirs,
                 ctx: Arc::new(CallbackCtx {
                     sink: Mutex::new(None),
+                    flush_error: AtomicI32::new(0),
                 }),
                 session_open: false,
                 events_subscribed: false,
                 led_buffer: Vec::new(),
             }
+        }
+
+        /// Fills `led_buffer` with an opaque `color` for each of `led_ids` and returns its length.
+        fn fill_led_buffer(&mut self, led_ids: &[u32], color: Rgb) -> Result<c_int, SdkError> {
+            self.led_buffer.clear();
+            self.led_buffer
+                .extend(led_ids.iter().map(|&id| CorsairLedColor {
+                    id,
+                    r: color.r,
+                    g: color.g,
+                    b: color.b,
+                    a: 255,
+                }));
+            buf_len(self.led_buffer.len())
         }
 
         fn api(&self) -> Result<&Api, SdkError> {
@@ -507,21 +545,43 @@ mod imp {
             color: Rgb,
         ) -> Result<(), SdkError> {
             let id = device_id_buf(device)?;
-            self.led_buffer.clear();
-            self.led_buffer
-                .extend(led_ids.iter().map(|&id| CorsairLedColor {
-                    id,
-                    r: color.r,
-                    g: color.g,
-                    b: color.b,
-                    a: 255,
-                }));
-            let size = buf_len(self.led_buffer.len())?;
+            let size = self.fill_led_buffer(led_ids, color)?;
             // SAFETY: `id` is NUL-terminated and `led_buffer` holds `size` initialised entries.
             let raw = unsafe {
                 (self.api()?.set_led_colors)(id.as_ptr().cast(), size, self.led_buffer.as_ptr())
             };
             check("CorsairSetLedColors", raw)
+        }
+
+        fn buffer_leds_color(
+            &mut self,
+            device: &str,
+            led_ids: &[u32],
+            color: Rgb,
+        ) -> Result<(), SdkError> {
+            let id = device_id_buf(device)?;
+            let size = self.fill_led_buffer(led_ids, color)?;
+            // SAFETY: `id` is NUL-terminated and `led_buffer` holds `size` initialised entries;
+            // the SDK copies them before returning.
+            let raw = unsafe {
+                (self.api()?.set_led_colors_buffer)(
+                    id.as_ptr().cast(),
+                    size,
+                    self.led_buffer.as_ptr(),
+                )
+            };
+            check("CorsairSetLedColorsBuffer", raw)
+        }
+
+        fn flush_leds(&mut self) -> Result<(), SdkError> {
+            let context = self.context();
+            let flush = self.api()?.flush_led_colors_buffer;
+            let earlier = self.ctx.flush_error.swap(0, Ordering::Acquire);
+            // SAFETY: `on_flush_done` matches `CorsairAsyncCallback` and `context` outlives the
+            // library (see `FfiSdk` field order).
+            let raw = unsafe { flush(on_flush_done, context) };
+            check("CorsairSetLedColorsFlushBufferAsync", raw)?;
+            check("CorsairSetLedColorsFlushBufferAsync", earlier)
         }
 
         fn led_colors(&mut self, device: &str, led_ids: &[u32]) -> Result<Vec<Rgb>, SdkError> {
@@ -660,6 +720,17 @@ mod imp {
             _led_ids: &[u32],
             _color: Rgb,
         ) -> Result<(), SdkError> {
+            Err(unsupported())
+        }
+        fn buffer_leds_color(
+            &mut self,
+            _device: &str,
+            _led_ids: &[u32],
+            _color: Rgb,
+        ) -> Result<(), SdkError> {
+            Err(unsupported())
+        }
+        fn flush_leds(&mut self) -> Result<(), SdkError> {
             Err(unsupported())
         }
         fn led_colors(&mut self, _device: &str, _led_ids: &[u32]) -> Result<Vec<Rgb>, SdkError> {

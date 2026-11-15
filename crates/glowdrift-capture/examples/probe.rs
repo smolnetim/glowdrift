@@ -175,10 +175,10 @@ fn run_capture(capturer: &mut Capturer, target: Option<&str>, args: &Args) -> Ru
         let used = thread_cycles() - cycles;
         match result {
             Ok(Some(frame)) => {
+                last = Some(Frame::from_view(&frame));
                 grab_times.push(begin.elapsed());
                 cpu_times.push(Duration::from_secs_f64(used as f64 / hz));
                 timings.push(capturer.last_timings());
-                last = Some(frame);
             }
             Ok(None) => timeouts += 1,
             Err(CaptureError::AccessLost) => {
@@ -245,12 +245,36 @@ fn report(run: &Run) {
             cpu_sorted[cpu_sorted.len() - 1]
         );
         println!(
-            "avg phases per grab: acquire(wait) {:.2?}  store {:.2?}  submit {:.2?}  map-block {:.2?}",
+            "avg phases per grab: acquire(wait) {:.2?}  store {:.2?}  submit {:.2?}  map-block {:.2?}  collect {:.2?}  gpu-wait {:.2?}  read-back {:.2?}",
             avg(|t| t.acquire),
             avg(|t| t.store),
             avg(|t| t.submit),
-            avg(|t| t.map)
+            avg(|t| t.map),
+            avg(|t| t.collect_ready),
+            avg(|t| t.wait_for_gpu),
+            avg(|t| t.read_back)
         );
+        let cpu_avg = |f: fn(&GrabTimings) -> u64| {
+            glowdrift_capture::cpu::cycles_to_duration(
+                run.timings.iter().map(f).sum::<u64>() / u64::from(n),
+            )
+        };
+        if run
+            .timings
+            .iter()
+            .any(|t| t.cpu.acquire + t.cpu.read_back > 0)
+        {
+            println!(
+                "avg CPU per grab: acquire {:.2?}  store {:.2?}  submit {:.2?}  map {:.2?}  collect {:.2?}  gpu-wait {:.2?}  read-back {:.2?}",
+                cpu_avg(|t| t.cpu.acquire),
+                cpu_avg(|t| t.cpu.store),
+                cpu_avg(|t| t.cpu.submit),
+                cpu_avg(|t| t.cpu.map),
+                cpu_avg(|t| t.cpu.collect_ready),
+                cpu_avg(|t| t.cpu.wait_for_gpu),
+                cpu_avg(|t| t.cpu.read_back)
+            );
+        }
         let mut latencies: Vec<Duration> = run.timings.iter().filter_map(|t| t.latency).collect();
         latencies.sort();
         if !latencies.is_empty() {

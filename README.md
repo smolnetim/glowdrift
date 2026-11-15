@@ -12,9 +12,9 @@ Early development, pre-1.0. Everything here is subject to change.
 | --- | --- |
 | Capture a display region (DXGI Desktop Duplication, GPU downscale) | In development |
 | Average and dominant colour, exponential smoothing, brightness and saturation | In development |
-| Corsair iCUE output (official iCUE SDK) | In development |
+| Corsair iCUE light (official iCUE SDK) | In development |
 | System tray, start minimised, auto-update | In development |
-| Philips Hue output | Planned |
+| Philips Hue light | Planned |
 | Virtual-display fallback for apps that can only sample a screen | Planned |
 
 See [docs/integrations.md](docs/integrations.md) for what each lighting route does and what is implemented.
@@ -46,15 +46,15 @@ flowchart LR
     A[Display region] -->|DXGI Desktop Duplication,<br/>GPU downscale| B[Capture thread<br/>captureFps]
     B -->|small frame| C[Reduce to one colour<br/>average or dominant,<br/>linear light]
     C -->|target colour| D[Smoother<br/>~60 Hz, exponential]
-    D -->|sRGB, only on change| E[Outputs<br/>Corsair iCUE]
+    D -->|sRGB, only on change| E[Lights<br/>Corsair iCUE]
     D -.->|throttled preview,<br/>only while window visible| F[UI]
 ```
 
 - Capture is cheap: the frame is shrunk on the GPU, so only a small image is read back.
 - The colour is computed in linear light, which averages brightness the way your eyes see it.
-- The smoother runs at a fixed output rate that is independent of the capture rate, so fades stay fluid even at
+- The smoother runs at a fixed smoothing rate that is independent of the capture rate, so fades stay fluid even at
   5 captures per second.
-- Outputs only receive a colour when it actually changed, and the engine sleeps when the light has settled, so the
+- Lights only receive a colour when it actually changed, and the engine sleeps when the light has settled, so the
   app idles at very low CPU.
 
 Details are in [docs/architecture.md](docs/architecture.md).
@@ -110,7 +110,7 @@ is set, because the bundle config enables them. See [CONTRIBUTING.md](CONTRIBUTI
 ```
 crates/glowdrift-core/      Colour maths, reduction, smoothing, config schema and validation (platform independent)
 crates/glowdrift-capture/   Windows monitor enumeration and DXGI Desktop Duplication capture
-crates/glowdrift-outputs/   Output trait and sinks (iCUE now; Hue and virtual display later)
+crates/glowdrift-lights/   Light trait and lights (iCUE now; Hue and virtual display later)
 apps/desktop/               Tauri v2 app: React + TypeScript frontend (src/) and Rust shell (src-tauri/)
 docs/                       Architecture, update policy, release process, integrations
 scripts/                    Version bump and release helper scripts

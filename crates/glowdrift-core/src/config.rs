@@ -43,7 +43,7 @@ impl<'de> Deserialize<'de> for ReduceMode {
     }
 }
 
-/// Settings for the iCUE output.
+/// Settings for the iCUE light.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct IcueConfig {
@@ -56,10 +56,10 @@ impl Default for IcueConfig {
     }
 }
 
-/// Per-output settings.
+/// Per-light settings.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
-pub struct OutputsConfig {
+pub struct LightsConfig {
     pub icue: IcueConfig,
 }
 
@@ -78,11 +78,11 @@ pub struct Config {
     pub mode: ReduceMode,
     /// Exponential smoothing time constant in milliseconds, `0..=5000`.
     pub smoothing_ms: u32,
-    /// Output gain, `0.0..=1.0`.
+    /// Brightness gain, `0.0..=1.0`.
     pub brightness: f32,
     /// Saturation multiplier, `0.0..=2.0`.
     pub saturation: f32,
-    pub outputs: OutputsConfig,
+    pub lights: LightsConfig,
     pub start_minimized: bool,
     pub auto_update: bool,
 }
@@ -142,7 +142,7 @@ impl Default for Config {
             smoothing_ms: 500,
             brightness: 1.0,
             saturation: 1.0,
-            outputs: OutputsConfig::default(),
+            lights: LightsConfig::default(),
             start_minimized: true,
             auto_update: true,
         }
@@ -170,7 +170,7 @@ mod tests {
         let v = serde_json::to_value(Config::default()).unwrap();
         assert_eq!(v["schemaVersion"], 1);
         assert_eq!(v["mode"], "average");
-        assert_eq!(v["outputs"]["icue"]["enabled"], true);
+        assert_eq!(v["lights"]["icue"]["enabled"], true);
         assert_eq!(v["monitorId"], serde_json::Value::Null);
         assert_eq!(v["region"]["width"], 1.0);
     }
@@ -226,7 +226,7 @@ mod tests {
             smoothing_ms: 1234,
             brightness: 0.75,
             saturation: 1.5,
-            outputs: OutputsConfig {
+            lights: LightsConfig {
                 icue: IcueConfig { enabled: false },
             },
             start_minimized: false,
@@ -241,12 +241,12 @@ mod tests {
 
     #[test]
     fn partial_nested_objects_default_missing_fields() {
-        let c: Config = serde_json::from_str(r#"{"region":{"x":0.5},"outputs":{}}"#).unwrap();
+        let c: Config = serde_json::from_str(r#"{"region":{"x":0.5},"lights":{}}"#).unwrap();
         assert_eq!(c.region, NormRect::new(0.5, 0.0, 1.0, 1.0));
-        assert!(c.outputs.icue.enabled);
+        assert!(c.lights.icue.enabled);
         let c: Config =
-            serde_json::from_str(r#"{"outputs":{"icue":{"enabled":false,"x":1}}}"#).unwrap();
-        assert!(!c.outputs.icue.enabled);
+            serde_json::from_str(r#"{"lights":{"icue":{"enabled":false,"x":1}}}"#).unwrap();
+        assert!(!c.lights.icue.enabled);
     }
 
     #[test]

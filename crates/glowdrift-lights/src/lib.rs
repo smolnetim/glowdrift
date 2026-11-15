@@ -1,30 +1,32 @@
-//! Output sinks that receive the smoothed colour.
+//! Lights that receive the smoothed colour.
 
 #![deny(unsafe_code)]
 
 pub mod icue;
 pub mod null;
 
-pub use null::NullOutput;
+pub use null::NullLight;
+
+use std::time::Duration;
 
 use glowdrift_core::Rgb;
 use serde::{Deserialize, Serialize};
 
-/// Errors an output can report from [`Output::set_color`].
+/// Errors a light can report from [`Light::set_color`].
 #[derive(Debug, thiserror::Error)]
-pub enum OutputError {
-    /// The output is not connected; the colour was dropped.
-    #[error("output unavailable: {0}")]
+pub enum LightError {
+    /// The light is not connected; the colour was dropped.
+    #[error("light unavailable: {0}")]
     Unavailable(String),
     /// The underlying SDK or device reported a failure.
-    #[error("output error: {0}")]
+    #[error("light error: {0}")]
     Failed(String),
 }
 
-/// Connection state of an output.
+/// Connection state of a light.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum OutputState {
+pub enum LightState {
     Connected,
     Connecting,
     Unavailable,
@@ -32,41 +34,45 @@ pub enum OutputState {
     Disabled,
 }
 
-/// Machine-readable reason behind an [`OutputStatus`], for UI branches that must not parse
+/// Machine-readable reason behind an [`LightStatus`], for UI branches that must not parse
 /// `detail`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum OutputCode {
-    /// The output's runtime library is not installed in any searched location.
+pub enum LightCode {
+    /// The light's runtime library is not installed in any searched location.
     LibraryMissing,
 }
 
-/// Snapshot of an output for the UI.
+/// Snapshot of a light for the UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct OutputStatus {
+pub struct LightStatus {
     pub id: String,
-    /// Output family, e.g. `"icue"`.
+    /// Light family, e.g. `"icue"`.
     pub kind: String,
     pub name: String,
     pub enabled: bool,
-    pub state: OutputState,
+    pub state: LightState,
     pub detail: Option<String>,
     pub device_count: u32,
     /// Set when `detail` has a specific machine-readable cause.
     #[serde(default)]
-    pub code: Option<OutputCode>,
+    pub code: Option<LightCode>,
 }
 
 /// An ambient-lighting target.
-pub trait Output: Send {
+pub trait Light: Send {
     fn id(&self) -> &str;
-    fn status(&self) -> OutputStatus;
+    fn status(&self) -> LightStatus;
     fn set_enabled(&mut self, enabled: bool);
+    /// The shortest useful gap between colours sent to this light, which sets its maximum
+    /// smoothing rate: colours arriving faster are dropped or coalesced. `None` means the
+    /// light has no limit and can use any rate.
+    fn min_send_interval(&self) -> Option<Duration>;
     /// Sends a colour. Must be cheap and non-blocking; implementations own their
     /// reconnect logic and drop colours while disconnected.
-    fn set_color(&mut self, color: Rgb) -> Result<(), OutputError>;
-    /// Asks the output to retry connecting now instead of waiting for its next scheduled
+    fn set_color(&mut self, color: Rgb) -> Result<(), LightError>;
+    /// Asks the light to retry connecting now instead of waiting for its next scheduled
     /// attempt, for example after a missing runtime library was installed.
     fn retry(&mut self) {}
     /// Releases devices and stops any background work.

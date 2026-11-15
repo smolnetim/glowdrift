@@ -214,6 +214,17 @@ pub trait Sdk: Send {
     /// Sets the listed LEDs of a device to one opaque colour.
     fn set_leds_color(&mut self, device: &str, led_ids: &[u32], color: Rgb)
     -> Result<(), SdkError>;
+    /// Queues the listed LEDs of a device for one opaque colour. Nothing reaches the hardware
+    /// until [`Sdk::flush_leds`], which sends everything queued for all devices in one request.
+    fn buffer_leds_color(
+        &mut self,
+        device: &str,
+        led_ids: &[u32],
+        color: Rgb,
+    ) -> Result<(), SdkError>;
+    /// Sends the queued colours. The SDK reports a failure of the transfer itself one call late,
+    /// so an error may belong to an earlier flush.
+    fn flush_leds(&mut self) -> Result<(), SdkError>;
     /// Current hardware colour of the listed LEDs.
     fn led_colors(&mut self, device: &str, led_ids: &[u32]) -> Result<Vec<Rgb>, SdkError>;
     /// Releases any control requested for a device (resets access to shared).

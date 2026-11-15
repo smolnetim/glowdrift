@@ -20,7 +20,7 @@ pub fn pause_label(running: bool) -> &'static str {
     if running { LABEL_PAUSE } else { LABEL_RESUME }
 }
 
-/// Stops the engine, releasing outputs, and exits the application.
+/// Stops the engine, releasing lights, and exits the application.
 pub fn quit(app: &AppHandle) {
     if let Some(state) = app.try_state::<AppState>() {
         state.shutdown();

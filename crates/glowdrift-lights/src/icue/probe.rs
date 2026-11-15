@@ -9,7 +9,7 @@ use glowdrift_core::Rgb;
 use super::controller::session_status;
 use super::ffi::FfiSdk;
 use super::sdk::{EventSink, Sdk, SdkError, SdkEvent, SessionState, device_type_name};
-use crate::OutputError;
+use crate::LightError;
 
 /// A lighting device found by [`probe`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,21 +34,18 @@ pub struct ProbeReport {
     pub devices: Vec<ProbeDevice>,
 }
 
-/// Connects to iCUE with the same library lookup as [`super::IcueOutput`] (plus `dll_dirs`),
+/// Connects to iCUE with the same library lookup as [`super::IcueLight`] (plus `dll_dirs`),
 /// waits up to `timeout` for the session to be established, reads the devices and disconnects.
-pub fn probe(dll_dirs: Vec<PathBuf>, timeout: Duration) -> Result<ProbeReport, OutputError> {
+pub fn probe(dll_dirs: Vec<PathBuf>, timeout: Duration) -> Result<ProbeReport, LightError> {
     probe_with(FfiSdk::new(super::library_dirs(dll_dirs)), timeout)
 }
 
-pub(crate) fn probe_with<S: Sdk>(
-    mut sdk: S,
-    timeout: Duration,
-) -> Result<ProbeReport, OutputError> {
+pub(crate) fn probe_with<S: Sdk>(mut sdk: S, timeout: Duration) -> Result<ProbeReport, LightError> {
     let (tx, rx) = mpsc::channel();
     let sink: EventSink = std::sync::Arc::new(move |event| {
         let _ = tx.send(event);
     });
-    sdk.connect(sink).map_err(to_output_error)?;
+    sdk.connect(sink).map_err(to_light_error)?;
     let result = collect_report(&mut sdk, &rx, timeout);
     sdk.disconnect();
     result
@@ -58,7 +55,7 @@ fn collect_report<S: Sdk>(
     sdk: &mut S,
     events: &mpsc::Receiver<SdkEvent>,
     timeout: Duration,
-) -> Result<ProbeReport, OutputError> {
+) -> Result<ProbeReport, LightError> {
     let deadline = Instant::now() + timeout;
     let mut states = Vec::new();
     let mut last_state = SessionState::Closed;
@@ -75,7 +72,7 @@ fn collect_report<S: Sdk>(
             Ok(SdkEvent::DevicesChanged) => {}
             Err(_) => {
                 let (_, text) = session_status(last_state);
-                return Err(OutputError::Unavailable(format!(
+                return Err(LightError::Unavailable(format!(
                     "{text} (session states seen: {})",
                     if states.is_empty() {
                         "none".to_owned()
@@ -87,10 +84,10 @@ fn collect_report<S: Sdk>(
         }
     }
 
-    let details = sdk.session_details().map_err(to_output_error)?;
+    let details = sdk.session_details().map_err(to_light_error)?;
     let mut devices = Vec::new();
-    for info in sdk.devices().map_err(to_output_error)? {
-        let led_ids = sdk.led_ids(&info.id).map_err(to_output_error)?;
+    for info in sdk.devices().map_err(to_light_error)? {
+        let led_ids = sdk.led_ids(&info.id).map_err(to_light_error)?;
         let first_led_color = led_ids
             .first()
             .and_then(|id| sdk.led_colors(&info.id, &[*id]).ok())
@@ -112,9 +109,9 @@ fn collect_report<S: Sdk>(
     })
 }
 
-fn to_output_error(err: SdkError) -> OutputError {
+fn to_light_error(err: SdkError) -> LightError {
     match err {
-        SdkError::LibraryMissing { .. } => OutputError::Unavailable(err.to_string()),
-        other => OutputError::Failed(other.to_string()),
+        SdkError::LibraryMissing { .. } => LightError::Unavailable(err.to_string()),
+        other => LightError::Failed(other.to_string()),
     }
 }

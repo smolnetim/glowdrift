@@ -11,5 +11,5 @@ GitHub Releases additionally carry notes generated from the Conventional Commit 
 
 ### Added
 
-- Project scaffold: Rust workspace (`glowdrift-core`, `glowdrift-capture`, `glowdrift-outputs`) and a Tauri v2 desktop app with a React and TypeScript frontend.
+- Project scaffold: Rust workspace (`glowdrift-core`, `glowdrift-capture`, `glowdrift-lights`) and a Tauri v2 desktop app with a React and TypeScript frontend.
 - Continuous integration, security scanning, and a tag-driven release pipeline with signed updater artifacts.

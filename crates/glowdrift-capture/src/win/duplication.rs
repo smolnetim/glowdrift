@@ -15,7 +15,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use glowdrift_core::{NormRect, PixelRect};
+use glowdrift_core::{FrameView, NormRect, PixelRect};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_10_1,
@@ -48,6 +48,47 @@ use crate::math::{
     Rotation, mip_count, mip_size, region_on_surface, select_mip_level, thumbnail_dimension,
 };
 use crate::{CaptureError, Frame, GrabTimings};
+
+/// Thread cycles of the calling thread; 0 unless the `cpu-timing` feature is on.
+fn cycles_now() -> u64 {
+    #[cfg(feature = "cpu-timing")]
+    {
+        crate::cpu::thread_cycles()
+    }
+    #[cfg(not(feature = "cpu-timing"))]
+    {
+        0
+    }
+}
+
+/// Start of a span timed in wall clock and, with `cpu-timing`, thread cycles.
+struct Span {
+    wall: Instant,
+    cycles: u64,
+}
+
+impl Span {
+    fn start() -> Self {
+        Self {
+            wall: Instant::now(),
+            cycles: cycles_now(),
+        }
+    }
+
+    /// Wall time and cycles since the start.
+    fn lap(&self) -> (Duration, u64) {
+        (
+            self.wall.elapsed(),
+            cycles_now().saturating_sub(self.cycles),
+        )
+    }
+
+    fn add_to(&self, wall: &mut Duration, cycles: &mut u64) {
+        let (w, c) = self.lap();
+        *wall += w;
+        *cycles += c;
+    }
+}
 
 use super::error::{Class, classify, map_err};
 use super::monitors::MonitorEntry;
@@ -181,6 +222,8 @@ pub(crate) struct Duplicator {
     /// Presentation time (QPC ticks) of the image in the cache.
     present_qpc: i64,
     timings: GrabTimings,
+    /// Pixels of the most recent read-back, reused so steady-state grabs do not allocate.
+    pixels: Vec<u8>,
 }
 
 // SAFETY: The D3D11 device is free-threaded, and every other COM object (immediate context,
@@ -256,14 +299,32 @@ impl Duplicator {
             dirty: false,
             present_qpc: 0,
             timings: GrabTimings::default(),
+            pixels: Vec::new(),
         })
     }
 
+    /// Waits up to `timeout` for a frame of `region`. The returned view borrows the reused
+    /// read-back buffer and stays valid until the next call.
     pub(crate) fn grab(
         &mut self,
         region: NormRect,
         timeout: Duration,
-    ) -> Result<Option<Frame>, CaptureError> {
+    ) -> Result<Option<FrameView<'_>>, CaptureError> {
+        Ok(self
+            .grab_size(region, timeout)?
+            .map(|(width, height)| self.view(width, height)))
+    }
+
+    fn view(&self, width: u32, height: u32) -> FrameView<'_> {
+        FrameView::new(&self.pixels, width, height, width as usize * 4)
+    }
+
+    /// Like [`Self::grab`], leaving the frame in `self.pixels` and returning its size.
+    fn grab_size(
+        &mut self,
+        region: NormRect,
+        timeout: Duration,
+    ) -> Result<Option<(u32, u32)>, CaptureError> {
         let key = Key {
             region: region.clamped(),
             max_dimension: self.max_dimension,
@@ -308,10 +369,15 @@ impl Duplicator {
     }
 
     /// Sleeps until the newest in-flight render is finished, at most `timeout`.
-    fn wait_for_gpu(&self, timeout: Duration) {
+    fn wait_for_gpu(&mut self, timeout: Duration) {
         let value = self.pending.back().and_then(|p| p.fence_value);
         if let (Some(fence), Some(value)) = (&self.fence, value) {
+            let span = Span::start();
             fence.wait(value, timeout);
+            span.add_to(
+                &mut self.timings.wait_for_gpu,
+                &mut self.timings.cpu.wait_for_gpu,
+            );
         }
     }
 
@@ -322,6 +388,15 @@ impl Duplicator {
 
     pub(crate) fn timings(&self) -> GrabTimings {
         self.timings
+    }
+
+    /// Wall time and cycles recorded so far for `Map` and pixel copies, the spans nested in
+    /// `collect_ready`.
+    fn nested_in_collect(&self) -> (Duration, u64) {
+        (
+            self.timings.map + self.timings.read_back,
+            self.timings.cpu.map + self.timings.cpu.read_back,
+        )
     }
 
     pub(crate) fn set_max_dimension(&mut self, max_dimension: u32) {
@@ -351,12 +426,17 @@ impl Duplicator {
             return Err(CaptureError::Os("no desktop image cached".into()));
         };
         let dimension = thumbnail_dimension(cache.width, cache.height, max_width);
-        let frame = self.render_sync(Key {
+        let (width, height) = self.render_sync(Key {
             region: NormRect::full(),
             max_dimension: dimension,
         })?;
         self.last_key = None;
-        Ok(frame)
+        Ok(Frame {
+            data: self.pixels.clone(),
+            width,
+            height,
+            stride: width as usize * 4,
+        })
     }
 
     /// Time since the desktop image presented at `present_qpc` was presented.
@@ -384,13 +464,13 @@ impl Duplicator {
         let millis = u32::try_from(wait.as_micros().div_ceil(1000)).unwrap_or(u32::MAX);
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
-        let started = Instant::now();
+        let span = Span::start();
         // SAFETY: out pointers refer to live locals.
         let acquired = unsafe {
             self.duplication
                 .AcquireNextFrame(millis, &raw mut info, &raw mut resource)
         };
-        self.timings.acquire += started.elapsed();
+        span.add_to(&mut self.timings.acquire, &mut self.timings.cpu.acquire);
         if let Err(e) = acquired {
             return match classify(e.code().0) {
                 Class::Timeout => Ok(false),
@@ -399,7 +479,7 @@ impl Duplicator {
         }
 
         let desktop_updated = info.LastPresentTime != 0 || info.AccumulatedFrames > 0;
-        let store_started = Instant::now();
+        let store_span = Span::start();
         let stored = if desktop_updated {
             resource
                 .ok_or_else(|| CaptureError::Os("AcquireNextFrame returned no resource".into()))
@@ -410,7 +490,7 @@ impl Duplicator {
         // SAFETY: a frame was acquired above and has not been released yet. It is released on
         // every path, including after a failed copy.
         let released = unsafe { self.duplication.ReleaseFrame() };
-        self.timings.store += store_started.elapsed();
+        store_span.add_to(&mut self.timings.store, &mut self.timings.cpu.store);
         stored?;
         released.map_err(|e| map_err("ReleaseFrame", &e))?;
         if desktop_updated {
@@ -615,7 +695,7 @@ impl Duplicator {
             bottom: rect.y + rect.height,
             back: 1,
         };
-        let started = Instant::now();
+        let span = Span::start();
         // SAFETY: all resources belong to `self.device`; the box lies inside the cached surface
         // (guaranteed by `PixelRect` clamping) and the destination mip 0 has the region's size.
         // For a full mip chain, subresource index equals the mip level.
@@ -644,18 +724,22 @@ impl Duplicator {
                 None,
             );
         }
-        self.timings.submit += started.elapsed();
+        span.add_to(&mut self.timings.submit, &mut self.timings.cpu.submit);
         Ok((staging_texture, out_w, out_h))
     }
 
     /// Renders `key` from the cached desktop image and waits for the result.
-    fn render_sync(&mut self, key: Key) -> Result<Frame, CaptureError> {
+    fn render_sync(&mut self, key: Key) -> Result<(u32, u32), CaptureError> {
         let (staging, width, height) = self.record(key, None)?;
-        let frame = self.read_back(&staging, width, height, false)?;
+        let read = self.read_back(&staging, width, height, false, true)?;
         self.last_key = Some(key);
         self.dirty = false;
         self.timings.latency = Self::since_present(self.present_qpc);
-        frame.ok_or_else(|| CaptureError::Os("blocking Map returned no data".into()))
+        if read {
+            Ok((width, height))
+        } else {
+            Err(CaptureError::Os("blocking Map returned no data".into()))
+        }
     }
 
     /// Records a render of the cached desktop image into a free ring slot without waiting for
@@ -686,84 +770,94 @@ impl Duplicator {
         Ok(())
     }
 
-    /// Reads back every in-flight render the GPU has finished and returns the newest one that
-    /// was made for `key`. Never waits.
-    fn collect_ready(&mut self, key: Key) -> Result<Option<Frame>, CaptureError> {
+    /// Reads back every in-flight render the GPU has finished and leaves the newest one that
+    /// was made for `key` in `self.pixels`, returning its size. Never waits.
+    fn collect_ready(&mut self, key: Key) -> Result<Option<(u32, u32)>, CaptureError> {
+        let span = Span::start();
+        let nested_before = self.nested_in_collect();
         let mut newest = None;
         while let Some(pending) = self.pending.front() {
             let (slot, width, height) = (pending.slot, pending.width, pending.height);
+            let wanted = pending.key == key;
             let Some(texture) = self.ring[slot].staging.as_ref().map(|s| s.texture.clone()) else {
                 return Err(CaptureError::Os("staging texture missing".into()));
             };
-            let Some(frame) = self.read_back(&texture, width, height, true)? else {
+            if !self.read_back(&texture, width, height, true, wanted)? {
                 break;
-            };
+            }
             if let Some(done) = self.pending.pop_front() {
                 self.ring[done.slot].busy = false;
-                if done.key == key {
-                    newest = Some((frame, done.present_qpc));
+                if wanted {
+                    newest = Some((width, height, done.present_qpc));
                 }
             }
         }
-        Ok(newest.map(|(frame, present_qpc)| {
+        let (wall, cycles) = span.lap();
+        let (nested_wall, nested_cycles) = self.nested_in_collect();
+        self.timings.collect_ready +=
+            wall.saturating_sub(nested_wall.saturating_sub(nested_before.0));
+        self.timings.cpu.collect_ready +=
+            cycles.saturating_sub(nested_cycles.saturating_sub(nested_before.1));
+        Ok(newest.map(|(width, height, present_qpc)| {
             self.timings.latency = Self::since_present(present_qpc);
-            frame
+            (width, height)
         }))
     }
 
-    /// Copies the staging texture to a [`Frame`]. With `poll`, returns `Ok(None)` when the GPU
-    /// has not finished writing it; otherwise waits.
+    /// Maps the staging texture and, with `copy`, stores its pixels in `self.pixels` with the
+    /// alpha channel forced opaque. With `poll`, returns `Ok(false)` when the GPU has not
+    /// finished writing the texture; otherwise waits.
     fn read_back(
         &mut self,
         staging: &ID3D11Texture2D,
         width: u32,
         height: u32,
         poll: bool,
-    ) -> Result<Option<Frame>, CaptureError> {
+        copy: bool,
+    ) -> Result<bool, CaptureError> {
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         let flags = if poll {
             D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32
         } else {
             0
         };
-        let started = Instant::now();
+        let map_span = Span::start();
         // SAFETY: the staging texture is CPU-readable and not mapped elsewhere.
         let mapped_ok = unsafe {
             self.context
                 .Map(staging, 0, D3D11_MAP_READ, flags, Some(&raw mut mapped))
         };
-        self.timings.map += started.elapsed();
+        map_span.add_to(&mut self.timings.map, &mut self.timings.cpu.map);
+        let copy_span = Span::start();
         if let Err(e) = mapped_ok {
             return if poll && e.code() == DXGI_ERROR_WAS_STILL_DRAWING {
-                Ok(None)
+                Ok(false)
             } else {
                 Err(map_err("Map", &e))
             };
         }
 
-        let row_bytes = width as usize * 4;
-        let mut data = vec![0u8; row_bytes * height as usize];
-        let base = mapped.pData.cast::<u8>().cast_const();
-        for (y, row) in data.chunks_exact_mut(row_bytes).enumerate() {
-            // SAFETY: while mapped, `pData` addresses `height` rows of `RowPitch` bytes, each at
-            // least `width * 4` bytes long; `y < height`.
-            let src = unsafe {
-                std::slice::from_raw_parts(base.add(y * mapped.RowPitch as usize), row_bytes)
-            };
-            row.copy_from_slice(src);
+        if copy {
+            let row_bytes = width as usize * 4;
+            self.pixels.resize(row_bytes * height as usize, 0);
+            let base = mapped.pData.cast::<u8>().cast_const();
+            for (y, row) in self.pixels.chunks_exact_mut(row_bytes).enumerate() {
+                // SAFETY: while mapped, `pData` addresses `height` rows of `RowPitch` bytes, each
+                // at least `width * 4` bytes long; `y < height`.
+                let src = unsafe {
+                    std::slice::from_raw_parts(base.add(y * mapped.RowPitch as usize), row_bytes)
+                };
+                let (src, _) = src.as_chunks::<4>();
+                let (dst, _) = row.as_chunks_mut::<4>();
+                for (out, pixel) in dst.iter_mut().zip(src) {
+                    *out = (u32::from_le_bytes(*pixel) | 0xFF00_0000).to_le_bytes();
+                }
+            }
         }
         // SAFETY: the resource was mapped above.
         unsafe { self.context.Unmap(staging, 0) };
-
-        for pixel in data.as_chunks_mut::<4>().0 {
-            pixel[3] = 255;
-        }
-        Ok(Some(Frame {
-            data,
-            width,
-            height,
-            stride: row_bytes,
-        }))
+        copy_span.add_to(&mut self.timings.read_back, &mut self.timings.cpu.read_back);
+        Ok(true)
     }
 }
 
@@ -790,11 +884,10 @@ mod tests {
     use super::*;
     use crate::win::find_monitor;
 
-    fn max_channel_difference(a: &Frame, b: &Frame) -> u8 {
-        assert_eq!((a.width, a.height), (b.width, b.height));
-        a.data
-            .iter()
-            .zip(&b.data)
+    fn max_channel_difference(a: &[u8], b: &[u8]) -> u8 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
             .map(|(x, y)| x.abs_diff(*y))
             .max()
             .unwrap_or(0)
@@ -813,7 +906,9 @@ mod tests {
         let sync = duplicator
             .grab(region, Duration::from_secs(2))
             .expect("grab")
-            .expect("first grab renders synchronously");
+            .expect("first grab renders synchronously")
+            .data
+            .to_vec();
         duplicator.submit(key).expect("submit");
         assert_eq!(duplicator.pending.len(), 1);
         duplicator.wait_for_gpu(Duration::from_secs(1));
@@ -825,10 +920,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
             asynchronous = duplicator.collect_ready(key).expect("collect");
         }
-        let asynchronous = asynchronous.expect("the GPU finished the render");
+        asynchronous.expect("the GPU finished the render");
         assert!(duplicator.pending.is_empty());
         assert!(duplicator.ring.iter().all(|slot| !slot.busy));
-        assert!(max_channel_difference(&sync, &asynchronous) <= 1);
+        assert!(max_channel_difference(&sync, &duplicator.pixels) <= 1);
     }
 
     #[test]

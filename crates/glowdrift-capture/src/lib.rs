@@ -17,6 +17,8 @@
 //! - Exclusive-fullscreen games, protected content, the lock screen and the UAC secure desktop
 //!   can make duplication fail or return black; those surface as [`CaptureError::AccessLost`].
 
+#[cfg(windows)]
+pub mod cpu;
 mod math;
 #[cfg(windows)]
 mod win;
@@ -55,9 +57,31 @@ pub struct GrabTimings {
     pub submit: Duration,
     /// Blocked in `Map` waiting for the GPU.
     pub map: Duration,
+    /// Bookkeeping in `collect_ready`, excluding its `Map` calls and pixel copies.
+    pub collect_ready: Duration,
+    /// Sleeping on the GPU fence until the newest render finishes.
+    pub wait_for_gpu: Duration,
+    /// Copying mapped pixels into the frame buffer, forcing alpha opaque, and unmapping.
+    pub read_back: Duration,
+    /// Thread CPU cycles spent in the spans above; all zero without the `cpu-timing` feature.
+    pub cpu: GrabCpu,
     /// Time between the desktop image shown in the returned frame being presented and the frame
     /// being returned; `None` when no frame was returned or the presentation time is unknown.
     pub latency: Option<Duration>,
+}
+
+/// Thread CPU cycles (`QueryThreadCycleTime`) for the spans of [`GrabTimings`], excluding time the
+/// thread spent blocked. Filled only with the `cpu-timing` feature; convert with
+/// `cpu::cycles_to_duration` (Windows only).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GrabCpu {
+    pub acquire: u64,
+    pub store: u64,
+    pub submit: u64,
+    pub map: u64,
+    pub collect_ready: u64,
+    pub wait_for_gpu: u64,
+    pub read_back: u64,
 }
 
 /// A display attached to the desktop.
@@ -91,6 +115,16 @@ impl Frame {
     /// Borrows the frame for reduction.
     pub fn view(&self) -> FrameView<'_> {
         FrameView::new(&self.data, self.width, self.height, self.stride)
+    }
+
+    /// Copies a borrowed frame into an owned one.
+    pub fn from_view(view: &FrameView<'_>) -> Frame {
+        Frame {
+            data: view.data.to_vec(),
+            width: view.width,
+            height: view.height,
+            stride: view.stride,
+        }
     }
 }
 
@@ -215,11 +249,15 @@ impl Capturer {
     /// updates do not count as a change. When `region` differs from the previously delivered
     /// one, a frame is returned immediately from the last desktop image seen.
     /// [`CaptureError::AccessLost`] means the caller must recreate the capturer.
+    ///
+    /// The frame borrows a buffer owned by the capturer and reused by every grab, so steady-state
+    /// grabs do not allocate; it is valid until the next call. Copy it with [`Frame::from_view`]
+    /// to keep it.
     pub fn grab(
         &mut self,
         region: NormRect,
         timeout: Duration,
-    ) -> Result<Option<Frame>, CaptureError> {
+    ) -> Result<Option<FrameView<'_>>, CaptureError> {
         #[cfg(windows)]
         {
             self.inner.grab(region, timeout)

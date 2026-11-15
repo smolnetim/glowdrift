@@ -22,7 +22,7 @@ const ZIP_URL: &str =
 const ZIP_SHA256: &str = "eb4414cf505145f3e507dc839ad587bf7ca684d64be3d9a834f416a136736d5d";
 const DLL_ENTRY: &str = "iCUESDK/redist/x64/iCUESDK.x64_2019.dll";
 const DLL_SHA256: &str = "d72fd819b91fd1d3b0c3db2ea17a47dcfe3b38e26269aa967ecfee10d2e93884";
-/// File name the outputs crate loads.
+/// File name the lights crate loads.
 const DLL_FILE_NAME: &str = "iCUESDK.x64_2019.dll";
 
 /// Upper bound for the downloaded archive (the pinned archive is about 340 KB).

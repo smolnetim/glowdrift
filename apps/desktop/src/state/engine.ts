@@ -8,13 +8,13 @@ interface EngineState {
 }
 
 export const engineStore = createStore<EngineState>({
-  status: { running: false, measuredFps: 0, lastError: null, raw: "#000000", smoothed: "#000000" },
+  status: { running: false, measuredFps: 0, lastError: null, target: "#000000", smoothed: "#000000" },
   commandFailed: false,
 });
 
 function apply(status: EngineStatus): void {
   engineStore.set({ status, commandFailed: false });
-  pushLiveColor({ raw: status.raw, smoothed: status.smoothed });
+  pushLiveColor({ target: status.target, smoothed: status.smoothed });
 }
 
 export async function refreshEngine(): Promise<void> {

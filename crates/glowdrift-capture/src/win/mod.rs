@@ -92,10 +92,11 @@ mod tests {
         let entry = find_monitor(None).expect("primary monitor");
         let grab = |max_dimension: u32| {
             let mut duplicator = Duplicator::new(&entry, max_dimension).expect("duplicator");
-            duplicator
+            let view = duplicator
                 .grab(NormRect::full(), Duration::from_secs(2))
                 .expect("grab")
-                .expect("frame")
+                .expect("frame");
+            Frame::from_view(&view)
         };
         let small = grab(32);
         let full = grab(u32::MAX);

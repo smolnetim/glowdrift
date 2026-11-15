@@ -23,7 +23,7 @@ const MAX_BACKOFF_DOUBLINGS: u32 = 3;
 pub struct PendingUpdate {
     update: Update,
     bytes: Vec<u8>,
-    /// Set by the updater's before-exit hook once the engine and outputs have been stopped.
+    /// Set by the updater's before-exit hook once the engine and lights have been stopped.
     engine_stopped: Arc<AtomicBool>,
 }
 
