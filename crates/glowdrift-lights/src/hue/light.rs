@@ -96,7 +96,9 @@ fn effective_zones(
 
 impl Shared {
     /// Rebuilds the layout from the current overrides and resolved lights; bumps the
-    /// generation when the lights or any zone differ from before.
+    /// generation when the lights were resolved again or the lights or any zone differ from
+    /// before. Colours addressed to an earlier epoch are shown as the whole colour by the
+    /// worker, so the new generation is what makes the engine send per-light colours again.
     fn refresh_layout(&self) {
         let mut layout = lock(&self.layout);
         let overrides = lock(&self.zone_overrides).clone();
@@ -110,8 +112,9 @@ impl Shared {
                     .map(|lights| effective_zones(lights, &overrides)),
             )
         };
+        let resolved_again = layout.epoch != epoch;
         layout.epoch = epoch;
-        if layout.lights != lights {
+        if resolved_again || layout.lights != lights {
             layout.generation += 1;
             layout.lights = lights;
         }
@@ -487,6 +490,27 @@ mod tests {
         assert_eq!(*lock(&light.shared.extra_lights), vec!["b".to_owned()]);
         assert_eq!(handle.area_lights(), None);
         assert_eq!(light.zone_layout(), None);
+    }
+
+    #[test]
+    fn resolving_the_same_lights_again_changes_the_generation() {
+        let (light, _handle) = HueLight::new(None, None);
+        let lights = || {
+            Some(vec![TargetInfo {
+                id: "a".to_owned(),
+                name: "Lamp".to_owned(),
+                position: None,
+                source: ZoneSource::Extra,
+            }])
+        };
+        light.shared.publish_resolved(1, lights());
+        let first = light.zone_layout().unwrap();
+        light.shared.publish_resolved(1, lights());
+        assert_eq!(light.zone_layout().unwrap(), first);
+        light.shared.publish_resolved(2, lights());
+        let second = light.zone_layout().unwrap();
+        assert_eq!(second.zones, first.zones);
+        assert_ne!(second.generation, first.generation);
     }
 
     #[test]

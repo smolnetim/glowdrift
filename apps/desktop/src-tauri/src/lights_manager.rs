@@ -90,16 +90,26 @@ struct Inner {
     rects: Vec<NormRect>,
 }
 
+/// What changed when the zone layouts were re-read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ZoneChange {
+    /// The combined zone rectangles differ.
+    rects: bool,
+    /// The generation of some light's layout differs.
+    generations: bool,
+}
+
 impl Inner {
-    /// Collects the zone layouts of the active lights. Returns true when the combined zone
-    /// rectangles changed.
-    fn refresh_zones(&mut self) -> bool {
+    /// Collects the zone layouts of the active lights and reports what changed.
+    fn refresh_zones(&mut self) -> ZoneChange {
         let active = !self.paused && !self.closed;
         let mut rects = Vec::new();
+        let mut generations = false;
         for slot in &mut self.slots {
             let layout = (active && slot.wanted)
                 .then(|| slot.light.zone_layout())
                 .flatten();
+            let previous = slot.span.map(|span| span.generation);
             slot.span = layout.map(|layout| {
                 let span = Span {
                     generation: layout.generation,
@@ -109,10 +119,14 @@ impl Inner {
                 rects.extend(layout.zones);
                 span
             });
+            generations |= previous != slot.span.map(|span| span.generation);
         }
-        let changed = rects != self.rects;
+        let change = ZoneChange {
+            rects: rects != self.rects,
+            generations,
+        };
         self.rects = rects;
-        changed
+        change
     }
 }
 
@@ -190,12 +204,17 @@ impl LightsManager {
         *lock(&self.zone_sink) = Some(Box::new(sink));
     }
 
-    /// Re-reads the lights' zone layouts and tells the zone sink when the combined zones changed.
+    /// Re-reads the lights' zone layouts. Tells the zone sink when the combined zones changed.
+    /// When only a layout's generation changed, asks for a resend: colours sent for the old
+    /// generation made the light show the whole colour, and a static picture would not send again.
     fn refresh_zones(&self, inner: &mut Inner) {
-        if inner.refresh_zones()
-            && let Some(sink) = lock(&self.zone_sink).as_ref()
-        {
-            sink(inner.rects.clone());
+        let change = inner.refresh_zones();
+        if change.rects {
+            if let Some(sink) = lock(&self.zone_sink).as_ref() {
+                sink(inner.rects.clone());
+            }
+        } else if change.generations {
+            self.resend.store(true, Ordering::Release);
         }
     }
 
@@ -379,6 +398,7 @@ impl LightsManager {
 mod tests {
     use super::*;
     use glowdrift_core::IcueConfig;
+    use std::sync::atomic::AtomicU64;
 
     #[derive(Default)]
     struct Shared {
@@ -695,6 +715,66 @@ mod tests {
         manager.set_paused(true);
         assert_eq!(lock(&heard).len(), 2);
         assert_eq!(lock(&heard)[1], Vec::<NormRect>::new());
+    }
+
+    /// A Hue-id light whose layout generation the test can change while the zones stay put.
+    struct GenerationFake(Arc<AtomicU64>);
+
+    impl Light for GenerationFake {
+        fn id(&self) -> &str {
+            HUE_LIGHT_ID
+        }
+        fn status(&self) -> LightStatus {
+            LightStatus {
+                id: HUE_LIGHT_ID.to_owned(),
+                kind: "hue".to_owned(),
+                name: "Generation".to_owned(),
+                enabled: true,
+                state: LightState::Connected,
+                detail: None,
+                device_count: 1,
+                code: None,
+            }
+        }
+        fn min_send_interval(&self) -> Option<Duration> {
+            None
+        }
+        fn set_enabled(&mut self, _: bool) {}
+        fn set_color(&mut self, _: Rgb) -> Result<(), glowdrift_lights::LightError> {
+            Ok(())
+        }
+        fn zone_layout(&self) -> Option<glowdrift_lights::ZoneLayout> {
+            Some(glowdrift_lights::ZoneLayout {
+                generation: self.0.load(Ordering::Acquire),
+                zones: vec![NormRect::full()],
+            })
+        }
+        fn shutdown(&mut self) {}
+    }
+
+    #[test]
+    fn a_new_generation_with_the_same_zones_asks_for_a_resend_instead_of_new_zones() {
+        let generation = Arc::new(AtomicU64::new(1));
+        let mut lights = config(false);
+        lights.hue.enabled = true;
+        let manager = LightsManager::new(
+            vec![Box::new(GenerationFake(Arc::clone(&generation)))],
+            &lights,
+            |_| {},
+        );
+        let heard = Arc::new(Mutex::new(0_u32));
+        let counter = Arc::clone(&heard);
+        manager.set_zone_sink(move |_| *lock(&counter) += 1);
+        manager.poll();
+        manager.take_resend();
+
+        manager.poll();
+        assert!(!manager.take_resend(), "nothing changed");
+
+        generation.store(2, Ordering::Release);
+        manager.poll();
+        assert!(manager.take_resend());
+        assert_eq!(*lock(&heard), 0, "the zones did not change");
     }
 
     #[test]
