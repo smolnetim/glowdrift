@@ -39,6 +39,8 @@ struct Mock {
     drop_inventory: Arc<AtomicU32>,
     /// Light ids whose state cannot be read.
     unreachable: Arc<Mutex<Vec<String>>>,
+    /// Body of `GET .../entertainment_configuration`.
+    entertainment: Arc<Mutex<String>>,
     stop: Arc<AtomicBool>,
 }
 
@@ -113,12 +115,14 @@ impl Mock {
             link_pressed: Arc::default(),
             drop_inventory: Arc::default(),
             unreachable: Arc::default(),
+            entertainment: Arc::new(Mutex::new(fixtures::ENTERTAINMENT.to_owned())),
             stop: Arc::default(),
         };
         let requests = Arc::clone(&mock.requests);
         let link_pressed = Arc::clone(&mock.link_pressed);
         let drop_inventory = Arc::clone(&mock.drop_inventory);
         let unreachable = Arc::clone(&mock.unreachable);
+        let entertainment = Arc::clone(&mock.entertainment);
         let stop = Arc::clone(&mock.stop);
         std::thread::spawn(move || {
             while !stop.load(Ordering::SeqCst) {
@@ -135,6 +139,7 @@ impl Mock {
                 let link_pressed = Arc::clone(&link_pressed);
                 let drop_inventory = Arc::clone(&drop_inventory);
                 let unreachable = Arc::clone(&unreachable);
+                let entertainment = Arc::clone(&entertainment);
                 let stop = Arc::clone(&stop);
                 std::thread::spawn(move || {
                     let conn = rustls::ServerConnection::new(config).unwrap();
@@ -150,7 +155,8 @@ impl Mock {
                             drop_inventory.fetch_sub(1, Ordering::SeqCst);
                             return;
                         }
-                        let (status, body) = route(&request, &link_pressed, &unreachable);
+                        let (status, body) =
+                            route(&request, &link_pressed, &unreachable, &entertainment);
                         let response = format!(
                             "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
                             body.len()
@@ -209,6 +215,24 @@ impl Mock {
             .collect()
     }
 
+    /// Replaces `from` by `to` in the entertainment configurations the bridge serves.
+    fn edit_entertainment(&self, from: &str, to: &str) {
+        let mut body = self.entertainment.lock().unwrap();
+        assert!(body.contains(from), "{from} is not in the fixture");
+        *body = body.replace(from, to);
+    }
+
+    /// Arrival times of the inventory reads.
+    fn inventory_reads(&self) -> Vec<Instant> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.method == "GET" && r.path == ENTERTAINMENT_PATH)
+            .map(|r| r.at)
+            .collect()
+    }
+
     fn count(&self, method: &str, path: &str) -> usize {
         self.requests
             .lock()
@@ -232,6 +256,7 @@ fn route(
     request: &Request,
     link_pressed: &AtomicBool,
     unreachable: &Mutex<Vec<String>>,
+    entertainment: &Mutex<String>,
 ) -> (&'static str, String) {
     let ok = |body: &str| ("200 OK", body.to_owned());
     match (request.method.as_str(), request.path.as_str()) {
@@ -247,7 +272,9 @@ fn route(
             "403 Forbidden",
             r#"{"errors":[{"description":"forbidden"}]}"#.to_owned(),
         ),
-        ("GET", "/clip/v2/resource/entertainment_configuration") => ok(fixtures::ENTERTAINMENT),
+        ("GET", "/clip/v2/resource/entertainment_configuration") => {
+            ok(&entertainment.lock().unwrap())
+        }
         ("GET", "/clip/v2/resource/device") => ok(fixtures::DEVICES),
         ("GET", "/clip/v2/resource/light") => ok(fixtures::LIGHTS),
         ("GET", path) if path.starts_with("/clip/v2/resource/light/") => {
@@ -285,6 +312,7 @@ fn test_timing() -> Timing {
         put_gap: GAP,
         backoff_initial: Duration::from_millis(20),
         backoff_max: Duration::from_millis(80),
+        refresh_gap: Duration::from_millis(50),
     }
 }
 
@@ -1158,4 +1186,178 @@ fn a_reconnect_within_a_session_does_not_read_the_lights_again() {
     assert!(mock.restores().is_empty());
     light.shutdown();
     assert_eq!(mock.restores().len(), 3);
+}
+
+const REFRESH_WAIT: Duration = Duration::from_secs(5);
+const MOVE_LIGHT_C: (&str, &str) = (
+    r#""position":{"x":0.5,"y":0.0,"z":0.0}"#,
+    r#""position":{"x":-0.9,"y":0.0,"z":0.9}"#,
+);
+
+fn zone_of(handle: &HueHandle, id: &str) -> AreaLightZone {
+    handle
+        .area_lights()
+        .unwrap()
+        .into_iter()
+        .find(|l| l.id == id)
+        .unwrap()
+}
+
+#[test]
+fn refresh_follows_moved_lights_but_keeps_overrides_and_the_generation_when_nothing_changed() {
+    let mock = Mock::start();
+    let (mut light, handle) = light_for(&mock, "ent-2");
+    wait_for("resolved", || handle.area_lights().is_some());
+    let custom = glowdrift_core::NormRect::new(0.1, 0.1, 0.2, 0.2);
+    handle.set_zone_overrides(std::collections::BTreeMap::from([(
+        "light-a".to_owned(),
+        custom,
+    )]));
+    let before = layout_of(&light);
+    let (a0, c0) = (zone_of(&handle, "light-a"), zone_of(&handle, "light-c"));
+    assert!(a0.custom && !c0.custom);
+    assert_eq!(a0.zone, custom);
+
+    // Nothing moved: the inventory is read, the layout stays.
+    assert!(handle.refresh_and_wait(REFRESH_WAIT));
+    assert_eq!(mock.inventory_reads().len(), 2);
+    assert_eq!(layout_of(&light), before);
+    assert_eq!(handle.area_lights().unwrap(), [a0.clone(), c0.clone()]);
+
+    // The light without an override moves.
+    mock.edit_entertainment(MOVE_LIGHT_C.0, MOVE_LIGHT_C.1);
+    assert!(handle.refresh_and_wait(REFRESH_WAIT));
+    let c1 = zone_of(&handle, "light-c");
+    assert_eq!(c1.position.unwrap().x, -0.9);
+    assert_ne!(c1.default_zone, c0.default_zone);
+    assert_eq!(c1.zone, c1.default_zone);
+    let moved = layout_of(&light);
+    assert!(moved.generation > before.generation);
+    assert_eq!(moved.zones[0], custom);
+    assert_eq!(moved.zones[1], c1.zone);
+
+    // The light with an override moves: only its default zone follows.
+    mock.edit_entertainment(
+        r#""position":{"x":-0.8,"y":0.5,"z":0.25}"#,
+        r#""position":{"x":0.8,"y":0.5,"z":0.25}"#,
+    );
+    assert!(handle.refresh_and_wait(REFRESH_WAIT));
+    let a1 = zone_of(&handle, "light-a");
+    assert_ne!(a1.default_zone, a0.default_zone);
+    assert_eq!(a1.zone, custom);
+    assert!(a1.custom);
+    assert_eq!(layout_of(&light), moved);
+    light.shutdown();
+}
+
+#[test]
+fn refresh_keeps_the_connection_the_snapshots_and_the_colours() {
+    let mock = Mock::start();
+    let (mut light, handle) = light_for(&mock, "ent-2");
+    wait_for("resolved", || handle.area_lights().is_some());
+    light.set_color(Rgb::new(255, 0, 0)).unwrap();
+    wait_for("both driven", || mock.puts().len() >= 2);
+    let log_before = mock.log().len();
+
+    mock.edit_entertainment(MOVE_LIGHT_C.0, MOVE_LIGHT_C.1);
+    assert!(handle.refresh_and_wait(REFRESH_WAIT));
+    assert_eq!(zone_of(&handle, "light-c").position.unwrap().x, -0.9);
+    std::thread::sleep(GAP * 8);
+
+    let log = mock.log();
+    let new = &log[log_before..];
+    assert!(
+        new.iter().all(|(m, _)| m == "GET"),
+        "a refresh only reads: {new:?}"
+    );
+    assert!(
+        new.iter().all(|(_, p)| !p.starts_with(&put_path(""))),
+        "lights are not read again: {new:?}"
+    );
+    assert_eq!(mock.puts().len(), 2, "colours are not resent");
+    assert!(mock.restores().is_empty());
+    assert_eq!(light.status().state, LightState::Connected);
+    light.shutdown();
+}
+
+#[test]
+fn a_light_that_leaves_the_area_on_refresh_is_restored() {
+    let mock = Mock::start();
+    let (mut light, handle) = light_for(&mock, "ent-1");
+    wait_for("resolved", || handle.area_lights().is_some());
+    light.set_color(Rgb::new(255, 0, 0)).unwrap();
+    wait_for("both driven", || mock.puts().len() >= 2);
+    let before = layout_of(&light);
+
+    mock.edit_entertainment(
+        r#""light_services":[{"rid":"light-a","rtype":"light"},{"rid":"light-b","rtype":"light"}]"#,
+        r#""light_services":[{"rid":"light-a","rtype":"light"}]"#,
+    );
+    assert!(handle.refresh_and_wait(REFRESH_WAIT));
+    assert_eq!(ids(&handle), ["light-a"]);
+    assert_eq!(light.status().device_count, 1);
+    assert!(layout_of(&light).generation > before.generation);
+    wait_for("the restore", || restored_ids(&mock) == ["light-b"]);
+    light.shutdown();
+}
+
+#[test]
+fn refreshes_are_coalesced_and_reads_keep_their_distance() {
+    let mock = Mock::start();
+    let gap = Duration::from_millis(400);
+    let timing = Timing {
+        refresh_gap: gap,
+        ..test_timing()
+    };
+    let (mut light, handle) =
+        HueLight::with_timing(Some(mock.creds()), Some("ent-1".to_owned()), timing);
+    wait_for("resolved", || handle.area_lights().is_some());
+
+    // A burst joins one refresh, which waits for the gap since the connect.
+    for _ in 0..20 {
+        handle.refresh();
+    }
+    assert!(handle.refresh_and_wait(REFRESH_WAIT));
+    assert_eq!(mock.inventory_reads().len(), 2, "connect plus one refresh");
+
+    // Concurrent callers share one more read, at least `gap` after the last.
+    let waiters: Vec<_> = (0..4)
+        .map(|_| {
+            let handle = handle.clone();
+            std::thread::spawn(move || handle.refresh_and_wait(REFRESH_WAIT))
+        })
+        .collect();
+    for waiter in waiters {
+        assert!(waiter.join().unwrap());
+    }
+    let reads = mock.inventory_reads();
+    assert_eq!(reads.len(), 3);
+    for pair in reads.windows(2) {
+        assert!(
+            pair[1].duration_since(pair[0]) >= gap * 8 / 10,
+            "reads {:?} apart",
+            pair[1].duration_since(pair[0])
+        );
+    }
+    light.shutdown();
+}
+
+#[test]
+fn refresh_without_a_connection_completes_without_reading() {
+    let mock = Mock::start();
+    let (mut unpaired, handle) = HueLight::with_timing(None, None, test_timing());
+    assert!(handle.refresh_and_wait(REFRESH_WAIT));
+    unpaired.shutdown();
+
+    let (mut disabled, handle) = light_for(&mock, "ent-1");
+    wait_for("resolved", || handle.area_lights().is_some());
+    disabled.set_enabled(false);
+    let reads = mock.inventory_reads().len();
+    assert!(handle.refresh_and_wait(REFRESH_WAIT));
+    assert_eq!(mock.inventory_reads().len(), reads);
+    disabled.shutdown();
+    // A stopped worker answers at once instead of leaving the caller waiting.
+    let started = Instant::now();
+    assert!(!handle.refresh_and_wait(REFRESH_WAIT));
+    assert!(started.elapsed() < Duration::from_secs(1));
 }
