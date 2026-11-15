@@ -1,9 +1,10 @@
 //! Philips Hue light over the bridge's CLIP v2 REST API.
 //!
 //! [`discover`] and [`probe`] find a bridge, [`pair`] registers this app (one attempt per
-//! call; the caller polls while the user presses the link button), and [`list_areas`] returns
-//! the rooms, zones and entertainment areas a user can pick. [`HueLight`] then sends the
-//! smoothed colour to every light of the chosen area with `PUT /clip/v2/resource/light/{id}`.
+//! call; the caller polls while the user presses the link button), [`list_areas`] returns the
+//! entertainment areas a user can pick and [`list_lights`] the single lights that can be added.
+//! [`HueLight`] then sends colours to the lights of the chosen area plus any extra lights with
+//! `PUT /clip/v2/resource/light/{id}`.
 //!
 //! # Trust
 //!
@@ -13,12 +14,32 @@
 //!
 //! # Output
 //!
-//! At most 10 PUTs per second go out in total, one light per slot, round-robin. With `n` lights
-//! a light is therefore refreshed every `n * 100 ms`, which is also the transition duration the
-//! bridge fades over and the value of [`Light::min_send_interval`]. Colours are coalesced:
-//! only the latest is ever sent, nothing queues. Near-black switches a light off; see
-//! [`color`] for the colour and brightness mapping. Lights are left as they are on disable and
-//! shutdown.
+//! At most 10 PUTs per second go out in total, one light per slot, round-robin over the lights
+//! whose colour changed. With `n` lights a light is therefore refreshed at most every
+//! `n * 100 ms`, which is also the transition duration the bridge fades over and the value of
+//! [`Light::min_send_interval`]. Colours are coalesced: only the latest is ever sent, nothing
+//! queues. Near-black switches a light off; see [`color`] for the colour and brightness
+//! mapping.
+//!
+//! # Zones
+//!
+//! The lights driven are the lights of the entertainment area in channel order followed by the
+//! extra lights. Each has a zone of the monitor: an override from
+//! [`HueHandle::set_zone_overrides`], else the default for its channel position (a light in
+//! several channels gets the average position) or, for extra lights, a centred box. The
+//! layout is available once the lights are resolved ([`Light::zone_layout`]); its generation
+//! changes when the lights or a zone change. [`Light::set_zone_colors`] gives each light its
+//! own colour; a colour computed for another generation is replaced by the whole-region colour
+//! on every light.
+//!
+//! # Restore
+//!
+//! Just before the first colour is sent to a light, its state (on/off, brightness, colour or
+//! colour temperature) is read. It is put back, fading over 400 ms, when the light is
+//! disabled, the bridge is forgotten, the target becomes empty or the light shuts down, and
+//! for lights that stop being driven when the area or extra lights change. A state is restored
+//! once; lights that cannot be reached are logged and skipped. The state is read again for
+//! lights that start being driven later.
 //!
 //! # Threading
 //!
@@ -93,7 +114,8 @@ pub enum PairOutcome {
     LinkButtonNotPressed,
 }
 
-/// Kind of a [`HueArea`].
+/// Kind of a [`HueArea`]. Only entertainment areas are listed; the other kinds remain for
+/// consumers of the serialised form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AreaKind {
@@ -144,7 +166,7 @@ pub enum HueError {
     /// The stored credentials are incomplete.
     #[error("invalid Hue credentials: {0}")]
     InvalidCredentials(String),
-    /// The chosen area does not exist on the bridge or has no lights.
+    /// Neither the chosen area nor any extra light exists on the bridge.
     #[error("the Hue area was not found or has no lights")]
     AreaNotFound,
 }
@@ -196,20 +218,10 @@ pub fn pair(address: &str, device_type: &str) -> Result<PairOutcome, HueError> {
     }
 }
 
-/// Lists the rooms, zones and entertainment areas of a paired bridge: rooms first, then zones,
-/// then entertainment areas, each sorted by name.
+/// Lists the entertainment areas of a paired bridge, sorted by name. Rooms and zones are not
+/// offered.
 pub fn list_areas(creds: &BridgeCredentials) -> Result<Vec<HueArea>, HueError> {
-    if creds.cert_sha256.is_empty() {
-        return Err(HueError::InvalidCredentials(
-            "no certificate pin recorded".to_owned(),
-        ));
-    }
-    let bridge = Bridge::new(
-        &creds.address,
-        Some(&creds.cert_sha256),
-        Some(&creds.app_key),
-        REQUEST_TIMEOUT,
-    )?;
+    let bridge = pinned_bridge(creds)?;
     Ok(Inventory::fetch(&bridge)?
         .areas()
         .into_iter()
@@ -219,9 +231,21 @@ pub fn list_areas(creds: &BridgeCredentials) -> Result<Vec<HueArea>, HueError> {
 
 /// Lists the lights of a paired bridge that can be added as extra lights: colour-capable
 /// lights first, each group sorted by name.
-///
-/// Currently returns an empty list without contacting the bridge.
 pub fn list_lights(creds: &BridgeCredentials) -> Result<Vec<BridgeLight>, HueError> {
-    let _ = creds;
-    Ok(Vec::new())
+    let bridge = pinned_bridge(creds)?;
+    Ok(Inventory::fetch_lights(&bridge)?.bridge_lights())
+}
+
+fn pinned_bridge(creds: &BridgeCredentials) -> Result<Bridge, HueError> {
+    if creds.cert_sha256.is_empty() {
+        return Err(HueError::InvalidCredentials(
+            "no certificate pin recorded".to_owned(),
+        ));
+    }
+    Bridge::new(
+        &creds.address,
+        Some(&creds.cert_sha256),
+        Some(&creds.app_key),
+        REQUEST_TIMEOUT,
+    )
 }

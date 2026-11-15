@@ -1,8 +1,9 @@
 //! Send scheduling for the Hue light: at most one PUT per [`PUT_GAP`] across all lights, latest
 //! colour wins, nothing is queued.
 //!
-//! Every new colour makes all lights stale. The pacer hands out stale lights round-robin, one
-//! per slot, so with `n` lights each light is refreshed once per `n * PUT_GAP`. That period is
+//! A new colour makes the lights it changes stale. The pacer hands out stale lights
+//! round-robin, one per slot, so with `n` lights each light is refreshed at most once per
+//! `n * PUT_GAP`. That period is
 //! also the transition duration, so a light fades until its next update arrives. The pacer is
 //! pure: callers pass the current time.
 
@@ -26,6 +27,8 @@ pub(crate) enum Poll {
 pub(crate) struct Pacer {
     gap: Duration,
     generation: u64,
+    /// Generation each light should have been delivered.
+    wanted: Vec<u64>,
     /// Generation last delivered (or deliberately skipped) per light.
     delivered: Vec<u64>,
     cursor: usize,
@@ -37,6 +40,7 @@ impl Pacer {
         Pacer {
             gap,
             generation: 0,
+            wanted: Vec::new(),
             delivered: Vec::new(),
             cursor: 0,
             next_slot: None,
@@ -45,20 +49,31 @@ impl Pacer {
 
     /// Replaces the light set; every light is stale if a colour exists.
     pub fn set_lights(&mut self, count: usize) {
+        self.wanted = vec![self.generation; count];
         self.delivered = vec![0; count];
         self.cursor = 0;
     }
 
     /// Records a new desired colour: all lights become stale.
+    #[cfg(test)]
     pub fn touch(&mut self) {
         self.generation += 1;
+        self.wanted.fill(self.generation);
+    }
+
+    /// Records a new desired colour for one light.
+    pub fn touch_one(&mut self, index: usize) {
+        self.generation += 1;
+        if let Some(wanted) = self.wanted.get_mut(index) {
+            *wanted = self.generation;
+        }
     }
 
     pub fn poll(&mut self, now: Instant) -> Poll {
         let count = self.delivered.len();
         let Some(index) = (0..count)
             .map(|offset| (self.cursor + offset) % count)
-            .find(|&i| self.delivered[i] != self.generation)
+            .find(|&i| self.delivered[i] != self.wanted[i])
         else {
             return Poll::Idle;
         };
@@ -70,14 +85,14 @@ impl Pacer {
 
     /// A PUT for `index` was attempted at `now` (successfully or not); it uses a slot.
     pub fn attempted(&mut self, index: usize, now: Instant) {
-        self.delivered[index] = self.generation;
+        self.delivered[index] = self.wanted[index];
         self.cursor = (index + 1) % self.delivered.len().max(1);
         self.next_slot = Some(now + self.gap);
     }
 
     /// The light already shows the right output; no slot is used.
     pub fn skipped(&mut self, index: usize) {
-        self.delivered[index] = self.generation;
+        self.delivered[index] = self.wanted[index];
         self.cursor = (index + 1) % self.delivered.len().max(1);
     }
 }
@@ -181,6 +196,22 @@ mod tests {
         assert_eq!(pacer.poll(t0), Poll::Send(0));
         pacer.skipped(0);
         assert_eq!(pacer.poll(t0), Poll::Send(1));
+    }
+
+    #[test]
+    fn only_touched_lights_are_stale() {
+        let mut pacer = Pacer::new(PUT_GAP);
+        pacer.set_lights(3);
+        let t0 = Instant::now();
+        pacer.touch();
+        for i in 0..3 {
+            assert_eq!(pacer.poll(ms(t0, i as u64 * 100)), Poll::Send(i));
+            pacer.attempted(i, ms(t0, i as u64 * 100));
+        }
+        pacer.touch_one(2);
+        assert_eq!(pacer.poll(ms(t0, 1000)), Poll::Send(2));
+        pacer.attempted(2, ms(t0, 1000));
+        assert_eq!(pacer.poll(ms(t0, 2000)), Poll::Idle);
     }
 
     #[test]
