@@ -8,6 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use glowdrift_core::{LightsConfig, Rgb};
+use glowdrift_lights::hue::{HUE_LIGHT_ID, HueLight};
 use glowdrift_lights::icue::{ICUE_LIGHT_ID, IcueLight};
 use glowdrift_lights::{Light, LightState, LightStatus};
 use tauri::{AppHandle, Manager};
@@ -37,14 +38,18 @@ pub fn icue_dll_dirs(app: &AppHandle) -> Vec<PathBuf> {
     dirs
 }
 
-/// Builds the default set of lights.
-pub fn default_lights(app: &AppHandle) -> Vec<Box<dyn Light>> {
-    vec![Box::new(IcueLight::with_dll_dirs(icue_dll_dirs(app)))]
+/// Builds the default set of lights around the already created Hue light.
+pub fn default_lights(app: &AppHandle, hue: HueLight) -> Vec<Box<dyn Light>> {
+    vec![
+        Box::new(IcueLight::with_dll_dirs(icue_dll_dirs(app))),
+        Box::new(hue),
+    ]
 }
 
 fn is_wanted(id: &str, config: &LightsConfig) -> bool {
     match id {
         ICUE_LIGHT_ID => config.icue.enabled,
+        HUE_LIGHT_ID => config.hue.enabled,
         _ => false,
     }
 }
@@ -343,6 +348,7 @@ mod tests {
     fn config(enabled: bool) -> LightsConfig {
         LightsConfig {
             icue: IcueConfig { enabled },
+            ..LightsConfig::default()
         }
     }
 
@@ -471,6 +477,17 @@ mod tests {
             |_| {},
         );
         assert_eq!(manager.fastest_interval(), Some(Duration::from_millis(33)));
+    }
+
+    #[test]
+    fn each_light_follows_its_own_enabled_flag() {
+        let mut lights = config(true);
+        lights.hue.enabled = false;
+        assert!(is_wanted(ICUE_LIGHT_ID, &lights));
+        assert!(!is_wanted(HUE_LIGHT_ID, &lights));
+        lights.hue.enabled = true;
+        assert!(is_wanted(HUE_LIGHT_ID, &lights));
+        assert!(!is_wanted("unknown", &lights));
     }
 
     #[test]

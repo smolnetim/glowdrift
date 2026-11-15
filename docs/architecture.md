@@ -10,7 +10,7 @@ something goes wrong. Where the code and this document disagree, the code is aut
 | --- | --- | --- |
 | `crates/glowdrift-core` | Colour types and conversions, frame reduction (average, dominant), exponential smoother, configuration schema and validation. No I/O. | Any |
 | `crates/glowdrift-capture` | Monitor enumeration and screen capture through DXGI Desktop Duplication, with a GPU downscale so only a small frame is read back. | Windows |
-| `crates/glowdrift-lights` | The `Light` trait and its implementations. The iCUE light loads the iCUE SDK runtime library at run time. | Windows for iCUE |
+| `crates/glowdrift-lights` | The `Light` trait and its implementations. The iCUE light loads the iCUE SDK runtime library at run time. The Hue light talks to a Hue bridge over its local HTTPS API (CLIP v2) from its own worker thread; bridge discovery, pairing and area listing live here too. | Windows for iCUE |
 | `apps/desktop/src-tauri` | Tauri v2 shell: tray, window lifecycle, IPC commands, configuration persistence, the engine thread, light management. | Windows |
 | `apps/desktop/src` | React + TypeScript + Vite frontend. | WebView2 |
 
@@ -29,6 +29,7 @@ flowchart LR
     end
     SM -->|sRGB, when changed| OUT[Lights manager]
     OUT --> ICUE[iCUE light]
+    OUT --> HUE[Hue light]
     SM -.->|throttled, only while<br/>window visible| EVT[engine://color]
     EVT --> UI[Frontend]
     UI -->|invoke| CMD[IPC commands]
@@ -42,7 +43,7 @@ flowchart LR
 4. The smoother advances at the smoothing rate, independent of the capture rate, moving the current colour toward
    the target with an exponential time constant (`smoothingMs`). A time constant of 0 snaps to the target. The
    rate is derived, not configured: the fastest of the active lights' maximum rates (`Light::min_send_interval`,
-   about 30 Hz for iCUE; a light with no limit gets the 60 Hz cap) and, while the preview is on, its 20 Hz. A light
+   about 30 Hz for iCUE, at most 10 Hz in total for Hue, whose interval grows with the number of lights in the area; a light with no limit gets the 60 Hz cap) and, while the preview is on, its 20 Hz. A light
    counts while it is enabled and the engine is running, even if disconnected. The step is time-based, so the time
    constant holds at any rate. With no active light and no preview nothing consumes the colour: the smoother does
    not tick and the smoothed colour follows the target directly, so a light enabled later starts from the current
@@ -59,9 +60,10 @@ linear light gives a more even perceived fade.
 | --- | --- |
 | Main / Tauri runtime | Window, tray, IPC command handlers, event emission. Handlers do not block on capture or lights. |
 | Engine thread | Owns the capturer, the smoother and the loop timing. Receives commands over a channel (apply config, start/stop, preview on/off, shut down). It sleeps until the next capture or smoothing deadline, and stops ticking once the smoothed colour has settled at its target, so an unchanging picture costs almost no CPU. |
+| Hue worker | Owns all Hue bridge I/O: connecting, the pinned TLS connection, paced light updates (latest colour wins, never queued). `set_color` and retargeting only hand values over and never block. |
 | Lights poller | Polls each light's status about once per second and emits `lights://status` when it changes. Reconnect handling lives here. |
 
-Shared state is small: the current configuration and the last engine status, each behind a mutex. The engine
+Shared state is small: the current configuration and the last engine status, each behind a mutex, plus the Hue state (the Hue light's handle and the decrypted bridge credentials read at startup, updated on pairing and forgetting). The engine
 thread never waits on the UI.
 
 ## IPC contract
@@ -79,8 +81,15 @@ Commands (Tauri `invoke`):
 | `get_monitor_thumbnail(monitorId, maxWidth)` | `{ width, height, dataUrl }` | PNG data URL of the whole monitor. `monitorId` null means the primary monitor. |
 | `get_engine_status()` | `EngineStatus` | `{ running, measuredFps, lastError, target, smoothed }` |
 | `set_engine_running(running)` | `EngineStatus` | |
-| `list_lights()` | `LightStatus[]` | `{ id, kind, name, enabled, state, detail, deviceCount, code? }`; `state` is `connected`, `connecting`, `unavailable`, `error` or `disabled`. `code` is an optional machine-readable cause; the only value is `libraryMissing` (the iCUE SDK library is not installed). |
+| `list_lights()` | `LightStatus[]` | `{ id, kind, name, enabled, state, detail, deviceCount, code? }`; `state` is `connected`, `connecting`, `unavailable`, `error` or `disabled`. `code` is an optional machine-readable cause: `libraryMissing` (the iCUE SDK library is not installed), `notPaired` or `noArea` (the Hue light has no paired bridge or no selected area). |
 | `install_icue_sdk()` | `LightStatus[]` | Downloads the pinned iCUE SDK release from GitHub, verifies it and installs the library, then makes the iCUE light retry loading. Returns the statuses after the retry. Rejects with a user-presentable message. See [integrations.md](integrations.md). |
+| `hue_discover()` | `BridgeCandidate[]` | Finds bridges by mDNS with a cloud fallback (about 4 s). `{ id, address, name }` |
+| `hue_probe(address)` | `BridgeCandidate` | Reads a manually entered address. |
+| `hue_pair(address)` | `HueBridge` | Polls the bridge every 2 s for up to 30 s until its link button is pressed. On success stores the credentials, sets `lights.hue.bridgeId` (and clears `areaId` if the bridge changed) and points the Hue light at the bridge. Rejects with "The link button was not pressed in time." on timeout. `HueBridge` is `{ id, address, name }`. |
+| `hue_bridge()` | `HueBridge` or null | The paired bridge whose id matches `lights.hue.bridgeId`; no secrets. |
+| `hue_list_areas()` | `HueArea[]` | Rooms, zones and entertainment areas of the paired bridge: `{ id, kind, name, lightCount }`, `kind` is `room`, `zone` or `entertainment`. Rejects when no bridge is paired. |
+| `hue_select_area(areaId)` | `Config` | Persists `lights.hue.areaId` and retargets the Hue light. Rejects when no bridge is paired. |
+| `hue_forget()` | `Config` | Deletes the stored credentials and clears `bridgeId` and `areaId`. |
 | `stage_update()` | `string` or null | Checks for an update, downloads and verifies it, and stages it. Returns the staged version, or null when up to date. |
 | `install_pending_update()` | `boolean` | Installs the staged update; false when none is staged. On Windows a successful install ends the process after the engine and lights are stopped. |
 | `frontend_ready()` | nothing | Sent once after the first screen is painted; the shell then shows the main window (unless it is starting minimised). |
@@ -130,6 +139,11 @@ both load.
 | `startMinimized` | bool | true | |
 | `autoUpdate` | bool | true | |
 
+Hue bridge credentials (app key, client key, address, certificate pin, bridge id) are never in `config.json`. They
+are stored as `hue-bridge.bin` in the app data directory, encrypted with DPAPI for the current Windows user. At
+startup they count only if their bridge id equals `lights.hue.bridgeId`; a store that cannot be decrypted is logged
+and treated as not paired.
+
 `Config::validated()` clamps every field into range. It runs on load and in `set_config`, so out-of-range values
 never reach the engine.
 
@@ -147,6 +161,7 @@ migration that upgrades older files on load. See [updates.md](updates.md) for th
 | Configured monitor no longer exists | The capturer reports `MonitorNotFound`. The error is surfaced in `EngineStatus.lastError` and the engine retries every few seconds, so reconnecting the monitor recovers without a restart. |
 | Capture unsupported or other OS error | Surfaced in `lastError`; the engine retries on a slower interval rather than spinning. |
 | iCUE not running, SDK library missing, or connection lost | The iCUE light reports `unavailable`, `connecting` or `error` with a `detail` string; a missing library also sets `code: "libraryMissing"`, which the UI answers with a download button (`install_icue_sdk`). The lights poller notices a reconnect and the engine resends the current colour. The rest of the app keeps working. |
+| Hue bridge unreachable, certificate changed, credentials rejected, or no area selected | The Hue light reports `unavailable`, `connecting` or `error` with a `detail` string; no bridge or no area sets `code: "notPaired"` or `"noArea"`. The worker retries in the background and the engine resends the current colour after a reconnect. |
 | A light is disabled in the settings, or the engine is paused | Lights are released (`disabled`) and the current state is restored on resume. |
 | `config.json` missing | Defaults are used. |
 | `config.json` unreadable as a configuration | It is copied to `config.json.bak` and defaults are used. Valid files are validated and clamped. |
