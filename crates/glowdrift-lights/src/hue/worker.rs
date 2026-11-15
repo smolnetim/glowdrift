@@ -1,21 +1,42 @@
 //! Worker-side state machine of the Hue light.
 //!
 //! A [`Worker`] is driven by explicit inputs (`apply`, `step`) and an explicit clock. `step`
-//! performs at most one network action (a connect or one PUT) and returns when it wants to be
-//! called again, so shutdown and new colours are noticed between requests. All I/O happens on
-//! the worker thread.
+//! performs at most one network action (a connect, a state read or one PUT) and returns when it
+//! wants to be called again, so shutdown and new colours are noticed between requests. All I/O
+//! happens on the worker thread, except that stopping a send session restores the lights it
+//! changed before returning.
+//!
+//! # Send sessions
+//!
+//! A send session starts when a light is first driven after the light was enabled or its
+//! target changed. Just before the first PUT to a light its state is read and kept. The
+//! states are PUT back when the light is disabled, the bridge is forgotten, the target becomes
+//! empty or the worker shuts down, and for lights that leave the target when the target or the
+//! extra lights change. A session survives connection losses and reconnects, so the kept
+//! states are never overwritten with the app's own output, and each state is restored once.
 
 use std::time::{Duration, Instant};
 
-use glowdrift_core::Rgb;
+use glowdrift_core::{LightPosition, Rgb};
 use serde_json::{Value, json};
 
-use super::api::{Inventory, LightInfo};
+use super::api::{Inventory, LightInfo, LightSnapshot, LightStateReply};
 use super::client::{Bridge, REQUEST_TIMEOUT};
 use super::color::{self, Mapped};
+use super::light::ZoneSource;
 use super::pacer::{PUT_GAP, Pacer, Poll, round_interval};
 use super::{BridgeCredentials, HueError};
 use crate::{LightCode, LightState};
+
+/// Transition time of the PUT that restores a light.
+const RESTORE_FADE: Duration = Duration::from_millis(400);
+/// Request timeout of the connection used for restoring.
+const RESTORE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Time after which a restore stops starting new PUTs when the light is stopped.
+const STOP_RESTORE_BUDGET: Duration = Duration::from_secs(5);
+/// Time after which a restore stops starting new PUTs when the worker shuts down. With the
+/// request timeout this stays inside the wait of `HueLight::shutdown`.
+const SHUTDOWN_RESTORE_BUDGET: Duration = Duration::from_secs(2);
 
 /// Timing knobs, overridable in tests.
 #[derive(Debug, Clone, Copy)]
@@ -70,11 +91,26 @@ pub(crate) struct Target {
     pub area_id: Option<String>,
 }
 
+/// The colours the light was last asked to show.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ColorUpdate {
+    /// One colour for every light.
+    Whole(Rgb),
+    /// One colour per light, in the order of the lights published for `epoch`. Applies only
+    /// while the worker's epoch is the same; otherwise `whole` is shown on every light.
+    PerLight {
+        epoch: u64,
+        whole: Rgb,
+        zones: Vec<Rgb>,
+    },
+}
+
 /// Inputs queued for the worker since its last step.
 #[derive(Debug, Default)]
 pub(crate) struct Inbox {
-    pub color: Option<Rgb>,
+    pub color: Option<ColorUpdate>,
     pub target: Option<Target>,
+    pub extras: Option<Vec<String>>,
     pub enabled: Option<bool>,
     pub retry: bool,
     pub shutdown: bool,
@@ -84,10 +120,20 @@ impl Inbox {
     pub fn has_pending(&self) -> bool {
         self.color.is_some()
             || self.target.is_some()
+            || self.extras.is_some()
             || self.enabled.is_some()
             || self.retry
             || self.shutdown
     }
+}
+
+/// A light the worker drives, as published to the handle.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TargetInfo {
+    pub id: String,
+    pub name: String,
+    pub position: Option<LightPosition>,
+    pub source: ZoneSource,
 }
 
 /// The output for one light, quantised so near-identical colours compare equal.
@@ -127,9 +173,13 @@ pub(crate) fn command_for(light: &LightInfo, rgb: Rgb) -> Command {
     }
 }
 
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// The PUT body for a command; `duration` is the transition time.
 pub(crate) fn body_for(command: Command, duration: Duration) -> Value {
-    let dynamics = json!({ "duration": u64::try_from(duration.as_millis()).unwrap_or(u64::MAX) });
+    let dynamics = json!({ "duration": millis(duration) });
     match command {
         Command::Off => json!({ "on": { "on": false }, "dynamics": dynamics }),
         Command::On { xy, brightness } => {
@@ -143,6 +193,40 @@ pub(crate) fn body_for(command: Command, duration: Duration) -> Value {
             }
             body
         }
+    }
+}
+
+/// The PUT body that puts a light back into `snapshot`: its on/off state, brightness, and
+/// either its colour temperature (when it was in that mode) or its colour.
+pub(crate) fn restore_body(snapshot: &LightSnapshot, duration: Duration) -> Value {
+    let mut body = json!({
+        "on": { "on": snapshot.on },
+        "dynamics": { "duration": millis(duration) },
+    });
+    if let Some(brightness) = snapshot.brightness {
+        body["dimming"] = json!({ "brightness": brightness });
+    }
+    if let Some(mirek) = snapshot.mirek {
+        body["color_temperature"] = json!({ "mirek": mirek });
+    } else if let Some((x, y)) = snapshot.xy {
+        body["color"] = json!({ "xy": { "x": x, "y": y } });
+    }
+    body
+}
+
+/// The colour the light at `index` of the target should show.
+fn color_for(colors: Option<&ColorUpdate>, epoch: u64, index: usize) -> Option<Rgb> {
+    match colors? {
+        ColorUpdate::Whole(color) => Some(*color),
+        ColorUpdate::PerLight {
+            epoch: for_epoch,
+            whole,
+            zones,
+        } => Some(if *for_epoch == epoch {
+            zones.get(index).copied().unwrap_or(*whole)
+        } else {
+            *whole
+        }),
     }
 }
 
@@ -173,12 +257,49 @@ impl Backoff {
     }
 }
 
+/// Whether the state of a light was read in the current send session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapState {
+    Unknown,
+    Taken,
+    /// Reading failed; the light is driven but cannot be restored.
+    Failed,
+}
+
+struct Member {
+    info: LightInfo,
+    source: ZoneSource,
+    position: Option<LightPosition>,
+    /// The colour this light should show.
+    want: Option<Rgb>,
+    /// The command this light was last given successfully.
+    last: Option<Command>,
+    snap: SnapState,
+}
+
+impl Member {
+    fn target_info(&self) -> TargetInfo {
+        TargetInfo {
+            id: self.info.id.clone(),
+            name: self.info.name.clone(),
+            position: self.position,
+            source: self.source,
+        }
+    }
+}
+
 struct Session {
+    creds: BridgeCredentials,
     bridge: Bridge,
-    lights: Vec<LightInfo>,
-    /// The command each light was last given successfully.
-    last: Vec<Option<Command>>,
+    /// Entertainment lights in channel order, then extra lights in the order given.
+    members: Vec<Member>,
     pacer: Pacer,
+}
+
+/// The states of the lights changed in the current send session.
+struct Held {
+    creds: BridgeCredentials,
+    snapshots: Vec<(String, LightSnapshot)>,
 }
 
 /// Problems that persist until the user changes something.
@@ -193,8 +314,15 @@ pub(crate) struct Worker {
     timing: Timing,
     enabled: bool,
     target: Target,
-    desired: Option<Rgb>,
+    extras: Vec<String>,
+    colors: Option<ColorUpdate>,
     session: Option<Session>,
+    /// States to restore when the send session ends.
+    held: Option<Held>,
+    /// The lights of the last successful resolve; `None` while the target is empty or changed.
+    resolved: Option<Vec<TargetInfo>>,
+    /// Counts changes of `resolved`.
+    epoch: u64,
     sticky: Option<Sticky>,
     retry_at: Option<Instant>,
     backoff: Backoff,
@@ -220,8 +348,12 @@ impl Worker {
             timing,
             enabled: false,
             target: Target::default(),
-            desired: None,
+            extras: Vec::new(),
+            colors: None,
             session: None,
+            held: None,
+            resolved: None,
+            epoch: 0,
             sticky: None,
             retry_at: None,
             backoff: Backoff::new(timing.backoff_initial, timing.backoff_max),
@@ -235,10 +367,24 @@ impl Worker {
         &self.status
     }
 
+    /// The lights driven by the last successful resolve, with a counter that changes whenever
+    /// they do.
+    pub fn resolved(&self) -> (u64, Option<&[TargetInfo]>) {
+        (self.epoch, self.resolved.as_deref())
+    }
+
+    fn set_resolved(&mut self, resolved: Option<Vec<TargetInfo>>) {
+        if resolved != self.resolved {
+            self.resolved = resolved;
+            self.epoch += 1;
+        }
+    }
+
     /// Applies queued inputs. Returns `true` on shutdown.
     pub fn apply(&mut self, inbox: Inbox) -> bool {
         if inbox.shutdown {
             self.session = None;
+            self.end_send_session(SHUTDOWN_RESTORE_BUDGET);
             self.status = Status::new(LightState::Disabled, None);
             return true;
         }
@@ -251,19 +397,46 @@ impl Worker {
         if let Some(target) = inbox.target
             && target != self.target
         {
+            if self
+                .held
+                .as_ref()
+                .is_some_and(|h| Some(&h.creds) != target.creds.as_ref())
+            {
+                self.session = None;
+                self.end_send_session(STOP_RESTORE_BUDGET);
+            }
             self.target = target;
+            self.set_resolved(None);
             self.reset_connection();
         }
-        if inbox.retry {
+        if let Some(extras) = inbox.extras
+            && extras != self.extras
+        {
+            self.extras = extras;
+            self.reset_connection();
+        }
+        if inbox.retry && self.session.is_none() {
             self.reset_connection();
         }
         if let Some(color) = inbox.color {
-            self.desired = Some(color);
-            if let Some(session) = &mut self.session {
-                session.pacer.touch();
-            }
+            self.colors = Some(color);
+            self.refresh_wants();
         }
         false
+    }
+
+    /// Recomputes what each light of the session should show and marks changed lights stale.
+    fn refresh_wants(&mut self) {
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        for (index, member) in session.members.iter_mut().enumerate() {
+            let want = color_for(self.colors.as_ref(), self.epoch, index);
+            if member.want != want {
+                member.want = want;
+                session.pacer.touch_one(index);
+            }
+        }
     }
 
     fn reset_connection(&mut self) {
@@ -275,16 +448,36 @@ impl Worker {
         self.put_failure_logged = None;
     }
 
+    /// Puts the lights changed in the send session back and ends the session. Lights that
+    /// cannot be reached are logged and skipped; the states are dropped either way.
+    fn end_send_session(&mut self, budget: Duration) {
+        let Some(held) = self.held.take() else {
+            return;
+        };
+        let bridge = Bridge::new(
+            &held.creds.address,
+            Some(&held.creds.cert_sha256),
+            Some(&held.creds.app_key),
+            RESTORE_TIMEOUT,
+        );
+        match bridge {
+            Ok(bridge) => restore_lights(&bridge, held.snapshots, self.timing.put_gap, budget),
+            Err(err) => log::warn!("could not restore the Hue lights: {err}"),
+        }
+    }
+
     /// Performs at most one network action; returns when to step again, `None` to sleep until
     /// the next input.
     pub fn step(&mut self, now: Instant) -> Option<Instant> {
         if !self.enabled {
             self.session = None;
+            self.end_send_session(STOP_RESTORE_BUDGET);
             self.status = Status::new(LightState::Disabled, None);
             return None;
         }
         if self.target.creds.is_none() {
             self.session = None;
+            self.end_send_session(STOP_RESTORE_BUDGET);
             self.status = Status::coded(
                 LightState::Unavailable,
                 "Not paired with a Hue bridge",
@@ -292,11 +485,13 @@ impl Worker {
             );
             return None;
         }
-        if self.target.area_id.is_none() {
+        if self.target.area_id.is_none() && self.extras.is_empty() {
             self.session = None;
+            self.end_send_session(STOP_RESTORE_BUDGET);
+            self.set_resolved(None);
             self.status = Status::coded(
                 LightState::Unavailable,
-                "Choose a Hue area",
+                "Choose a Hue area or add a light",
                 LightCode::NoArea,
             );
             return None;
@@ -316,23 +511,20 @@ impl Worker {
     }
 
     fn connect(&mut self, now: Instant) -> Option<Instant> {
-        let (Some(creds), Some(area)) = (self.target.creds.clone(), self.target.area_id.clone())
-        else {
-            return None;
-        };
-        match open_session(&creds, &area, self.timing.put_gap) {
+        let creds = self.target.creds.clone()?;
+        let area = self.target.area_id.clone();
+        match open_session(&creds, area.as_deref(), &self.extras, self.timing.put_gap) {
             Ok(mut session) => {
                 if self.outage_logged {
                     log::info!("Hue bridge reachable again");
                 }
                 self.outage_logged = false;
-                if self.desired.is_none() {
+                self.adopt(&mut session);
+                if self.colors.is_none() {
                     self.backoff.reset();
-                } else {
-                    session.pacer.touch();
                 }
                 self.status = Status {
-                    device_count: u32::try_from(session.lights.len()).unwrap_or(u32::MAX),
+                    device_count: u32::try_from(session.members.len()).unwrap_or(u32::MAX),
                     ..Status::new(LightState::Connected, Some("Connected"))
                 };
                 self.session = Some(session);
@@ -341,6 +533,46 @@ impl Worker {
             Err(err) => {
                 self.on_connect_error(&err, now);
                 self.retry_at
+            }
+        }
+    }
+
+    /// Joins a freshly opened session to the send session in progress: publishes its lights,
+    /// restores the held lights that are no longer driven and gives the lights their colours.
+    fn adopt(&mut self, session: &mut Session) {
+        self.set_resolved(Some(
+            session.members.iter().map(Member::target_info).collect(),
+        ));
+        if self
+            .held
+            .as_ref()
+            .is_some_and(|held| held.creds != session.creds)
+        {
+            self.end_send_session(STOP_RESTORE_BUDGET);
+        }
+        if let Some(held) = &mut self.held {
+            let (kept, departed): (Vec<_>, Vec<_>) = std::mem::take(&mut held.snapshots)
+                .into_iter()
+                .partition(|(id, _)| session.members.iter().any(|m| m.info.id == *id));
+            held.snapshots = kept;
+            if !departed.is_empty() {
+                restore_lights(
+                    &session.bridge,
+                    departed,
+                    self.timing.put_gap,
+                    STOP_RESTORE_BUDGET,
+                );
+            }
+            for member in &mut session.members {
+                if held.snapshots.iter().any(|(id, _)| *id == member.info.id) {
+                    member.snap = SnapState::Taken;
+                }
+            }
+        }
+        for (index, member) in session.members.iter_mut().enumerate() {
+            member.want = color_for(self.colors.as_ref(), self.epoch, index);
+            if member.want.is_some() {
+                session.pacer.touch_one(index);
             }
         }
     }
@@ -359,7 +591,7 @@ impl Worker {
             HueError::AreaNotFound => {
                 self.status = Status::coded(
                     LightState::Unavailable,
-                    "The selected Hue area was not found or has no lights",
+                    "The selected Hue area or lights were not found",
                     LightCode::NoArea,
                 );
                 self.schedule_retry(now);
@@ -410,42 +642,76 @@ impl Worker {
         }
     }
 
+    /// Handles a failure of a request that says something about the whole connection.
+    fn connection_failed(&mut self, err: &HueError, now: Instant) -> Option<Instant> {
+        if matches!(err, HueError::Network(_)) {
+            self.on_connect_error(err, Instant::now());
+            self.retry_at
+        } else {
+            self.on_connect_error(err, now);
+            None
+        }
+    }
+
     fn send_next(&mut self, now: Instant) -> Option<Instant> {
-        let desired = self.desired?;
         let session = self.session.as_mut()?;
         let index = match session.pacer.poll(now) {
             Poll::Idle => return None,
             Poll::WaitUntil(at) => return Some(at),
             Poll::Send(index) => index,
         };
-        let command = command_for(&session.lights[index], desired);
-        if session.last[index] == Some(command) {
+        let count = session.members.len();
+        let member = &mut session.members[index];
+        let Some(want) = member.want else {
+            session.pacer.skipped(index);
+            return Some(now);
+        };
+        let command = command_for(&member.info, want);
+        if member.last == Some(command) {
             session.pacer.skipped(index);
             return Some(now);
         }
-        let duration = round_interval(self.timing.put_gap, session.lights.len());
+        let id = member.info.id.clone();
+        if member.snap == SnapState::Unknown {
+            match read_snapshot(&session.bridge, &id) {
+                Ok(snapshot) => {
+                    member.snap = SnapState::Taken;
+                    self.held
+                        .get_or_insert_with(|| Held {
+                            creds: session.creds.clone(),
+                            snapshots: Vec::new(),
+                        })
+                        .snapshots
+                        .push((id.clone(), snapshot));
+                }
+                Err(
+                    err @ (HueError::Network(_)
+                    | HueError::Unauthorized
+                    | HueError::CertificateMismatch),
+                ) => return self.connection_failed(&err, now),
+                Err(err) => {
+                    member.snap = SnapState::Failed;
+                    log::warn!("could not read the state of Hue light {id}: {err}");
+                }
+            }
+        }
+        let duration = round_interval(self.timing.put_gap, count);
         let body = body_for(command, duration);
-        let id = session.lights[index].id.clone();
         session.pacer.attempted(index, now);
-        let result = session.bridge.put_v2("light", &id, &body);
-        match result {
+        match session.bridge.put_v2("light", &id, &body) {
             Ok(()) => {
-                session.last[index] = Some(command);
+                member.last = Some(command);
                 self.backoff.reset();
                 self.put_failure_logged = None;
                 self.outage_logged = false;
             }
-            Err(HueError::Network(_)) => {
-                let err = result.err()?;
-                self.on_connect_error(&err, Instant::now());
-                return self.retry_at;
-            }
-            Err(err @ (HueError::Unauthorized | HueError::CertificateMismatch)) => {
-                self.on_connect_error(&err, now);
-                return None;
-            }
+            Err(
+                err @ (HueError::Network(_)
+                | HueError::Unauthorized
+                | HueError::CertificateMismatch),
+            ) => return self.connection_failed(&err, now),
             Err(err) => {
-                session.last[index] = None;
+                member.last = None;
                 let text = err.to_string();
                 if self.put_failure_logged.as_deref() != Some(text.as_str()) {
                     log::warn!("Hue light {id} rejected a colour: {text}");
@@ -457,9 +723,52 @@ impl Worker {
     }
 }
 
+fn read_snapshot(bridge: &Bridge, id: &str) -> Result<LightSnapshot, HueError> {
+    let replies: Vec<LightStateReply> = bridge.get_v2(&format!("light/{id}"))?;
+    replies
+        .first()
+        .and_then(LightStateReply::snapshot)
+        .ok_or_else(|| HueError::Parse("the light reported no state".to_owned()))
+}
+
+/// PUTs each light back into its state, at most one PUT per `gap`, and stops starting new ones
+/// after `budget` or when the bridge cannot be reached. Lights that fail are logged and
+/// skipped.
+fn restore_lights(
+    bridge: &Bridge,
+    lights: Vec<(String, LightSnapshot)>,
+    gap: Duration,
+    budget: Duration,
+) {
+    let started = Instant::now();
+    let mut last_put: Option<Instant> = None;
+    for (id, snapshot) in lights {
+        if let Some(at) = last_put {
+            std::thread::sleep(gap.saturating_sub(at.elapsed()));
+        }
+        if started.elapsed() >= budget {
+            log::warn!("out of time restoring Hue light {id}; leaving it as it is");
+            continue;
+        }
+        last_put = Some(Instant::now());
+        match bridge.put_v2("light", &id, &restore_body(&snapshot, RESTORE_FADE)) {
+            Ok(()) => {}
+            Err(err @ (HueError::Network(_) | HueError::CertificateMismatch)) => {
+                log::warn!("could not restore the Hue lights: {err}");
+                return;
+            }
+            Err(err) => log::warn!("could not restore Hue light {id}: {err}"),
+        }
+    }
+}
+
+/// Connects and resolves the lights to drive: the entertainment area (when one is chosen and
+/// found) followed by the extra lights. Extra lights the bridge does not know are logged and
+/// skipped; having no light at all is [`HueError::AreaNotFound`].
 fn open_session(
     creds: &BridgeCredentials,
-    area_id: &str,
+    area_id: Option<&str>,
+    extras: &[String],
     put_gap: Duration,
 ) -> Result<Session, HueError> {
     if creds.cert_sha256.is_empty() || creds.app_key.is_empty() {
@@ -473,16 +782,46 @@ fn open_session(
         Some(&creds.app_key),
         REQUEST_TIMEOUT,
     )?;
-    let lights = Inventory::fetch(&bridge)?
-        .area_lights(area_id)
-        .filter(|lights| !lights.is_empty())
-        .ok_or(HueError::AreaNotFound)?;
+    let inventory = Inventory::fetch(&bridge)?;
+    let mut members: Vec<Member> = Vec::new();
+    let new_member = |info: LightInfo, source, position| Member {
+        info,
+        source,
+        position,
+        want: None,
+        last: None,
+        snap: SnapState::Unknown,
+    };
+    if let Some(area_id) = area_id {
+        match inventory.area_lights(area_id) {
+            Some(lights) if !lights.is_empty() => {
+                members.extend(
+                    lights.into_iter().map(|(info, position)| {
+                        new_member(info, ZoneSource::Entertainment, position)
+                    }),
+                );
+            }
+            _ => log::warn!("the selected Hue area was not found or has no lights"),
+        }
+    }
+    for id in extras {
+        if members.iter().any(|m| m.info.id == *id) {
+            continue;
+        }
+        match inventory.light(id) {
+            Some(info) => members.push(new_member(info, ZoneSource::Extra, None)),
+            None => log::warn!("Hue light {id} was not found on the bridge; skipping it"),
+        }
+    }
+    if members.is_empty() {
+        return Err(HueError::AreaNotFound);
+    }
     let mut pacer = Pacer::new(put_gap);
-    pacer.set_lights(lights.len());
+    pacer.set_lights(members.len());
     Ok(Session {
+        creds: creds.clone(),
         bridge,
-        last: vec![None; lights.len()],
-        lights,
+        members,
         pacer,
     })
 }
@@ -495,6 +834,7 @@ mod tests {
     fn colour_light() -> LightInfo {
         LightInfo {
             id: "l".to_owned(),
+            name: "L".to_owned(),
             gamut: Some(Gamut::C),
             dimmable: true,
         }
@@ -528,6 +868,7 @@ mod tests {
     fn dimmable_white_bulb_gets_brightness_only() {
         let light = LightInfo {
             id: "w".to_owned(),
+            name: "W".to_owned(),
             gamut: None,
             dimmable: true,
         };
@@ -542,6 +883,7 @@ mod tests {
     fn plain_switch_is_on_or_off() {
         let light = LightInfo {
             id: "p".to_owned(),
+            name: "P".to_owned(),
             gamut: None,
             dimmable: false,
         };
@@ -577,6 +919,70 @@ mod tests {
             body_for(Command::Off, Duration::from_millis(100)),
             json!({"on": {"on": false}, "dynamics": {"duration": 100}})
         );
+    }
+
+    #[test]
+    fn restore_bodies_put_back_the_active_colour_mode() {
+        let fade = Duration::from_millis(400);
+        let xy = LightSnapshot {
+            on: true,
+            brightness: Some(42.5),
+            xy: Some((0.31, 0.32)),
+            mirek: None,
+        };
+        assert_eq!(
+            restore_body(&xy, fade),
+            json!({
+                "on": {"on": true},
+                "dimming": {"brightness": 42.5},
+                "color": {"xy": {"x": 0.31, "y": 0.32}},
+                "dynamics": {"duration": 400}
+            })
+        );
+        // Colour-temperature mode wins over a stale xy value.
+        let ct = LightSnapshot {
+            mirek: Some(300),
+            ..xy.clone()
+        };
+        assert_eq!(
+            restore_body(&ct, fade),
+            json!({
+                "on": {"on": true},
+                "dimming": {"brightness": 42.5},
+                "color_temperature": {"mirek": 300},
+                "dynamics": {"duration": 400}
+            })
+        );
+        let off = LightSnapshot {
+            on: false,
+            brightness: None,
+            xy: None,
+            mirek: None,
+        };
+        assert_eq!(
+            restore_body(&off, fade),
+            json!({"on": {"on": false}, "dynamics": {"duration": 400}})
+        );
+    }
+
+    #[test]
+    fn per_light_colours_apply_only_to_their_epoch() {
+        let whole = Rgb::new(1, 1, 1);
+        let zones = vec![Rgb::new(2, 2, 2), Rgb::new(3, 3, 3)];
+        let update = ColorUpdate::PerLight {
+            epoch: 4,
+            whole,
+            zones: zones.clone(),
+        };
+        assert_eq!(color_for(Some(&update), 4, 1), Some(zones[1]));
+        // A light beyond the list and a list of another epoch show the whole colour.
+        assert_eq!(color_for(Some(&update), 4, 2), Some(whole));
+        assert_eq!(color_for(Some(&update), 5, 0), Some(whole));
+        assert_eq!(
+            color_for(Some(&ColorUpdate::Whole(whole)), 9, 3),
+            Some(whole)
+        );
+        assert_eq!(color_for(None, 0, 0), None);
     }
 
     #[test]

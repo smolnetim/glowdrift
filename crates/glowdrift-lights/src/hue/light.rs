@@ -1,5 +1,9 @@
 //! [`HueLight`]: the [`Light`] implementation and its handle. All I/O runs on one worker thread;
-//! `set_color` only stores the latest colour and wakes it.
+//! `set_color` and `set_zone_colors` only store the latest colours and wake it.
+//!
+//! The worker publishes the lights it drives. From those, the zone overrides and the default
+//! zones, [`Shared`] keeps the effective layout, whose generation changes whenever the lights
+//! or a zone do.
 
 use std::collections::BTreeMap;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -7,13 +11,14 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use glowdrift_core::{LightPosition, NormRect, Rgb};
+use glowdrift_core::zones::EXTRA_ZONE_WIDTH;
+use glowdrift_core::{LightPosition, NormRect, Rgb, default_zones};
 use serde::{Deserialize, Serialize};
 
 use super::pacer::round_interval;
-use super::worker::{Inbox, Status, Target, Timing, Worker};
+use super::worker::{ColorUpdate, Inbox, Status, Target, TargetInfo, Timing, Worker};
 use super::{BridgeCredentials, HUE_LIGHT_ID};
-use crate::{Light, LightError, LightState, LightStatus};
+use crate::{Light, LightError, LightState, LightStatus, ZoneLayout};
 
 /// How long [`Light::shutdown`] waits for the worker before abandoning it. Longer than one
 /// request timeout, so a request in flight finishes first.
@@ -31,21 +36,105 @@ struct Shared {
     inbox: Mutex<Inbox>,
     wake: Condvar,
     status: Mutex<Status>,
+    /// The lights the worker drives, with the epoch they were published for.
+    resolved: Mutex<Resolved>,
+    /// The effective layout. Always locked before `zone_overrides` and `resolved`.
+    layout: Mutex<Layout>,
+}
+
+#[derive(Default)]
+struct Resolved {
+    epoch: u64,
+    lights: Option<Vec<TargetInfo>>,
+}
+
+#[derive(Default)]
+struct Layout {
+    generation: u64,
+    /// The epoch of the resolved lights this layout was built from.
+    epoch: u64,
+    lights: Option<Vec<AreaLightZone>>,
+}
+
+/// The default zone of a light without a position.
+fn extra_zone() -> NormRect {
+    NormRect::new((1.0 - EXTRA_ZONE_WIDTH) / 2.0, 0.0, EXTRA_ZONE_WIDTH, 1.0)
+}
+
+/// The lights with their effective zones, in the order of `lights`. Entertainment lights get
+/// their default zone from `default_zones` (which spreads them evenly when none has a
+/// position), extra lights the centred box.
+fn effective_zones(
+    lights: &[TargetInfo],
+    overrides: &BTreeMap<String, NormRect>,
+) -> Vec<AreaLightZone> {
+    let positions: Vec<Option<LightPosition>> = lights
+        .iter()
+        .filter(|l| l.source == ZoneSource::Entertainment)
+        .map(|l| l.position)
+        .collect();
+    let mut defaults = default_zones(&positions).into_iter();
+    lights
+        .iter()
+        .map(|light| {
+            let default = match light.source {
+                ZoneSource::Entertainment => defaults.next().unwrap_or_else(extra_zone),
+                ZoneSource::Extra => extra_zone(),
+            };
+            let custom = overrides.get(&light.id).copied();
+            AreaLightZone {
+                id: light.id.clone(),
+                name: light.name.clone(),
+                position: light.position,
+                zone: custom.unwrap_or(default),
+                custom: custom.is_some(),
+                source: light.source,
+            }
+        })
+        .collect()
 }
 
 impl Shared {
+    /// Rebuilds the layout from the current overrides and resolved lights; bumps the
+    /// generation when the lights or any zone differ from before.
+    fn refresh_layout(&self) {
+        let mut layout = lock(&self.layout);
+        let overrides = lock(&self.zone_overrides).clone();
+        let (epoch, lights) = {
+            let resolved = lock(&self.resolved);
+            (
+                resolved.epoch,
+                resolved
+                    .lights
+                    .as_deref()
+                    .map(|lights| effective_zones(lights, &overrides)),
+            )
+        };
+        layout.epoch = epoch;
+        if layout.lights != lights {
+            layout.generation += 1;
+            layout.lights = lights;
+        }
+    }
+
+    fn publish_resolved(&self, epoch: u64, lights: Option<Vec<TargetInfo>>) {
+        *lock(&self.resolved) = Resolved { epoch, lights };
+        self.refresh_layout();
+    }
+
     fn update(&self, change: impl FnOnce(&mut Inbox)) {
         change(&mut lock(&self.inbox));
         self.wake.notify_one();
     }
 }
 
-/// Drives the lights of one Hue area with a single colour.
+/// Drives the lights of one Hue entertainment area plus any extra lights, with one colour or a
+/// colour per light, and restores them when it stops.
 pub struct HueLight {
     shared: Arc<Shared>,
     timing: Timing,
     enabled: bool,
-    last_color: Option<Rgb>,
+    last_update: Option<ColorUpdate>,
     thread: Option<JoinHandle<()>>,
     done: Receiver<()>,
 }
@@ -111,18 +200,23 @@ impl HueHandle {
     /// entry use their default zone. Never blocks.
     pub fn set_zone_overrides(&self, overrides: BTreeMap<String, NormRect>) {
         *lock(&self.shared.zone_overrides) = overrides;
+        self.shared.refresh_layout();
     }
 
-    /// Replaces the ids of the single bridge lights driven in addition to the area. Never
-    /// blocks.
+    /// Replaces the ids of the single bridge lights driven in addition to the area, in the
+    /// order they are listed by [`HueHandle::area_lights`]. Lights the bridge does not have are
+    /// skipped. Never blocks; the worker re-resolves in the background.
     pub fn set_extra_lights(&self, ids: Vec<String>) {
-        *lock(&self.shared.extra_lights) = ids;
+        lock(&self.shared.extra_lights).clone_from(&ids);
+        self.shared.update(|inbox| inbox.extras = Some(ids));
     }
 
-    /// The lights currently driven with the zone each one samples, entertainment lights
-    /// first. Performs no I/O. `None` until the area is resolved, which is currently always.
+    /// The lights currently driven with the zone each one samples: the area's lights in channel
+    /// order, then the extra lights. Performs no I/O. `None` until the lights are resolved; the
+    /// last result is kept while the bridge is unreachable or the light is disabled, and
+    /// dropped when the bridge or area changes.
     pub fn area_lights(&self) -> Option<Vec<AreaLightZone>> {
-        None
+        lock(&self.shared.layout).lights.clone()
     }
 }
 
@@ -162,6 +256,8 @@ impl HueLight {
             } else {
                 Status::new(LightState::Disabled, None)
             }),
+            resolved: Mutex::new(Resolved::default()),
+            layout: Mutex::new(Layout::default()),
         });
         let (done_tx, done) = mpsc::channel();
         let worker_shared = Arc::clone(&shared);
@@ -184,12 +280,23 @@ impl HueLight {
                 shared,
                 timing,
                 enabled,
-                last_color: None,
+                last_update: None,
                 thread,
                 done,
             },
             handle,
         )
+    }
+}
+
+impl HueLight {
+    /// Queues `update` for the worker unless it is the one sent last.
+    fn send_colors(&mut self, update: ColorUpdate) {
+        if self.last_update.as_ref() == Some(&update) {
+            return;
+        }
+        self.last_update = Some(update.clone());
+        self.shared.update(|inbox| inbox.color = Some(update));
     }
 }
 
@@ -247,11 +354,43 @@ impl Light for HueLight {
     }
 
     fn set_color(&mut self, color: Rgb) -> Result<(), LightError> {
-        if self.last_color == Some(color) {
-            return Ok(());
-        }
-        self.last_color = Some(color);
-        self.shared.update(|inbox| inbox.color = Some(color));
+        self.send_colors(ColorUpdate::Whole(color));
+        Ok(())
+    }
+
+    fn zone_layout(&self) -> Option<ZoneLayout> {
+        let layout = lock(&self.shared.layout);
+        let lights = layout.lights.as_ref()?;
+        Some(ZoneLayout {
+            generation: layout.generation,
+            zones: lights.iter().map(|light| light.zone).collect(),
+        })
+    }
+
+    fn set_zone_colors(
+        &mut self,
+        generation: u64,
+        whole: Rgb,
+        zones: &[Rgb],
+    ) -> Result<(), LightError> {
+        let (current, epoch) = {
+            let layout = lock(&self.shared.layout);
+            let matches = layout.generation == generation
+                && layout
+                    .lights
+                    .as_ref()
+                    .is_some_and(|lights| lights.len() == zones.len());
+            (matches, layout.epoch)
+        };
+        self.send_colors(if current {
+            ColorUpdate::PerLight {
+                epoch,
+                whole,
+                zones: zones.to_vec(),
+            }
+        } else {
+            ColorUpdate::Whole(whole)
+        });
         Ok(())
     }
 
@@ -279,14 +418,22 @@ fn run_worker(shared: &Arc<Shared>, timing: Timing, done: &Sender<()>) {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut worker = Worker::new(timing);
         let mut deadline: Option<Instant> = None;
+        let mut published_epoch = 0;
         loop {
             let batch = wait_for_work(shared, deadline);
-            if worker.apply(batch) {
-                *lock(&shared.status) = worker.status().clone();
+            let stop = worker.apply(batch);
+            if !stop {
+                deadline = worker.step(Instant::now());
+            }
+            *lock(&shared.status) = worker.status().clone();
+            let (epoch, lights) = worker.resolved();
+            if epoch != published_epoch {
+                published_epoch = epoch;
+                shared.publish_resolved(epoch, lights.map(<[TargetInfo]>::to_vec));
+            }
+            if stop {
                 break;
             }
-            deadline = worker.step(Instant::now());
-            *lock(&shared.status) = worker.status().clone();
         }
     }));
     if outcome.is_err() {

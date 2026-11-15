@@ -1,14 +1,15 @@
 //! Bridge wire formats: the v1 config and pairing replies and the CLIP v2 resources needed to
-//! turn an area into its lights.
+//! turn an entertainment area into its lights, with positions, and to read a light's state.
 
 use std::collections::HashMap;
 
+use glowdrift_core::LightPosition;
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::Value;
 
 use super::color::{Gamut, Xy};
-use super::{AreaKind, HueArea, HueError};
+use super::{AreaKind, BridgeLight, HueArea, HueError};
 
 /// `GET /api/0/config` (public part).
 #[derive(Debug, Deserialize)]
@@ -116,17 +117,10 @@ pub(crate) struct Metadata {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct Group {
+pub(crate) struct Device {
     pub id: String,
     #[serde(default)]
     pub metadata: Option<Metadata>,
-    #[serde(default)]
-    pub children: Vec<ResourceRef>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct Device {
-    pub id: String,
     #[serde(default)]
     pub services: Vec<ResourceRef>,
 }
@@ -137,7 +131,16 @@ pub(crate) struct Member {
 }
 
 #[derive(Debug, Deserialize)]
+struct PositionReply {
+    x: f64,
+    y: f64,
+    z: f64,
+}
+
+#[derive(Debug, Deserialize)]
 pub(crate) struct Channel {
+    #[serde(default)]
+    position: Option<PositionReply>,
     #[serde(default)]
     pub members: Vec<Member>,
 }
@@ -178,6 +181,10 @@ struct ColorReply {
 pub(crate) struct LightResource {
     pub id: String,
     #[serde(default)]
+    owner: Option<ResourceRef>,
+    #[serde(default)]
+    metadata: Option<Metadata>,
+    #[serde(default)]
     color: Option<ColorReply>,
     #[serde(default)]
     dimming: Option<Value>,
@@ -187,13 +194,22 @@ pub(crate) struct LightResource {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LightInfo {
     pub id: String,
+    pub name: String,
     /// `None` for lights without colour support.
     pub gamut: Option<Gamut>,
     pub dimmable: bool,
 }
 
 impl LightResource {
-    pub fn info(&self) -> LightInfo {
+    /// `device_name` is the name of the owning device, used when the light has none itself.
+    pub fn info(&self, device_name: Option<&str>) -> LightInfo {
+        let name = [self.metadata.as_ref().map(|m| m.name.as_str()), device_name]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .find(|n| !n.is_empty())
+            .unwrap_or(&self.id)
+            .to_owned();
         let gamut = self.color.as_ref().map(|color| {
             color
                 .gamut
@@ -209,152 +225,290 @@ impl LightResource {
         });
         LightInfo {
             id: self.id.clone(),
+            name,
             gamut,
             dimmable: self.dimming.is_some(),
         }
     }
 }
 
-/// Everything fetched from a bridge to resolve areas.
+/// Everything fetched from a bridge to resolve areas and lights.
 #[derive(Debug, Default)]
 pub(crate) struct Inventory {
-    pub rooms: Vec<Group>,
-    pub zones: Vec<Group>,
     pub entertainment: Vec<EntertainmentConfiguration>,
     pub devices: Vec<Device>,
     pub lights: Vec<LightResource>,
 }
 
+/// A light of an entertainment area with its position, when the area has one for it.
+pub(crate) type PositionedLight = (LightInfo, Option<LightPosition>);
+
+/// Sum of channel positions and how many were added.
+#[derive(Default)]
+struct PositionSum {
+    x: f64,
+    y: f64,
+    z: f64,
+    count: u32,
+}
+
+impl PositionSum {
+    fn add(&mut self, p: &PositionReply) {
+        self.x += p.x;
+        self.y += p.y;
+        self.z += p.z;
+        self.count += 1;
+    }
+
+    fn average(&self) -> Option<LightPosition> {
+        (self.count > 0).then(|| {
+            let n = f64::from(self.count);
+            LightPosition {
+                x: (self.x / n) as f32,
+                y: (self.y / n) as f32,
+                z: (self.z / n) as f32,
+            }
+        })
+    }
+}
+
 impl Inventory {
+    /// Everything needed to resolve entertainment areas.
     pub fn fetch(bridge: &super::client::Bridge) -> Result<Inventory, HueError> {
         Ok(Inventory {
-            rooms: bridge.get_v2("room")?,
-            zones: bridge.get_v2("zone")?,
             entertainment: bridge.get_v2("entertainment_configuration")?,
             devices: bridge.get_v2("device")?,
             lights: bridge.get_v2("light")?,
         })
     }
 
-    /// Light ids of a device, in service order.
-    fn device_lights<'a>(
-        devices: &'a HashMap<&str, &Device>,
-        device_id: &str,
-    ) -> impl Iterator<Item = &'a str> {
-        devices
-            .get(device_id)
-            .into_iter()
-            .flat_map(|d| d.services.iter())
+    /// Only the devices and lights, enough to list and name single lights.
+    pub fn fetch_lights(bridge: &super::client::Bridge) -> Result<Inventory, HueError> {
+        Ok(Inventory {
+            devices: bridge.get_v2("device")?,
+            lights: bridge.get_v2("light")?,
+            ..Inventory::default()
+        })
+    }
+
+    fn light_ids_of_device(device: &Device) -> impl Iterator<Item = &str> {
+        device
+            .services
+            .iter()
             .filter(|s| s.rtype == "light")
             .map(|s| s.rid.as_str())
     }
 
-    fn light_ids(&self, refs: &[ResourceRef]) -> Vec<String> {
+    fn known_light(&self, id: &str) -> bool {
+        self.lights.iter().any(|l| l.id == id)
+    }
+
+    /// The lights of an entertainment configuration in channel order, each with the average of
+    /// the positions of the channels it appears in. Lights listed by the configuration but in
+    /// no channel follow, without a position.
+    fn entertainment_members(
+        &self,
+        config: &EntertainmentConfiguration,
+    ) -> Vec<(String, Option<LightPosition>)> {
+        let by_service: HashMap<&str, &Device> = self
+            .devices
+            .iter()
+            .flat_map(|d| {
+                d.services
+                    .iter()
+                    .filter(|s| s.rtype == "entertainment")
+                    .map(move |s| (s.rid.as_str(), d))
+            })
+            .collect();
         let devices: HashMap<&str, &Device> =
             self.devices.iter().map(|d| (d.id.as_str(), d)).collect();
-        let mut ids: Vec<String> = Vec::new();
-        for r in refs {
-            match r.rtype.as_str() {
-                "light" => ids.push(r.rid.clone()),
-                "device" => ids.extend(Self::device_lights(&devices, &r.rid).map(str::to_owned)),
-                _ => {}
-            }
-        }
-        self.known_unique(ids)
-    }
-
-    /// Keeps ids that exist as light resources, once each, in order.
-    fn known_unique(&self, ids: Vec<String>) -> Vec<String> {
-        let known: std::collections::HashSet<&str> =
-            self.lights.iter().map(|l| l.id.as_str()).collect();
-        let mut seen = std::collections::HashSet::new();
-        ids.into_iter()
-            .filter(|id| known.contains(id.as_str()) && seen.insert(id.clone()))
-            .collect()
-    }
-
-    fn entertainment_lights(&self, config: &EntertainmentConfiguration) -> Vec<String> {
-        let mut refs: Vec<ResourceRef> = config
-            .light_services
-            .iter()
-            .filter(|r| r.rtype == "light")
-            .cloned()
-            .collect();
-        if refs.is_empty() {
-            // Fall back to the lights owning the entertainment services in the channels.
-            for member in config.channels.iter().flat_map(|c| &c.members) {
+        let mut order: Vec<String> = Vec::new();
+        let mut sums: HashMap<String, PositionSum> = HashMap::new();
+        for channel in &config.channels {
+            let position = channel
+                .position
+                .as_ref()
+                .filter(|p| p.x.is_finite() && p.y.is_finite() && p.z.is_finite());
+            let mut in_channel: Vec<&str> = Vec::new();
+            for member in &channel.members {
                 if member.service.rtype != "entertainment" {
                     continue;
                 }
-                if let Some(device) = self
-                    .devices
-                    .iter()
-                    .find(|d| d.services.iter().any(|s| s.rid == member.service.rid))
-                {
-                    refs.push(ResourceRef {
-                        rid: device.id.clone(),
-                        rtype: "device".to_owned(),
-                    });
+                let Some(device) = by_service.get(member.service.rid.as_str()) else {
+                    continue;
+                };
+                for id in Self::light_ids_of_device(device) {
+                    if !self.known_light(id) || in_channel.contains(&id) {
+                        continue;
+                    }
+                    in_channel.push(id);
+                    if !order.iter().any(|o| o == id) {
+                        order.push(id.to_owned());
+                    }
+                    if let Some(p) = position {
+                        sums.entry(id.to_owned()).or_default().add(p);
+                    }
                 }
             }
         }
-        self.light_ids(&refs)
+        for r in &config.light_services {
+            let ids: Vec<&str> = match r.rtype.as_str() {
+                "light" => vec![r.rid.as_str()],
+                "device" => devices
+                    .get(r.rid.as_str())
+                    .map(|d| Self::light_ids_of_device(d).collect())
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            for id in ids {
+                if self.known_light(id) && !order.iter().any(|o| o == id) {
+                    order.push(id.to_owned());
+                }
+            }
+        }
+        order
+            .into_iter()
+            .map(|id| {
+                let position = sums.get(&id).and_then(PositionSum::average);
+                (id, position)
+            })
+            .collect()
     }
 
-    /// All areas with their light ids, rooms first, then zones, then entertainment
-    /// configurations, each group sorted by name.
+    /// The entertainment areas with their light ids, sorted by name.
     pub fn areas(&self) -> Vec<(HueArea, Vec<String>)> {
-        let mut out = Vec::new();
-        let mut push = |kind: AreaKind, id: &str, name: &str, lights: Vec<String>| {
-            out.push((
-                HueArea {
-                    id: id.to_owned(),
-                    kind,
-                    name: name.to_owned(),
-                    light_count: u32::try_from(lights.len()).unwrap_or(u32::MAX),
-                },
-                lights,
-            ));
-        };
         let name_of = |m: &Option<Metadata>| m.as_ref().map(|m| m.name.clone()).unwrap_or_default();
-        let mut groups: Vec<(AreaKind, &Group)> = self
-            .rooms
-            .iter()
-            .map(|g| (AreaKind::Room, g))
-            .chain(self.zones.iter().map(|g| (AreaKind::Zone, g)))
-            .collect();
-        groups.sort_by_key(|(kind, g)| (*kind as u8, name_of(&g.metadata).to_lowercase()));
-        for (kind, group) in groups {
-            push(
-                kind,
-                &group.id,
-                &name_of(&group.metadata),
-                self.light_ids(&group.children),
-            );
-        }
         let mut configs: Vec<&EntertainmentConfiguration> = self.entertainment.iter().collect();
         configs.sort_by_key(|c| name_of(&c.metadata).to_lowercase());
-        for config in configs {
-            push(
-                AreaKind::Entertainment,
-                &config.id,
-                &name_of(&config.metadata),
-                self.entertainment_lights(config),
-            );
-        }
-        out
+        configs
+            .into_iter()
+            .map(|config| {
+                let ids: Vec<String> = self
+                    .entertainment_members(config)
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect();
+                let area = HueArea {
+                    id: config.id.clone(),
+                    kind: AreaKind::Entertainment,
+                    name: name_of(&config.metadata),
+                    light_count: u32::try_from(ids.len()).unwrap_or(u32::MAX),
+                };
+                (area, ids)
+            })
+            .collect()
     }
 
-    /// The lights of one area, or `None` if no area has that id.
-    pub fn area_lights(&self, area_id: &str) -> Option<Vec<LightInfo>> {
-        let (_, ids) = self.areas().into_iter().find(|(a, _)| a.id == area_id)?;
-        let by_id: HashMap<&str, &LightResource> =
-            self.lights.iter().map(|l| (l.id.as_str(), l)).collect();
+    fn info_of(&self, light: &LightResource) -> LightInfo {
+        let device_name = light
+            .owner
+            .as_ref()
+            .and_then(|o| self.devices.iter().find(|d| d.id == o.rid))
+            .and_then(|d| d.metadata.as_ref())
+            .map(|m| m.name.as_str());
+        light.info(device_name)
+    }
+
+    /// One light by id, or `None` if the bridge has no such light.
+    pub fn light(&self, id: &str) -> Option<LightInfo> {
+        self.lights
+            .iter()
+            .find(|l| l.id == id)
+            .map(|l| self.info_of(l))
+    }
+
+    /// The lights of one entertainment area in channel order with their positions, or `None`
+    /// if no area has that id.
+    pub fn area_lights(&self, area_id: &str) -> Option<Vec<PositionedLight>> {
+        let config = self.entertainment.iter().find(|c| c.id == area_id)?;
         Some(
-            ids.iter()
-                .filter_map(|id| by_id.get(id.as_str()).map(|l| l.info()))
+            self.entertainment_members(config)
+                .into_iter()
+                .filter_map(|(id, position)| self.light(&id).map(|info| (info, position)))
                 .collect(),
         )
+    }
+
+    /// All lights of the bridge: colour-capable lights first, each group sorted by name.
+    pub fn bridge_lights(&self) -> Vec<BridgeLight> {
+        let mut lights: Vec<LightInfo> = self.lights.iter().map(|l| self.info_of(l)).collect();
+        lights.sort_by_key(|l| (l.gamut.is_none(), l.name.to_lowercase(), l.id.clone()));
+        lights
+            .into_iter()
+            .map(|l| BridgeLight {
+                id: l.id,
+                name: l.name,
+            })
+            .collect()
+    }
+}
+
+/// A light's state as read before the app changes it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LightSnapshot {
+    pub on: bool,
+    pub brightness: Option<f64>,
+    pub xy: Option<(f64, f64)>,
+    /// Set only when the light is in colour-temperature mode.
+    pub mirek: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OnReply {
+    on: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct DimmingReply {
+    brightness: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct StateColorReply {
+    #[serde(default)]
+    xy: Option<XyReply>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TemperatureReply {
+    #[serde(default)]
+    mirek: Option<u32>,
+    #[serde(default)]
+    mirek_valid: bool,
+}
+
+/// `GET /clip/v2/resource/light/{id}` data: the parts a restore needs.
+#[derive(Debug, Deserialize)]
+pub(crate) struct LightStateReply {
+    #[serde(default)]
+    on: Option<OnReply>,
+    #[serde(default)]
+    dimming: Option<DimmingReply>,
+    #[serde(default)]
+    color: Option<StateColorReply>,
+    #[serde(default)]
+    color_temperature: Option<TemperatureReply>,
+}
+
+impl LightStateReply {
+    /// `None` when the light reports no on/off state.
+    pub fn snapshot(&self) -> Option<LightSnapshot> {
+        let on = self.on.as_ref()?.on;
+        let mirek = self
+            .color_temperature
+            .as_ref()
+            .filter(|t| t.mirek_valid)
+            .and_then(|t| t.mirek);
+        Some(LightSnapshot {
+            on,
+            brightness: self.dimming.as_ref().map(|d| d.brightness),
+            xy: self
+                .color
+                .as_ref()
+                .and_then(|c| c.xy.as_ref())
+                .map(|xy| (xy.x, xy.y)),
+            mirek,
+        })
     }
 }
 
@@ -362,35 +516,40 @@ impl Inventory {
 pub(crate) mod fixtures {
     //! CLIP v2 fixtures shared by unit and mock-bridge tests.
 
-    pub const ROOMS: &str = r#"{"errors":[],"data":[
-      {"id":"room-1","type":"room","metadata":{"name":"Living room","archetype":"living_room"},
-       "children":[{"rid":"dev-a","rtype":"device"},{"rid":"dev-b","rtype":"device"}],
-       "services":[{"rid":"gl-1","rtype":"grouped_light"}]},
-      {"id":"room-2","type":"room","metadata":{"name":"Bedroom"},
-       "children":[{"rid":"dev-c","rtype":"device"}],"services":[]}]}"#;
-    pub const ZONES: &str = r#"{"errors":[],"data":[
-      {"id":"zone-1","type":"zone","metadata":{"name":"Desk"},
-       "children":[{"rid":"light-b","rtype":"light"},{"rid":"light-b","rtype":"light"},
-                   {"rid":"light-gone","rtype":"light"}]}]}"#;
     pub const ENTERTAINMENT: &str = r#"{"errors":[],"data":[
       {"id":"ent-1","type":"entertainment_configuration","metadata":{"name":"TV"},
        "configuration_type":"screen","status":"inactive",
-       "light_services":[{"rid":"light-a","rtype":"light"},{"rid":"light-c","rtype":"light"}]}]}"#;
+       "light_services":[{"rid":"light-a","rtype":"light"},{"rid":"light-b","rtype":"light"}]},
+      {"id":"ent-2","type":"entertainment_configuration","metadata":{"name":"Cinema"},
+       "configuration_type":"screen","status":"inactive",
+       "light_services":[{"rid":"light-c","rtype":"light"},{"rid":"light-a","rtype":"light"}],
+       "channels":[
+         {"channel_id":0,"position":{"x":-0.8,"y":0.5,"z":0.25},
+          "members":[{"service":{"rid":"ent-a","rtype":"entertainment"},"index":0}]},
+         {"channel_id":1,"position":{"x":0.5,"y":0.0,"z":0.0},
+          "members":[{"service":{"rid":"ent-c","rtype":"entertainment"},"index":0}]},
+         {"channel_id":2,"position":{"x":-0.4,"y":0.5,"z":0.75},
+          "members":[{"service":{"rid":"ent-a","rtype":"entertainment"},"index":1}]}]}]}"#;
     pub const DEVICES: &str = r#"{"errors":[],"data":[
-      {"id":"dev-a","services":[{"rid":"light-a","rtype":"light"},{"rid":"zb-a","rtype":"zigbee_connectivity"}]},
-      {"id":"dev-b","services":[{"rid":"light-b","rtype":"light"}]},
-      {"id":"dev-c","services":[{"rid":"light-c","rtype":"light"}]}]}"#;
+      {"id":"dev-a","metadata":{"name":"Floor lamp device"},
+       "services":[{"rid":"light-a","rtype":"light"},{"rid":"zb-a","rtype":"zigbee_connectivity"},
+                   {"rid":"ent-a","rtype":"entertainment"}]},
+      {"id":"dev-b","metadata":{"name":"Desk lamp"},"services":[{"rid":"light-b","rtype":"light"}]},
+      {"id":"dev-c","metadata":{"name":"Hall device"},
+       "services":[{"rid":"light-c","rtype":"light"},{"rid":"ent-c","rtype":"entertainment"}]}]}"#;
     pub const LIGHTS: &str = r#"{"errors":[],"data":[
-      {"id":"light-a","owner":{"rid":"dev-a","rtype":"device"},"on":{"on":true},
-       "dimming":{"brightness":50.0},
+      {"id":"light-a","owner":{"rid":"dev-a","rtype":"device"},"metadata":{"name":"Floor lamp"},
+       "on":{"on":true},"dimming":{"brightness":50.0},
        "color":{"xy":{"x":0.3,"y":0.3},
          "gamut":{"red":{"x":0.6915,"y":0.3083},"green":{"x":0.17,"y":0.7},"blue":{"x":0.1532,"y":0.0475}},
-         "gamut_type":"C"}},
+         "gamut_type":"C"},
+       "color_temperature":{"mirek":null,"mirek_valid":false}},
       {"id":"light-b","owner":{"rid":"dev-b","rtype":"device"},"on":{"on":true},
        "dimming":{"brightness":50.0},
        "color":{"xy":{"x":0.3,"y":0.3},"gamut_type":"B"}},
-      {"id":"light-c","owner":{"rid":"dev-c","rtype":"device"},"on":{"on":true},
-       "dimming":{"brightness":50.0}}]}"#;
+      {"id":"light-c","owner":{"rid":"dev-c","rtype":"device"},"metadata":{"name":"Hall bulb"},
+       "on":{"on":true},"dimming":{"brightness":50.0},
+       "color_temperature":{"mirek":366,"mirek_valid":true}}]}"#;
     pub const PAIR_OK: &str =
         r#"[{"success":{"username":"app-key-123","clientkey":"test-client-key"}}]"#;
     pub const PAIR_LINK_BUTTON: &str =
@@ -406,8 +565,6 @@ mod tests {
     fn inventory() -> Inventory {
         let ok = StatusCode::OK;
         Inventory {
-            rooms: parse_v2(ok, ROOMS.as_bytes()).unwrap(),
-            zones: parse_v2(ok, ZONES.as_bytes()).unwrap(),
             entertainment: parse_v2(ok, ENTERTAINMENT.as_bytes()).unwrap(),
             devices: parse_v2(ok, DEVICES.as_bytes()).unwrap(),
             lights: parse_v2(ok, LIGHTS.as_bytes()).unwrap(),
@@ -488,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn areas_resolve_to_lights_in_order() {
+    fn only_entertainment_areas_are_listed_sorted_by_name() {
         let areas = inventory().areas();
         let summary: Vec<_> = areas
             .iter()
@@ -506,84 +663,135 @@ mod tests {
             summary,
             vec![
                 (
-                    "room-2",
-                    AreaKind::Room,
-                    "Bedroom",
-                    1,
-                    vec!["light-c".to_owned()]
-                ),
-                (
-                    "room-1",
-                    AreaKind::Room,
-                    "Living room",
+                    "ent-2",
+                    AreaKind::Entertainment,
+                    "Cinema",
                     2,
-                    vec!["light-a".to_owned(), "light-b".to_owned()]
-                ),
-                (
-                    "zone-1",
-                    AreaKind::Zone,
-                    "Desk",
-                    1,
-                    vec!["light-b".to_owned()]
+                    vec!["light-a".to_owned(), "light-c".to_owned()]
                 ),
                 (
                     "ent-1",
                     AreaKind::Entertainment,
                     "TV",
                     2,
-                    vec!["light-a".to_owned(), "light-c".to_owned()]
+                    vec!["light-a".to_owned(), "light-b".to_owned()]
                 ),
             ]
         );
     }
 
     #[test]
-    fn entertainment_falls_back_to_channel_members() {
+    fn channel_positions_are_parsed_and_averaged_per_light() {
+        let lights = inventory().area_lights("ent-2").unwrap();
+        // Channel order, not `light_services` order.
+        let ids: Vec<_> = lights.iter().map(|(l, _)| l.id.as_str()).collect();
+        assert_eq!(ids, ["light-a", "light-c"]);
+        // light-a sits in channels 0 and 2: the average of both positions.
+        let a = lights[0].1.unwrap();
+        assert!((a.x + 0.6).abs() < 1e-6, "{a:?}");
+        assert!((a.y - 0.5).abs() < 1e-6);
+        assert!((a.z - 0.5).abs() < 1e-6);
+        let c = lights[1].1.unwrap();
+        assert_eq!((c.x, c.y, c.z), (0.5, 0.0, 0.0));
+    }
+
+    #[test]
+    fn lights_without_channels_have_no_position() {
+        let lights = inventory().area_lights("ent-1").unwrap();
+        assert!(lights.iter().all(|(_, position)| position.is_none()));
+    }
+
+    #[test]
+    fn unplaced_channels_leave_the_position_empty() {
         let mut inv = inventory();
-        inv.devices[0].services.push(ResourceRef {
-            rid: "ent-svc-a".to_owned(),
-            rtype: "entertainment".to_owned(),
-        });
         inv.entertainment = serde_json::from_str::<V2Reply<EntertainmentConfiguration>>(
-            r#"{"data":[{"id":"ent-2","metadata":{"name":"Music"},
-                "channels":[{"members":[{"service":{"rid":"ent-svc-a","rtype":"entertainment"}}]}]}]}"#,
+            r#"{"data":[{"id":"e","metadata":{"name":"X"},
+                "channels":[
+                  {"members":[{"service":{"rid":"ent-a","rtype":"entertainment"}}]},
+                  {"members":[{"service":{"rid":"ent-c","rtype":"entertainment"}}]}]}]}"#,
         )
         .unwrap()
         .data;
-        let lights = inv.area_lights("ent-2").unwrap();
-        assert_eq!(lights.len(), 1);
-        assert_eq!(lights[0].id, "light-a");
+        let lights = inv.area_lights("e").unwrap();
+        let ids: Vec<_> = lights.iter().map(|(l, _)| l.id.as_str()).collect();
+        assert_eq!(ids, ["light-a", "light-c"]);
+        assert!(lights.iter().all(|(_, position)| position.is_none()));
     }
 
     #[test]
     fn light_gamuts_come_from_the_bridge_then_the_type_then_c() {
         let inv = inventory();
-        let lights = inv.area_lights("ent-1").unwrap();
-        assert_eq!(lights[0].gamut, Some(Gamut::C));
-        assert!(lights[0].dimmable);
-        // light-c has no colour support.
-        assert_eq!(lights[1].gamut, None);
-
-        let living = inv.area_lights("room-1").unwrap();
+        let tv = inv.area_lights("ent-1").unwrap();
+        assert_eq!(tv[0].0.gamut, Some(Gamut::C));
+        assert!(tv[0].0.dimmable);
         // light-b reports only a gamut type.
-        assert_eq!(living[1].gamut, Some(Gamut::B));
+        assert_eq!(tv[1].0.gamut, Some(Gamut::B));
+        // light-c has no colour support.
+        let cinema = inv.area_lights("ent-2").unwrap();
+        assert_eq!(cinema[1].0.gamut, None);
 
         let unknown: LightResource = serde_json::from_str(
             r#"{"id":"x","color":{"gamut_type":"other"},"dimming":{"brightness":1}}"#,
         )
         .unwrap();
-        assert_eq!(unknown.info().gamut, Some(Gamut::C));
+        assert_eq!(unknown.info(None).gamut, Some(Gamut::C));
         let degenerate: LightResource = serde_json::from_str(
             r#"{"id":"x","color":{"gamut":{"red":{"x":0,"y":0},"green":{"x":0,"y":0},"blue":{"x":0,"y":0}},"gamut_type":"A"}}"#,
         )
         .unwrap();
-        assert_eq!(degenerate.info().gamut, Some(Gamut::A));
-        assert!(!degenerate.info().dimmable);
+        assert_eq!(degenerate.info(None).gamut, Some(Gamut::A));
+        assert!(!degenerate.info(None).dimmable);
     }
 
     #[test]
     fn unknown_area_is_none() {
         assert!(inventory().area_lights("nope").is_none());
+    }
+
+    #[test]
+    fn light_names_fall_back_to_the_device_then_the_id() {
+        let inv = inventory();
+        assert_eq!(inv.light("light-a").unwrap().name, "Floor lamp");
+        assert_eq!(inv.light("light-b").unwrap().name, "Desk lamp");
+        let bare: LightResource = serde_json::from_str(r#"{"id":"x"}"#).unwrap();
+        assert_eq!(bare.info(None).name, "x");
+        assert!(inv.light("nope").is_none());
+    }
+
+    #[test]
+    fn bridge_lights_list_colour_lights_first_sorted_by_name() {
+        let names: Vec<_> = inventory()
+            .bridge_lights()
+            .into_iter()
+            .map(|l| (l.id, l.name))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("light-b".to_owned(), "Desk lamp".to_owned()),
+                ("light-a".to_owned(), "Floor lamp".to_owned()),
+                ("light-c".to_owned(), "Hall bulb".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn snapshots_use_mirek_only_when_valid() {
+        let ok = StatusCode::OK;
+        let lights: Vec<LightStateReply> = parse_v2(ok, LIGHTS.as_bytes()).unwrap();
+        let a = lights[0].snapshot().unwrap();
+        assert_eq!(a.xy, Some((0.3, 0.3)));
+        assert_eq!(a.mirek, None);
+        assert_eq!(a.brightness, Some(50.0));
+        assert!(a.on);
+        let c = lights[2].snapshot().unwrap();
+        assert_eq!(c.mirek, Some(366));
+        assert_eq!(c.xy, None);
+        let off: LightStateReply = serde_json::from_str(r#"{"on":{"on":false}}"#).unwrap();
+        let off = off.snapshot().unwrap();
+        assert!(!off.on && off.brightness.is_none());
+        let none: LightStateReply = serde_json::from_str("{}").unwrap();
+        assert!(none.snapshot().is_none());
     }
 
     #[test]

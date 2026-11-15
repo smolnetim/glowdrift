@@ -6,10 +6,12 @@
 //! - `probe <address>`: read the public config of a bridge.
 //! - `pair <address>`: press the bridge's link button, then this polls for 30 seconds and
 //!   prints the credentials as `HUE_*` variable assignments for the other commands.
-//! - `areas`: list rooms, zones and entertainment areas.
-//! - `drive <area-id>`: send red, green, blue, white and black to the area, then stop.
+//! - `areas`: list the entertainment areas.
+//! - `lights`: list the single lights that can be added as extra lights.
+//! - `drive <area-id|-> [light-id...]`: send red, green, blue, white and black to the area
+//!   (`-` for none) and the extra lights, then stop; the lights are put back as they were.
 //!
-//! `areas` and `drive` read the credentials from the environment: `HUE_ADDRESS`,
+//! `areas`, `lights` and `drive` read the credentials from the environment: `HUE_ADDRESS`,
 //! `HUE_APP_KEY`, `HUE_CERT_SHA256` and optionally `HUE_CLIENT_KEY` and `HUE_BRIDGE_ID`.
 //! Nothing is written to disk.
 
@@ -17,7 +19,8 @@ use std::time::{Duration, Instant};
 
 use glowdrift_core::Rgb;
 use glowdrift_lights::hue::{
-    BridgeCredentials, HueError, HueLight, PairOutcome, discover, list_areas, pair, probe,
+    BridgeCredentials, HueError, HueLight, PairOutcome, discover, list_areas, list_lights, pair,
+    probe,
 };
 use glowdrift_lights::{Light, LightState};
 
@@ -60,8 +63,9 @@ fn run_pair(address: &str) -> Result<(), HueError> {
     Ok(())
 }
 
-fn run_drive(creds: BridgeCredentials, area: &str) {
-    let (mut light, _handle) = HueLight::new(Some(creds), Some(area.to_owned()));
+fn run_drive(creds: BridgeCredentials, area: Option<String>, extras: Vec<String>) {
+    let (mut light, handle) = HueLight::new(Some(creds), area);
+    handle.set_extra_lights(extras);
     light.set_enabled(true);
     let started = Instant::now();
     while light.status().state != LightState::Connected {
@@ -120,8 +124,20 @@ fn main() {
                 })
                 .map_err(|e| e.to_string())
         }),
-        ("drive", Some(area)) => credentials().map(|creds| run_drive(creds, &area)),
-        _ => Err("usage: hue_probe discover | probe <address> | pair <address> | areas | drive <area-id>".to_owned()),
+        ("lights", _) => credentials().and_then(|creds| {
+            list_lights(&creds)
+                .map(|lights| {
+                    for light in lights {
+                        println!("{} {:?}", light.id, light.name);
+                    }
+                })
+                .map_err(|e| e.to_string())
+        }),
+        ("drive", Some(area)) => credentials().map(|creds| {
+            let area = (area != "-").then_some(area);
+            run_drive(creds, area, args.collect());
+        }),
+        _ => Err("usage: hue_probe discover | probe <address> | pair <address> | areas | lights | drive <area-id|-> [light-id...]".to_owned()),
     };
     if let Err(message) = result {
         eprintln!("{message}");
