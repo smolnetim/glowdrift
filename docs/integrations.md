@@ -80,22 +80,35 @@ How it works in Glowdrift:
   changed certificate is refused and the light shows an error until the user pairs again.
 - **Credentials.** The address, bridge id, application key, client key and certificate pin are stored encrypted for
   the current Windows user (DPAPI) in `hue-bridge.bin` in the app data directory, never in `config.json`.
-  `config.json` keeps only `lights.hue.enabled`, `bridgeId` and `areaId`. A file that cannot be decrypted, or one
-  whose bridge id differs from `bridgeId`, counts as not paired. "Forget bridge" deletes the file.
-- **Target.** The user picks one room, zone or entertainment area; its lights receive the colour. Entertainment
-  areas are used only as a group of lights here.
-- **Output.** For each light, `PUT /clip/v2/resource/light/{id}` with on/off, brightness, CIE xy colour (clamped
+  `config.json` keeps only `lights.hue.enabled`, `bridgeId`, `areaId`, `extraLights` and `zones`. A file that
+  cannot be decrypted, or one whose bridge id differs from `bridgeId`, counts as not paired. "Forget bridge" deletes the file.
+- **Target.** The user picks one entertainment area (rooms and zones are not offered, because only entertainment
+  areas carry light positions) and may add single bridge lights that are not in it ("Extra lights" on the Lights
+  page, stored in `lights.hue.extraLights`).
+- **Zones.** Each Hue light follows its own rectangle of the whole display, smoothed independently; iCUE keeps the
+  whole-region colour from `region`. Zones are fractions of the monitor, so they may lie outside the iCUE region
+  and may overlap. Defaults: a light in the entertainment area is centred horizontally at `(x + 1) / 2` and
+  vertically at `(1 - z) / 2` from its position in the Hue app's entertainment area setup, one third of the
+  display wide and two thirds tall, kept on screen; an extra light has no position and gets a centred box one
+  fifth wide and full height. The Capture page shows the display with the iCUE box and one labelled box per light
+  with its live colour; dragging or resizing a box stores an override in `lights.hue.zones` (light id to
+  rectangle), and "Reset to Hue positions" removes the overrides, for one light or all.
+- **State restore.** When Glowdrift starts sending to a light it records the light's on/off state and brightness
+  and either its colour or its colour temperature, whichever it had. When it stops sending, each light is put
+  back to that state. Stopping means: the Hue light is disabled, the engine is paused, the area or the extra
+  lights change, the bridge is forgotten, or the app exits. A light that cannot be reached at that moment is
+  skipped. A crash or power loss cannot restore anything; the lights then keep the last colour they were given.
+- **Output.** For each light, with the colour of its own zone, `PUT /clip/v2/resource/light/{id}` with on/off, brightness, CIE xy colour (clamped
   into the light's gamut) and a transition. At most 10 requests per second go out in total, one light per slot in
   round-robin order, so a light is refreshed every `lights x 100 ms`. That period is also the transition time and
   the light's minimum send interval, so the bridge fades between updates. Only the latest colour is kept; nothing
   queues. Brightness is the largest 8-bit colour channel as a percentage (at least 1 %); a colour whose largest
   channel is below 3 turns the light off.
-- **Status.** The light reports `notPaired` or `noArea` (status codes) until a bridge and area are set. An
+- **Status.** The light reports `notPaired` or `noArea` (status codes) until a bridge and an area or extra light are set. An
   unreachable bridge shows as `unavailable` and is retried with a growing delay (1 s up to 30 s); an area that no
   longer exists is reported as `noArea` and retried the same way. A rejected application key, a changed
   certificate or unusable stored details show as `error` and are not retried until the user pairs again.
-- Disabling the light, or pausing the engine, stops the requests. The lights keep the last colour they were
-  given.
+- Disabling the light, or pausing the engine, stops the requests and restores the lights (see State restore).
 
 Trade-offs:
 
