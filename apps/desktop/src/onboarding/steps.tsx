@@ -15,9 +15,9 @@ export interface Step {
 
 function HowItWorks() {
   const items: { icon: IconName; title: string; text: string }[] = [
-    { icon: "capture", title: "Capture", text: "Watches a part of your screen." },
-    { icon: "wave", title: "Calm", text: "Turns it into one smooth colour." },
-    { icon: "lights", title: "Glow", text: "Sends it to your lights." },
+    { icon: "capture", title: "Capture", text: "Watches parts of your screen." },
+    { icon: "wave", title: "Calm", text: "Turns them into smooth colour." },
+    { icon: "lights", title: "Glow", text: "Sends it to each of your lights." },
   ];
   return (
     <ol className="how-it-works">
@@ -44,7 +44,7 @@ export const STEPS: readonly Step[] = [
     id: "welcome",
     title: "Welcome to Glowdrift",
     summary:
-      "Glowdrift captures a part of your screen and calms it into one smooth colour. It then sends that colour to your lights.",
+      "Glowdrift captures parts of your screen and calms them into smooth colour. It then sends that colour to your lights: Corsair iCUE, Philips Hue, or both.",
     body: (
       <div className="stack">
         <HowItWorks />
@@ -57,7 +57,8 @@ export const STEPS: readonly Step[] = [
   {
     id: "screen",
     title: "Pick your screen and region",
-    summary: "Choose a display, then drag the frame over the part you want your lights to follow.",
+    summary:
+      "Choose a display, then drag the frame over the part you want your Corsair lights to follow. Philips Hue lamps each get their own zone later, on the Capture page.",
     body: <ScreenRegionPicker />,
   },
   {
@@ -69,7 +70,7 @@ export const STEPS: readonly Step[] = [
   {
     id: "feel",
     title: "Set the feel",
-    summary: "Slow the colour down so changes fade in gently. The swatch below follows your screen live.",
+    summary: "Slow the colour down so changes fade in gently. The swatch below shows the colour of the region you picked, live.",
     body: (
       <div className="stack">
         <LiveSwatch label="Live preview of the smoothed colour" />

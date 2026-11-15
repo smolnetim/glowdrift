@@ -20,7 +20,7 @@ let current: ColorEvent = { target: "#000000", smoothed: "#000000", zones: [] };
 let frame = 0;
 const listeners = new Set<Listener>();
 
-const inkFor = (hex: string): string => (luminance(hex) > INK_THRESHOLD ? INK_DARK : INK_LIGHT);
+export const inkFor = (hex: string): string => (luminance(hex) > INK_THRESHOLD ? INK_DARK : INK_LIGHT);
 
 function flush(): void {
   frame = 0;
@@ -74,3 +74,7 @@ export function useLiveHexRef(kind: LiveColorKind) {
 
 /** CSS colour for a live zone swatch. */
 export const rgbCss = (c: Rgb): string => `rgb(${c.r} ${c.g} ${c.b})`;
+
+/** "#rrggbb" for a zone colour. */
+export const rgbHex = (c: Rgb): string =>
+  `#${[c.r, c.g, c.b].map((v) => Math.round(clamp(v, 0, 255)).toString(16).padStart(2, "0")).join("")}`;

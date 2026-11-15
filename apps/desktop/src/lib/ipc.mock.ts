@@ -2,7 +2,9 @@
 // Query flags: ?onboarded starts with setup complete, ?icue=unavailable simulates
 // iCUE being unreachable, ?update=1 simulates an available update (?update=machine one that
 // needs a Windows permission prompt to install), ?hue=paired starts with a bridge already paired,
-// ?hue=nobridge makes bridge discovery find nothing. The first Hue pairing attempt times out
+// ?hue=nobridge makes bridge discovery find nothing, ?hue=ready starts paired with Hue on and the area
+// chosen. The left desk lamp moves on the bridge every 20 s; the app sees it after a refresh.
+// The first Hue pairing attempt times out
 // (as if the link button was not pressed); the second succeeds.
 
 import type { UnlistenFn } from "@tauri-apps/api/event";
@@ -39,13 +41,32 @@ const HUE_BRIDGE: HueBridge = { id: "0017881A2B3C", address: "192.168.1.23", nam
 
 const HUE_AREAS: HueArea[] = [{ id: "ent-desk", kind: "entertainment", name: "Desk setup", lightCount: 2 }];
 
-/** Entertainment area members with their channel positions. */
+/** Entertainment area members with their channel positions at the start. */
 const AREA_MEMBERS: Record<string, { id: string; position: LightPosition }[]> = {
   "ent-desk": [
     { id: "lamp-left", position: { x: -0.8, y: 0.2, z: 0.3 } },
     { id: "lamp-right", position: { x: 0.8, y: 0.2, z: 0.3 } },
   ],
 };
+
+/** The left lamp steps through these x positions on the bridge, one per period. */
+const LEFT_LAMP_X = [-0.8, -0.3, 0.2];
+const LEFT_LAMP_PERIOD_MS = 20_000;
+
+/** Positions as the bridge has them right now. */
+function bridgePositions(): Record<string, LightPosition> {
+  const step = Math.floor(Date.now() / LEFT_LAMP_PERIOD_MS) % LEFT_LAMP_X.length;
+  const positions: Record<string, LightPosition> = {};
+  for (const members of Object.values(AREA_MEMBERS)) {
+    for (const m of members) {
+      positions[m.id] = m.id === "lamp-left" ? { ...m.position, x: LEFT_LAMP_X[step] ?? m.position.x } : m.position;
+    }
+  }
+  return positions;
+}
+
+/** Positions last read from the bridge; they change only on a refresh, like the shell's cached inventory. */
+let knownPositions: Record<string, LightPosition> | null = null;
 
 const BRIDGE_LIGHTS: BridgeLight[] = [
   { id: "lamp-left", name: "Left desk lamp" },
@@ -81,19 +102,22 @@ function areaLights(): AreaLightZone[] {
   const hue = config.lights.hue;
   if (!hue.enabled || !hueBridgeState || hue.bridgeId !== hueBridgeState.id) return [];
   const members = (hue.areaId ? AREA_MEMBERS[hue.areaId] : undefined) ?? [];
+  const positions = (knownPositions ??= bridgePositions());
   const entries = [
-    ...members.map((m) => ({ id: m.id, position: m.position, source: "entertainment" as const })),
+    ...members.map((m) => ({ id: m.id, position: positions[m.id] ?? m.position, source: "entertainment" as const })),
     ...hue.extraLights
       .filter((id) => !members.some((m) => m.id === id))
       .map((id) => ({ id, position: null, source: "extra" as const })),
   ];
   return entries.map(({ id, position, source }) => {
     const override = hue.zones[id];
+    const fallback = defaultZone(position);
     return {
       id,
       name: lightName(id),
       position,
-      zone: override ? clampRect(override) : defaultZone(position),
+      zone: override ? clampRect(override) : fallback,
+      defaultZone: fallback,
       custom: override !== undefined,
       source,
     };
@@ -105,9 +129,20 @@ let running = true;
 let libraryInstalled = false;
 let hueBridgeState: HueBridge | null = null;
 let huePairAttempts = 0;
-if (params.get("hue") === "paired") {
+if (params.get("hue") === "paired" || params.get("hue") === "ready") {
+  const ready = params.get("hue") === "ready";
   hueBridgeState = { ...HUE_BRIDGE };
-  config = { ...config, lights: { ...config.lights, hue: { ...config.lights.hue, bridgeId: HUE_BRIDGE.id } } };
+  config = {
+    ...config,
+    lights: {
+      ...config.lights,
+      hue: {
+        ...config.lights.hue,
+        bridgeId: HUE_BRIDGE.id,
+        ...(ready ? { enabled: true, areaId: HUE_AREAS[0]?.id ?? null } : {}),
+      },
+    },
+  };
 }
 let engineColor: ColorEvent = { target: "#000000", smoothed: "#000000" };
 const zoneColors = new Map<string, Rgb>();
@@ -274,6 +309,7 @@ export async function installIcueSdk(): Promise<LightStatus[]> {
 }
 
 function setHueConfig(bridgeId: string | null, areaId: string | null): Config {
+  knownPositions = null;
   config = { ...config, lights: { ...config.lights, hue: { ...config.lights.hue, bridgeId, areaId } } };
   emit("lights://status", lights());
   return config;
@@ -324,6 +360,13 @@ export async function hueListLights(): Promise<BridgeLight[]> {
 }
 
 export const hueAreaLights = async (): Promise<AreaLightZone[]> => areaLights();
+
+export async function hueRefreshAreaLights(): Promise<AreaLightZone[]> {
+  await delay(500);
+  if (!hueBridgeState || config.lights.hue.bridgeId !== hueBridgeState.id) throw "Not paired with a Hue bridge.";
+  knownPositions = bridgePositions();
+  return areaLights();
+}
 
 export async function hueSelectArea(areaId: string): Promise<Config> {
   if (!hueBridgeState) throw "Not paired with a Hue bridge.";

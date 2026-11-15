@@ -213,7 +213,23 @@
   font-weight: 600;
 }
 
+.zone-text {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 6px;
+  min-width: 0;
+}
 
-.zone-pick--static {
-  cursor: default;
+.zone-note {
+  flex-basis: 100%;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.zone-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
 }
