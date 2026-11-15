@@ -518,6 +518,25 @@ fn missing_credentials_or_area_are_reported_with_codes() {
 }
 
 #[test]
+fn a_new_light_stays_disabled_until_enabled() {
+    let mock = Mock::start();
+    let (mut light, _handle) = HueLight::new(Some(mock.creds()), Some("room-1".to_owned()));
+    assert_eq!(light.status().state, LightState::Disabled);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(light.status().state, LightState::Disabled);
+    assert_eq!(
+        mock.requests.lock().unwrap().len(),
+        0,
+        "a disabled light must not contact the bridge"
+    );
+    light.set_enabled(true);
+    wait_for("connected", || {
+        light.status().state == LightState::Connected
+    });
+    light.shutdown();
+}
+
+#[test]
 fn an_unknown_area_reports_no_area() {
     let mock = Mock::start();
     let (mut light, _handle) = light_for(&mock, "does-not-exist");

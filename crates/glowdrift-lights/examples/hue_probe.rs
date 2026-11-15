@@ -62,6 +62,7 @@ fn run_pair(address: &str) -> Result<(), HueError> {
 
 fn run_drive(creds: BridgeCredentials, area: &str) {
     let (mut light, _handle) = HueLight::new(Some(creds), Some(area.to_owned()));
+    light.set_enabled(true);
     let started = Instant::now();
     while light.status().state != LightState::Connected {
         let status = light.status();

@@ -75,24 +75,39 @@ impl HueHandle {
 }
 
 impl HueLight {
-    /// Creates an enabled light for `area_id` on the bridge described by `creds`.
+    /// Creates a disabled light for `area_id` on the bridge described by `creds`; it does not
+    /// contact the bridge until [`Light::set_enabled`] enables it.
     pub fn new(creds: Option<BridgeCredentials>, area_id: Option<String>) -> (HueLight, HueHandle) {
-        HueLight::with_timing(creds, area_id, Timing::default())
+        HueLight::build(creds, area_id, Timing::default(), false)
     }
 
+    #[cfg(test)]
     pub(crate) fn with_timing(
         creds: Option<BridgeCredentials>,
         area_id: Option<String>,
         timing: Timing,
     ) -> (HueLight, HueHandle) {
+        HueLight::build(creds, area_id, timing, true)
+    }
+
+    fn build(
+        creds: Option<BridgeCredentials>,
+        area_id: Option<String>,
+        timing: Timing,
+        enabled: bool,
+    ) -> (HueLight, HueHandle) {
         let shared = Arc::new(Shared {
             inbox: Mutex::new(Inbox {
-                enabled: Some(true),
+                enabled: enabled.then_some(true),
                 target: Some(Target { creds, area_id }),
                 ..Inbox::default()
             }),
             wake: Condvar::new(),
-            status: Mutex::new(Status::new(LightState::Connecting, Some("Starting"))),
+            status: Mutex::new(if enabled {
+                Status::new(LightState::Connecting, Some("Starting"))
+            } else {
+                Status::new(LightState::Disabled, None)
+            }),
         });
         let (done_tx, done) = mpsc::channel();
         let worker_shared = Arc::clone(&shared);
@@ -114,7 +129,7 @@ impl HueLight {
             HueLight {
                 shared,
                 timing,
-                enabled: true,
+                enabled,
                 last_color: None,
                 thread,
                 done,
