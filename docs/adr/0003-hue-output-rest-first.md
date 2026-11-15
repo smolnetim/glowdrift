@@ -64,8 +64,8 @@ Reasons:
 
 - Glowdrift's changes are slow and smoothed. With `dynamics.duration` equal to the interval, the bridge already
   interpolates between updates, so the extra update rate of streaming has little visible effect.
-- REST needs only an app key and the user's normal Hue rooms or zones. Streaming additionally needs an entertainment
-  area made in the Hue app, the client key, exclusive use of the bridge's single stream, a keep-alive, and
+- REST needs only an app key; the entertainment area is used just for its list of lights and their positions.
+  Streaming additionally needs the client key, exclusive use of the bridge's single stream, a keep-alive, and
   reconnect handling.
 - Streaming costs ~80 new crates and an unverified interop path, for no demonstrated gain on this workload.
 

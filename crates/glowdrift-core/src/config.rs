@@ -88,10 +88,10 @@ pub struct HueConfig {
     /// Identifier of the paired bridge, `None` when none is selected.
     #[serde(deserialize_with = "lenient")]
     pub bridge_id: Option<String>,
-    /// Identifier of the room, zone or entertainment area to drive, `None` when none is selected.
+    /// Identifier of the entertainment area to drive, `None` when none is selected.
     #[serde(deserialize_with = "lenient")]
     pub area_id: Option<String>,
-    /// Per-light zone overrides: Hue light id to a rectangle of the captured region. Lights
+    /// Per-light zone overrides: Hue light id to a rectangle of the monitor. Lights
     /// without an entry use their default zone. An entry that is not a rectangle is dropped
     /// when loading.
     #[serde(deserialize_with = "zone_map")]

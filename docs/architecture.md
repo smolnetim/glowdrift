@@ -71,7 +71,7 @@ The lights manager collects `zone_layout()` of every enabled light on its status
 after the lights are enabled, disabled or paused, concatenates the layouts in light order, and sends
 `EngineCommand::SetZones(Vec<NormRect>)` to the engine only when the combined zones changed. Colours go out with
 `set_colors(whole, zones)`: a light with a layout gets its slice and generation, every other light `set_color(whole)`;
-zone colours computed for a layout of another size are not applied. The engine reopens its capture session when the
+zone colours computed for a layout of another size are not applied. When a light's layout changes in a way that leaves the combined zones as they are (its generation changes), the manager asks the engine to resend the current colours, so a static picture does not leave the light on the whole colour. The engine reopens its capture session when the
 zones change so every colour is recomputed even on a static desktop.
 
 Working in linear light matters: averaging gamma-encoded sRGB values darkens mixed colours, and fading in
@@ -111,7 +111,7 @@ Commands (Tauri `invoke`):
 | `hue_pair(address)` | `HueBridge` | Polls the bridge every 2 s for up to 30 s until its link button is pressed. On success stores the credentials, sets `lights.hue.bridgeId` (and clears `areaId` if the bridge changed) and points the Hue light at the bridge. Rejects with "The link button was not pressed in time." on timeout. `HueBridge` is `{ id, address, name }`. |
 | `hue_bridge()` | `HueBridge` or null | The paired bridge whose id matches `lights.hue.bridgeId`; no secrets. |
 | `hue_list_areas()` | `HueArea[]` | Entertainment areas of the paired bridge: `{ id, kind, name, lightCount }`. Rejects when no bridge is paired. |
-| `hue_list_lights()` | `BridgeLight[]` | Lights of the paired bridge that can be added as extra lights: `{ id, name }`, colour-capable first. Rejects when no bridge is paired. |
+| `hue_list_lights()` | `BridgeLight[]` | Lights of the paired bridge that can be added as extra lights, leaving out those of the selected area: `{ id, name }`, colour-capable first. Rejects when no bridge is paired. |
 | `hue_area_lights()` | `AreaLightZone[]` | The lights the Hue light drives (entertainment area, then extra lights) with the zone each samples: `{ id, name, position, zone, custom, source }`; `position` is the entertainment position or null, `zone` a monitor-fraction rect (the override, else the default), `custom` whether `zone` is an override, `source` is `entertainment` or `extra`. Answered from the light's resolved state without I/O; empty until the area is resolved. |
 | `hue_select_area(areaId)` | `Config` | Persists `lights.hue.areaId` and retargets the Hue light. Rejects when no bridge is paired. A stored `areaId` that is not an entertainment area simply shows `noArea`; no migration. |
 | `hue_forget()` | `Config` | Deletes the stored credentials and clears `bridgeId` and `areaId`. |
@@ -124,7 +124,7 @@ Events (emitted by Rust):
 
 | Event | Payload | When |
 | --- | --- | --- |
-| `engine://color` | `{ target, smoothed, zones }` as `#rrggbb`; `zones` is the smoothed colour of each light zone in layout order (the order of `hue_area_lights`), empty without zones | At most about 20 per second, only while the main window is visible. |
+| `engine://color` | `{ target, smoothed, zones }`; `target` and `smoothed` are `#rrggbb`, `zones` is the smoothed `{ r, g, b }` colour of each light zone in layout order (the order of `hue_area_lights`), empty without zones | At most about 20 per second, only while the main window is visible. |
 | `engine://status` | `EngineStatus` | On change: start, stop, error, notable frame-rate change. |
 | `lights://status` | `LightStatus[]` | On change. |
 | `updater://ready` | `{ version }` | An update was downloaded and staged. |
